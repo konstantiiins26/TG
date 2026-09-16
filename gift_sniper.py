@@ -32,9 +32,11 @@
 """
 
 import os
+import re
 import sys
 import json
 import time
+import base64
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -84,14 +86,38 @@ TARGET_COLLECTION   = os.getenv("TARGET_COLLECTION", "EQAAAAAAAAAAAAAAAAAAAAAAAA
 # переменной окружения CLAUDE_MODEL при необходимости.
 CLAUDE_MODEL        = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
 
-# --- Экономика сделки (используется и в промпте ИИ, и в локальной проверке) ---
-MARKETPLACE_FEE_PCT = Decimal(os.getenv("MARKETPLACE_FEE_PCT", "0.05"))   # 5% комиссия площадки при перепродаже
-GAS_FEE_TON         = Decimal(os.getenv("GAS_FEE_TON", "0.15"))           # газ (сеть) в TON
-MIN_ROI_PCT         = Decimal(os.getenv("MIN_ROI_PCT", "5"))             # ниже этого ROI бот не покупает
+# --- Экономика сделки -------------------------------------------------------
+# ВАЖНО: комиссия площадки и роялти берутся С ЦЕНЫ ПРОДАЖИ, а не с цены покупки.
+# (В первоначальном ТЗ было `Buy * 0.05` — это занижало издержки и завышало
+#  прибыль, т.к. в прибыльной сделке цена продажи выше цены покупки.)
+MARKETPLACE_FEE_PCT = Decimal(os.getenv("MARKETPLACE_FEE_PCT", "0.05"))   # комиссия площадки (с цены ПРОДАЖИ)
+ROYALTY_PCT         = Decimal(os.getenv("ROYALTY_PCT", "0.05"))           # роялти создателю коллекции (с цены ПРОДАЖИ)
+UNDERCUT_PCT        = Decimal(os.getenv("UNDERCUT_PCT", "0.03"))          # насколько встаём НИЖЕ floor, чтобы реально продать
+GAS_FEE_TON         = Decimal(os.getenv("GAS_FEE_TON", "0.15"))           # газ за круг (покупка + продажа), TON
+MIN_ROI_PCT         = Decimal(os.getenv("MIN_ROI_PCT", "5"))              # ниже этого ROI бот не покупает
+
+# --- Расчёт Floor Price -----------------------------------------------------
+# У TonAPI-эндпоинта /items НЕТ сортировки по цене, поэтому честный floor
+# получается только выборкой: тянем несколько страниц и берём перцентиль.
+#
+# ЦЕНА ВОПРОСА — нагрузка на API: FLOOR_SAMPLE_PAGES запросов КАЖДЫЙ цикл.
+# При 5 страницах и интервале 12 сек это ~25 запросов/мин. Без ключа TONAPI_KEY
+# вы упрётесь в лимиты. Если ловите 429 — поднимите POLL_INTERVAL_SEC
+# или уменьшите FLOOR_SAMPLE_PAGES (ценой точности floor).
+FLOOR_PAGE_SIZE     = int(os.getenv("FLOOR_PAGE_SIZE", "100"))            # размер одной страницы выборки
+FLOOR_SAMPLE_PAGES  = int(os.getenv("FLOOR_SAMPLE_PAGES", "5"))           # сколько страниц тянуть (5 x 100 = 500 лотов)
+FLOOR_PERCENTILE    = Decimal(os.getenv("FLOOR_PERCENTILE", "5"))         # 5-й перцентиль вместо голого min()
+MIN_FLOOR_SAMPLE    = int(os.getenv("MIN_FLOOR_SAMPLE", "8"))             # меньше этого — floor недостоверен, не торгуем
+FLOOR_CACHE_TTL_SEC = int(os.getenv("FLOOR_CACHE_TTL_SEC", "60"))         # кэш floor, чтобы не сканировать рынок каждые 12 сек
+CANDIDATES_TO_ANALYZE = int(os.getenv("CANDIDATES_TO_ANALYZE", "5"))      # сколько самых дешёвых лотов отдавать ИИ
+
+# --- Верификация коллекции (защита от скам-коллекций) -----------------------
+# Скам-коллекции копируют имя и картинки один в один; доверять можно ТОЛЬКО адресу.
+# Список адресов через запятую. Пустой список = проверка выключена (бот предупредит).
+COLLECTION_WHITELIST = [a.strip() for a in os.getenv("COLLECTION_WHITELIST", "").split(",") if a.strip()]
 
 # --- Параметры цикла мониторинга --------------------------------------------
 POLL_INTERVAL_SEC   = int(os.getenv("POLL_INTERVAL_SEC", "12"))           # задержка между проверками (10–15 сек)
-ITEMS_PER_POLL      = int(os.getenv("ITEMS_PER_POLL", "20"))              # сколько лотов тянуть за одну проверку
 HTTP_TIMEOUT_SEC    = int(os.getenv("HTTP_TIMEOUT_SEC", "15"))           # таймаут HTTP-запросов
 
 # --- "Красивые" номера минта, за которые наценка оправдана -------------------
@@ -147,7 +173,84 @@ log.addHandler(_handler)
 
 
 # =============================================================================
-# 3. СБОР ДАННЫХ С РЫНКА (БЕСПЛАТНЫЕ ПУБЛИЧНЫЕ API)
+# 3. АДРЕСА TON — НОРМАЛИЗАЦИЯ И ВЕРИФИКАЦИЯ КОЛЛЕКЦИИ
+# =============================================================================
+# Один и тот же адрес TON существует в двух видах:
+#   raw:            0:9f8a...e21c   (workchain:hex-хэш)
+#   user-friendly:  EQCfio...IeLp   (base64url, 36 байт, с CRC16)
+# Наивное сравнение строк их не сматчит, поэтому whitelist без нормализации
+# бесполезен. Приводим оба вида к канонической форме "wc:hex".
+
+_RAW_ADDR_RE = re.compile(r"^(-?\d+):([0-9a-fA-F]{64})$")
+
+
+def _crc16_xmodem(data: bytes) -> int:
+    """CRC16/XMODEM — контрольная сумма в user-friendly адресах TON."""
+    crc = 0
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def normalize_ton_address(addr: str):
+    """
+    Приводит адрес TON к канонической форме "workchain:hex" (нижний регистр).
+
+    Принимает и raw ("0:abc..."), и user-friendly ("EQ...", "UQ...", в любом
+    из двух base64-алфавитов). Проверяет длину и CRC16 — битый адрес
+    отвергается. Возвращает None, если адрес нераспознан.
+    """
+    if not addr or not isinstance(addr, str):
+        return None
+    addr = addr.strip()
+
+    # --- Вариант 1: уже raw-форма -------------------------------------------
+    m = _RAW_ADDR_RE.match(addr)
+    if m:
+        return f"{int(m.group(1))}:{m.group(2).lower()}"
+
+    # --- Вариант 2: user-friendly base64(url) --------------------------------
+    if len(addr) != 48:
+        return None
+    try:
+        # Адрес могут записать и в url-safe (-_), и в обычном (+/) алфавите.
+        decoded = base64.b64decode(addr.replace("-", "+").replace("_", "/"))
+    except Exception:  # noqa: BLE001 — любой мусор просто не адрес
+        return None
+
+    if len(decoded) != 36:
+        return None
+    # Последние 2 байта — CRC16 первых 34. Не сошлось => адрес повреждён.
+    if _crc16_xmodem(decoded[:34]) != int.from_bytes(decoded[34:], "big"):
+        return None
+
+    workchain = -1 if decoded[1] == 0xFF else decoded[1]
+    return f"{workchain}:{decoded[2:34].hex()}"
+
+
+def is_collection_trusted(collection_addr: str) -> bool:
+    """
+    Проверяет адрес коллекции по whitelist.
+
+    Скам-коллекции копируют название и картинки байт в байт, поэтому
+    доверять `collection_name` нельзя — только адресу контракта.
+    Пустой whitelist = проверка отключена (main() об этом предупреждает).
+    """
+    if not COLLECTION_WHITELIST:
+        return True
+    target = normalize_ton_address(collection_addr)
+    if target is None:
+        return False
+    return any(normalize_ton_address(a) == target for a in COLLECTION_WHITELIST)
+
+
+# =============================================================================
+# 4. СБОР ДАННЫХ С РЫНКА (БЕСПЛАТНЫЕ ПУБЛИЧНЫЕ API)
 # =============================================================================
 
 def _nano_to_ton(nano_value) -> Decimal:
@@ -160,16 +263,20 @@ def _nano_to_ton(nano_value) -> Decimal:
         return Decimal("0")
 
 
-def fetch_items_tonapi(collection: str, limit: int):
+def fetch_items_tonapi(collection: str, limit: int, offset: int = 0):
     """
     ОСНОВНОЙ ИСТОЧНИК: TonAPI.io
     GET /v2/nfts/collections/{account_address}/items
 
     Возвращает список нормализованных лотов (см. _normalize_item).
     Работает и без ключа (низкие лимиты), с ключом TONAPI_KEY — выше квота.
+
+    `offset` нужен для постраничной выборки при расчёте честного floor:
+    у этого эндпоинта нет сортировки по цене, поэтому floor можно получить
+    только достаточно широкой выборкой.
     """
     url = f"https://tonapi.io/v2/nfts/collections/{collection}/items"
-    params = {"limit": limit, "offset": 0}
+    params = {"limit": limit, "offset": offset}
     headers = {"Accept": "application/json"}
     if TONAPI_KEY:
         headers["Authorization"] = f"Bearer {TONAPI_KEY}"
@@ -190,9 +297,13 @@ def fetch_items_tonapi(collection: str, limit: int):
         meta = nft.get("metadata") or {}
         mint_index = _extract_mint_index(nft, meta)
 
+        coll = nft.get("collection") or {}
         items.append(_normalize_item(
             address=nft.get("address", ""),
-            collection_name=(nft.get("collection") or {}).get("name") or meta.get("name", "Unknown"),
+            collection_name=coll.get("name") or meta.get("name", "Unknown"),
+            # Адрес коллекции — единственное, чему можно доверять при проверке
+            # на скам (имя подделывается тривиально).
+            collection_address=coll.get("address", ""),
             mint_index=mint_index,
             sale_price_ton=sale_price_ton,
             is_on_sale=bool(sale_price_nano and sale_price_ton > 0),
@@ -236,6 +347,9 @@ def fetch_items_getgems(collection: str, limit: int):
         items.append(_normalize_item(
             address=node.get("address", ""),
             collection_name=node.get("name", "Unknown"),
+            # Getgems-запрос не возвращает адрес коллекции, поэтому подставляем
+            # тот, который сами запрашивали — для whitelist этого достаточно.
+            collection_address=collection,
             mint_index=node.get("index"),
             sale_price_ton=price_ton,
             is_on_sale=bool(price_nano and price_ton > 0),
@@ -271,61 +385,155 @@ def _extract_mint_index(nft: dict, meta: dict):
     return None
 
 
-def _normalize_item(address, collection_name, mint_index, sale_price_ton, is_on_sale):
+def _normalize_item(address, collection_name, collection_address,
+                    mint_index, sale_price_ton, is_on_sale):
     """Единый формат лота для всего приложения (и для отправки в ИИ)."""
     return {
         "address": address,
         "collection_name": collection_name,
+        "collection_address": collection_address,
         "mint_index": mint_index,
         "sale_price_ton": float(sale_price_ton),   # float для JSON-сериализации в ИИ
         "is_on_sale": is_on_sale,
     }
 
 
-def get_market_snapshot(collection: str, limit: int):
+def _percentile(sorted_vals, pct: Decimal) -> Decimal:
     """
-    Возвращает (items, floor_price_ton).
+    Линейно интерполированный перцентиль по ОТСОРТИРОВАННОМУ списку Decimal.
 
-    items       — список выставленных на продажу лотов.
-    floor_price — минимальная цена продажи среди них (Floor Price коллекции).
-
-    Сначала пробуем TonAPI, при ошибке — Getgems.
+    Зачем не min(): один случайный "пылевой" лот (например, выставленный
+    по ошибке за 0.01 TON) утащил бы floor вниз и сделал бы все расчёты
+    прибыли бессмысленными. Перцентиль устойчив к таким выбросам.
     """
-    items = []
-    try:
-        items = fetch_items_tonapi(collection, limit)
-        source = "TonAPI"
-    except Exception as e:  # noqa: BLE001 — намеренно ловим всё, чтобы уйти на фолбэк
-        log.warning(f"TonAPI недоступен ({e}). Переключаюсь на Getgems...")
+    if not sorted_vals:
+        return Decimal("0")
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+
+    k = (Decimal(len(sorted_vals) - 1) * pct) / Decimal("100")
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    if lo == hi:
+        return sorted_vals[lo]
+    frac = k - Decimal(lo)
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac
+
+
+# Кэш floor: {collection_addr: (timestamp, floor, sample_size)}.
+# Внимание: это НЕ экономия запросов. Выборку приходится собирать каждый цикл,
+# иначе не увидишь новые дешёвые листинги — а именно ради них бот и работает.
+# Кэш нужен для другого: пережить цикл, в котором рынок отдался частично
+# (часть страниц не пришла), не подменив рабочий floor случайным огрызком.
+_floor_cache = {}
+
+
+def get_market_snapshot(collection: str):
+    """
+    Возвращает (candidates, floor_price, sample_size, source).
+
+    candidates  — самые дешёвые лоты на продажу (кандидаты на покупку).
+    floor_price — ЧЕСТНЫЙ floor: перцентиль по широкой выборке, а не min()
+                  по первой странице.
+    sample_size — сколько лотов на продажу попало в выборку. Если мало,
+                  floor недостоверен и торговать нельзя.
+
+    Почему выборка: у TonAPI /items нет сортировки по цене, он отдаёт
+    элементы по индексу. Поэтому тянем FLOOR_SAMPLE_PAGES страниц и считаем
+    перцентиль по собранным ценам.
+    """
+    cache_key = normalize_ton_address(collection) or collection
+    cached = _floor_cache.get(cache_key)
+    now = time.monotonic()
+
+    # --- Собираем выборку (или берём кандидатов из свежего кэша) ------------
+    all_items, source = _collect_sample(collection)
+    if not all_items:
+        return [], Decimal("0"), 0, "none"
+
+    on_sale = [it for it in all_items if it["is_on_sale"] and it["sale_price_ton"] > 0]
+    prices = sorted(Decimal(str(it["sale_price_ton"])) for it in on_sale)
+
+    if cached and (now - cached[0]) < FLOOR_CACHE_TTL_SEC and len(prices) < MIN_FLOOR_SAMPLE:
+        # Выборка в этот раз вышла бедной — доверяем недавнему floor.
+        floor, sample_size = cached[1], cached[2]
+    else:
+        floor = _percentile(prices, FLOOR_PERCENTILE).quantize(Decimal("0.000000001"))
+        sample_size = len(prices)
+        if sample_size >= MIN_FLOOR_SAMPLE:
+            _floor_cache[cache_key] = (now, floor, sample_size)
+
+    # Кандидаты — самые дешёвые лоты (именно среди них живёт арбитраж).
+    candidates = sorted(on_sale, key=lambda it: it["sale_price_ton"])[:CANDIDATES_TO_ANALYZE]
+    return candidates, floor, sample_size, source
+
+
+def _collect_sample(collection: str):
+    """
+    Тянет FLOOR_SAMPLE_PAGES страниц с TonAPI; при полном провале — один
+    запрос к Getgems. Возвращает (items, source).
+
+    Частичный успех допустим: если 3 страницы из 5 пришли, работаем с ними
+    и пишем предупреждение — это лучше, чем потерять весь цикл.
+    """
+    items, failures = [], 0
+    for page in range(FLOOR_SAMPLE_PAGES):
         try:
-            items = fetch_items_getgems(collection, limit)
-            source = "Getgems"
-        except Exception as e2:  # noqa: BLE001
-            log.error(f"Оба источника недоступны. Getgems: {e2}")
-            return [], Decimal("0"), "none"
+            batch = fetch_items_tonapi(collection, FLOOR_PAGE_SIZE, offset=page * FLOOR_PAGE_SIZE)
+        except Exception as e:  # noqa: BLE001 — страница могла не прийти, это не фатально
+            failures += 1
+            log.warning(f"TonAPI: страница {page + 1}/{FLOOR_SAMPLE_PAGES} не получена ({e}).")
+            continue
+        if not batch:
+            break           # коллекция закончилась — дальше тянуть нечего
+        items.extend(batch)
 
-    # Оставляем только реально продающиеся лоты.
-    on_sale = [it for it in items if it["is_on_sale"] and it["sale_price_ton"] > 0]
+    if items:
+        if failures:
+            log.warning(f"Выборка неполная: {failures} страниц потеряно. Floor менее точен.")
+        return items, "TonAPI"
 
-    # Floor Price = минимальная цена среди выставленных лотов.
-    floor = min((Decimal(str(it["sale_price_ton"])) for it in on_sale), default=Decimal("0"))
-    return on_sale, floor, source
+    # --- Полный провал TonAPI: пробуем Getgems -----------------------------
+    log.warning("TonAPI недоступен полностью. Переключаюсь на Getgems...")
+    try:
+        return fetch_items_getgems(collection, FLOOR_PAGE_SIZE), "Getgems"
+    except Exception as e:  # noqa: BLE001
+        log.error(f"Оба источника недоступны. Getgems: {e}")
+        return [], "none"
 
 
 # =============================================================================
-# 4. ЛОКАЛЬНАЯ ЭКОНОМИКА (быстрая проверка до вызова ИИ)
+# 5. ЛОКАЛЬНАЯ ЭКОНОМИКА (быстрая проверка до вызова ИИ)
 # =============================================================================
+
+def target_sale_price(floor_price: Decimal) -> Decimal:
+    """
+    Цена, по которой мы реально сможем продать.
+
+    Продать ПО floor нельзя: чтобы уйти первым, надо встать ниже текущего
+    минимума. Поэтому целевая цена = floor минус undercut.
+    """
+    return floor_price * (Decimal("1") - UNDERCUT_PCT)
+
 
 def compute_net_profit(floor_price: Decimal, buy_price: Decimal) -> Decimal:
     """
-    Формула чистой прибыли (та же, что зашита в промпт ИИ):
+    Честная формула чистой прибыли:
 
-        Profit = (Floor - Buy) - (Buy * fee) - gas
+        Sale     = Floor * (1 - undercut)
+        Proceeds = Sale - Sale*fee - Sale*royalty
+        Profit   = Proceeds - Buy - gas
 
-    Логика: покупаем по buy_price, перепродаём по floor_price, платим
-    комиссию площадки с цены покупки и газ сети.
+    Отличия от первоначального ТЗ (`(Floor-Buy) - Buy*0.05 - gas`):
+      1. комиссия берётся с цены ПРОДАЖИ, а не покупки (так работают площадки);
+      2. добавлено роялти создателю коллекции;
+      3. продаём с undercut'ом, а не ровно по floor.
+    Все три правки смещают оценку в консервативную сторону — раньше бот
+    систематически завышал прибыль.
     """
-    return (floor_price - buy_price) - (buy_price * MARKETPLACE_FEE_PCT) - GAS_FEE_TON
+    sale = target_sale_price(floor_price)
+    proceeds = sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)
+    return proceeds - buy_price - GAS_FEE_TON
 
 
 def compute_roi_pct(net_profit: Decimal, buy_price: Decimal) -> Decimal:
@@ -358,26 +566,38 @@ AI_SYSTEM_PROMPT = f"""\
 
 ПРАВИЛА РАСЧЁТА (соблюдай буквально):
 
-1) ЧИСТАЯ ПРИБЫЛЬ (в TON):
-   NET_PROFIT = (Floor_Price - Buy_Price) - (Buy_Price * {MARKETPLACE_FEE_PCT}) - {GAS_FEE_TON}
-   где {MARKETPLACE_FEE_PCT} — комиссия площадки (5%), {GAS_FEE_TON} TON — газ сети.
+1) ЦЕНА РЕАЛЬНОЙ ПРОДАЖИ:
+   SALE = Floor_Price * (1 - {UNDERCUT_PCT})
+   Продать РОВНО по floor нельзя — чтобы уйти первым, надо встать ниже.
 
-2) ROI в процентах:
+2) ЧИСТАЯ ПРИБЫЛЬ (в TON):
+   PROCEEDS   = SALE - SALE*{MARKETPLACE_FEE_PCT} - SALE*{ROYALTY_PCT}
+   NET_PROFIT = PROCEEDS - Buy_Price - {GAS_FEE_TON}
+   где {MARKETPLACE_FEE_PCT} — комиссия площадки, {ROYALTY_PCT} — роялти
+   создателю коллекции (ОБЕ берутся с цены ПРОДАЖИ, не с цены покупки),
+   {GAS_FEE_TON} TON — газ за круг покупка+продажа.
+
+3) ROI в процентах:
    ROI_PERCENT = NET_PROFIT / Buy_Price * 100
 
-3) ОТСЕЧЕНИЕ ХАЙПА / ПЕРЕПЛАТЫ (критично!):
-   Считай номер минта "красивым", ТОЛЬКО если он входит в топ-100 (<= 100)
-   ЛИБО является классическим красивым числом (например 7, 77, 777, 1111,
-   5555, 8888, 9999). Если номер НЕ красивый и НЕ в топ-100, то ЛЮБАЯ цена
-   покупки ВЫШЕ Floor_Price — это ПЕРЕПЛАТА за хайп. В этом случае немедленно
-   выдавай ACTION = "SKIP", даже если формально прибыль кажется возможной.
+4) ОТСЕЧЕНИЕ ХАЙПА / ПЕРЕПЛАТЫ (критично!):
+   Поле is_top_100_or_pretty уже вычислено детерминированно — доверяй ему,
+   не пересчитывай сам. Если оно false, то ЛЮБАЯ цена покупки ВЫШЕ
+   Floor_Price — это ПЕРЕПЛАТА за хайп, и ты немедленно выдаёшь
+   ACTION = "SKIP", даже если формально прибыль кажется возможной.
 
-4) РЕШЕНИЕ:
+5) ДОСТОВЕРНОСТЬ FLOOR:
+   Если floor_is_reliable = false, выборка рынка слишком мала и floor
+   недостоверен. В этом случае ВСЕГДА возвращай ACTION = "SKIP".
+
+6) РЕШЕНИЕ:
    ACTION = "BUY"  только если ОДНОВРЕМЕННО:
        - NET_PROFIT > 0,
        - ROI_PERCENT >= {MIN_ROI_PCT},
-       - нет переплаты по правилу (3).
-   Иначе ACTION = "SKIP".
+       - нет переплаты по правилу (4),
+       - floor_is_reliable = true.
+   Иначе ACTION = "SKIP". В спорных случаях всегда выбирай SKIP:
+   пропущенная сделка стоит ноль, ошибочная покупка стоит денег.
 
 ФОРМАТ ОТВЕТА — СТРОГО ОДИН JSON-ОБЪЕКТ, без markdown, без пояснений вокруг:
 {{
@@ -389,7 +609,8 @@ AI_SYSTEM_PROMPT = f"""\
 """
 
 
-def ai_analyze(client: Anthropic, item: dict, floor_price: Decimal) -> dict:
+def ai_analyze(client: Anthropic, item: dict, floor_price: Decimal,
+               floor_reliable: bool) -> dict:
     """
     Отправляет один лот + Floor Price в Claude API и возвращает распарсенный
     вердикт (dict с ключами ACTION, ROI_PERCENT, NET_PROFIT_TON, REASON).
@@ -404,10 +625,14 @@ def ai_analyze(client: Anthropic, item: dict, floor_price: Decimal) -> dict:
         "mint_index": item["mint_index"],
         "buy_price_ton": item["sale_price_ton"],
         "floor_price_ton": float(floor_price),
+        "target_sale_price_ton": float(target_sale_price(floor_price)),
         "marketplace_fee_pct": float(MARKETPLACE_FEE_PCT),
+        "royalty_pct": float(ROYALTY_PCT),
+        "undercut_pct": float(UNDERCUT_PCT),
         "gas_fee_ton": float(GAS_FEE_TON),
         "min_roi_pct": float(MIN_ROI_PCT),
         "is_top_100_or_pretty": is_pretty_mint(item["mint_index"]),
+        "floor_is_reliable": floor_reliable,
     }
 
     user_message = (
@@ -512,11 +737,23 @@ def execute_blockchain_buy(item_id: str, price) -> bool:
 # 7. ОБРАБОТКА ОДНОГО ЛОТА (сбор -> ИИ -> действие)
 # =============================================================================
 
-def process_item(client: Anthropic, item: dict, floor_price: Decimal):
+def process_item(client: Anthropic, item: dict, floor_price: Decimal,
+                 floor_reliable: bool):
     """Прогоняет один лот через ИИ и, при вердикте BUY, вызывает покупку."""
     buy_price = Decimal(str(item["sale_price_ton"]))
     mint = item["mint_index"]
     pretty = is_pretty_mint(mint)
+
+    # --- ЗАЩИТА ОТ СКАМА: адрес коллекции важнее любого названия -----------
+    # Делается ДО вызова ИИ: и дешевле, и ИИ нельзя доверить проверку,
+    # которую можно выполнить детерминированно.
+    if not is_collection_trusted(item.get("collection_address", "")):
+        log.warning(
+            f"{_Color.RED}ОТКЛОНЕНО: лот {_short(item['address'])} "
+            f"из коллекции вне whitelist ({_short(item.get('collection_address', ''))}). "
+            f"Возможен скам-клон.{_Color.RESET}"
+        )
+        return
 
     # Локальный предрасчёт (для лога; финальное слово — за ИИ).
     local_profit = compute_net_profit(floor_price, buy_price)
@@ -530,7 +767,7 @@ def process_item(client: Anthropic, item: dict, floor_price: Decimal):
     )
 
     # Вердикт ИИ.
-    verdict = ai_analyze(client, item, floor_price)
+    verdict = ai_analyze(client, item, floor_price, floor_reliable)
     action = str(verdict.get("ACTION", "SKIP")).upper()
     roi = verdict.get("ROI_PERCENT", 0)
     net = verdict.get("NET_PROFIT_TON", 0)
@@ -539,6 +776,20 @@ def process_item(client: Anthropic, item: dict, floor_price: Decimal):
     if action == "BUY":
         log.info(f"{_Color.GREEN}{_Color.BOLD}ВЕРДИКТ ИИ: BUY{_Color.RESET} "
                  f"| ROI {roi}% | профит {net} TON | {reason}")
+
+        # --- ПОСЛЕДНИЙ РУБЕЖ: детерминированная проверка поверх ИИ ----------
+        # ИИ может ошибиться в арифметике или проигнорировать правило.
+        # Деньги тратятся только если локальный расчёт ТОЖЕ согласен.
+        if not floor_reliable:
+            log.warning(f"{_Color.RED}ПОКУПКА ОТМЕНЕНА: floor недостоверен "
+                        f"(мала выборка рынка).{_Color.RESET}")
+            return
+        if local_profit <= 0 or local_roi < MIN_ROI_PCT:
+            log.warning(f"{_Color.RED}ПОКУПКА ОТМЕНЕНА: локальный расчёт не согласен "
+                        f"с ИИ (профит {local_profit:.4f} TON, ROI {local_roi}% "
+                        f"< порога {MIN_ROI_PCT}%).{_Color.RESET}")
+            return
+
         execute_blockchain_buy(item["address"], buy_price)
     else:
         log.info(f"{_Color.YELLOW}ВЕРДИКТ ИИ: SKIP{_Color.RESET} "
@@ -561,10 +812,23 @@ def preflight_checks():
         problems.append("ANTHROPIC_API_KEY не задан (нужен для ИИ-анализа).")
     if not TARGET_COLLECTION or TARGET_COLLECTION.startswith("EQAAAAAA"):
         problems.append("TARGET_COLLECTION не задан — впишите реальный адрес коллекции.")
+    elif normalize_ton_address(TARGET_COLLECTION) is None:
+        problems.append(f"TARGET_COLLECTION нераспознан как адрес TON: {TARGET_COLLECTION!r}")
+
+    # Адреса в whitelist тоже должны быть валидны, иначе защита молча не работает.
+    for addr in COLLECTION_WHITELIST:
+        if normalize_ton_address(addr) is None:
+            problems.append(f"COLLECTION_WHITELIST содержит нераспознанный адрес: {addr!r}")
+
     if problems:
         for p in problems:
             log.error(p)
         return False
+
+    if not COLLECTION_WHITELIST:
+        log.warning(f"{_Color.YELLOW}COLLECTION_WHITELIST пуст — проверка на скам-коллекции "
+                    f"ОТКЛЮЧЕНА. Укажите доверенные адреса перед реальной торговлей."
+                    f"{_Color.RESET}")
     return True
 
 
@@ -587,16 +851,26 @@ def main():
         log.info(f"{_Color.BOLD}--- Проверка #{cycle} @ {now} ---{_Color.RESET}")
 
         try:
-            items, floor, source = get_market_snapshot(TARGET_COLLECTION, ITEMS_PER_POLL)
+            candidates, floor, sample_size, source = get_market_snapshot(TARGET_COLLECTION)
 
-            if not items:
+            # Floor достоверен только при достаточной выборке рынка.
+            floor_reliable = sample_size >= MIN_FLOOR_SAMPLE and floor > 0
+
+            if not candidates:
                 log.warning("Активных лотов на продаже не найдено. Жду следующей проверки.")
+            elif not floor_reliable:
+                log.warning(
+                    f"{_Color.YELLOW}Floor недостоверен: в выборке всего {sample_size} лотов "
+                    f"(нужно >= {MIN_FLOOR_SAMPLE}). Торговля в этом цикле пропущена."
+                    f"{_Color.RESET}"
+                )
             else:
-                log.info(f"Источник: {source} | Лотов на продаже: {len(items)} | "
-                         f"Floor Price: {floor} TON")
-                # Прогоняем каждый обнаруженный подарок через ИИ.
-                for item in items:
-                    process_item(client, item, floor)
+                log.info(f"Источник: {source} | Выборка: {sample_size} лотов | "
+                         f"Floor (P{FLOOR_PERCENTILE}): {floor} TON | "
+                         f"Кандидатов: {len(candidates)}")
+                # Прогоняем самые дешёвые лоты через ИИ.
+                for item in candidates:
+                    process_item(client, item, floor, floor_reliable)
 
         except KeyboardInterrupt:
             raise
