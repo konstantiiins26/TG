@@ -120,6 +120,32 @@ COLLECTION_WHITELIST = [a.strip() for a in os.getenv("COLLECTION_WHITELIST", "")
 POLL_INTERVAL_SEC   = int(os.getenv("POLL_INTERVAL_SEC", "12"))           # задержка между проверками (10–15 сек)
 HTTP_TIMEOUT_SEC    = int(os.getenv("HTTP_TIMEOUT_SEC", "15"))           # таймаут HTTP-запросов
 
+# --- Редкость трейтов (Ярус 2) ----------------------------------------------
+# Для Telegram Gifts редкость модели/фона/символа влияет на цену СИЛЬНЕЕ, чем
+# номер минта. Официального API редкости нет, поэтому частоты трейтов считаются
+# по той же выборке, что и floor. Это ОЦЕНКА по выборке, а не истина по всей
+# коллекции — чем больше FLOOR_SAMPLE_PAGES, тем она точнее.
+RARE_TRAIT_THRESHOLD_PCT = Decimal(os.getenv("RARE_TRAIT_THRESHOLD_PCT", "5"))  # <= N% носителей = редкий
+MIN_TRAIT_SAMPLE    = int(os.getenv("MIN_TRAIT_SAMPLE", "50"))            # меньше — редкость не оцениваем
+
+# --- Ликвидность (Ярус 2) ---------------------------------------------------
+# Floor ничего не говорит о том, ПРОДАСТСЯ ли лот. Если у floor стоит толпа
+# продавцов, ваш undercut встанет в конец очереди и флип не закроется.
+COMPETITION_BAND_PCT = Decimal(os.getenv("COMPETITION_BAND_PCT", "10"))    # полоса вокруг floor, %
+MAX_COMPETITION     = int(os.getenv("MAX_COMPETITION", "15"))             # больше лотов в полосе — не лезем
+
+# История продаж: эндпоинт истории TonAPI НЕ ПРОВЕРЕН из этой среды (сеть
+# закрыта), поэтому по умолчанию ВЫКЛЮЧЕН. Включайте только после того, как
+# убедитесь, что ответ парсится — иначе фильтр будет врать.
+ENABLE_SALES_HISTORY = os.getenv("ENABLE_SALES_HISTORY", "0") == "1"
+LIQUIDITY_WINDOW_HOURS = int(os.getenv("LIQUIDITY_WINDOW_HOURS", "72"))   # окно наблюдения продаж
+MIN_SALES_IN_WINDOW = int(os.getenv("MIN_SALES_IN_WINDOW", "1"))          # меньше сделок — рынок мёртв
+
+# --- Дедупликация (Ярус 2) --------------------------------------------------
+# Без неё один и тот же неизменившийся лот уходит в Claude каждые 12 секунд.
+# Это прямые деньги за API и мусор в логах.
+SEEN_TTL_SEC        = int(os.getenv("SEEN_TTL_SEC", "300"))               # не переспрашивать ИИ N секунд
+
 # --- "Красивые" номера минта, за которые наценка оправдана -------------------
 # Топ-100 (номер <= 100) + классические reepeat-digit / lucky номера.
 PRETTY_MINTS        = {7, 77, 777, 7777, 111, 1111, 11111,
@@ -250,7 +276,7 @@ def is_collection_trusted(collection_addr: str) -> bool:
 
 
 # =============================================================================
-# 4. СБОР ДАННЫХ С РЫНКА (БЕСПЛАТНЫЕ ПУБЛИЧНЫЕ API)
+# 4. РЫНОК: СБОР ДАННЫХ, РЕДКОСТЬ, ЛИКВИДНОСТЬ, ДЕДУПЛИКАЦИЯ
 # =============================================================================
 
 def _nano_to_ton(nano_value) -> Decimal:
@@ -299,6 +325,8 @@ def fetch_items_tonapi(collection: str, limit: int, offset: int = 0):
 
         coll = nft.get("collection") or {}
         items.append(_normalize_item(
+            traits=extract_traits(meta),
+            explicit_rarity_pct=_explicit_rarity_pct(meta),
             address=nft.get("address", ""),
             collection_name=coll.get("name") or meta.get("name", "Unknown"),
             # Адрес коллекции — единственное, чему можно доверять при проверке
@@ -386,7 +414,8 @@ def _extract_mint_index(nft: dict, meta: dict):
 
 
 def _normalize_item(address, collection_name, collection_address,
-                    mint_index, sale_price_ton, is_on_sale):
+                    mint_index, sale_price_ton, is_on_sale,
+                    traits=None, explicit_rarity_pct=None):
     """Единый формат лота для всего приложения (и для отправки в ИИ)."""
     return {
         "address": address,
@@ -395,7 +424,218 @@ def _normalize_item(address, collection_name, collection_address,
         "mint_index": mint_index,
         "sale_price_ton": float(sale_price_ton),   # float для JSON-сериализации в ИИ
         "is_on_sale": is_on_sale,
+        # Трейты нужны для оценки редкости — она влияет на цену Telegram Gifts
+        # сильнее номера минта.
+        "traits": traits or {},
+        "explicit_rarity_pct": explicit_rarity_pct,
     }
+
+
+# --- Трейты и редкость -------------------------------------------------------
+# Служебные атрибуты, которые НЕ являются признаком редкости (это номер, а не
+# характеристика). Номер минта оценивается отдельно, в is_pretty_mint().
+# Сравнение идёт ПО СЛОВАМ, а не по подстроке: подстрочный матч выбрасывал
+# легитимные трейты ("Sidekick" и "Rider" содержат "id").
+_SKIP_TRAITS = {"number", "mint", "index", "serial", "id", "rarity", "no", "num"}
+
+
+def extract_traits(meta: dict) -> dict:
+    """
+    Достаёт характеристики подарка из metadata.attributes:
+    {"model": "Plush Pepe", "backdrop": "Onyx Black", "symbol": "Skull"}.
+
+    Служебные числовые атрибуты (номер/индекс) пропускаем — они про
+    нумерацию, а не про редкость.
+    """
+    traits = {}
+    for attr in meta.get("attributes", []) or []:
+        name = str(attr.get("trait_type", "")).strip().lower()
+        value = attr.get("value")
+        if not name or value is None:
+            continue
+        if set(re.split(r"[^a-z0-9]+", name)) & _SKIP_TRAITS:
+            continue
+        traits[name] = str(value).strip()
+    return traits
+
+
+def _explicit_rarity_pct(meta: dict):
+    """
+    Если площадка сама отдала процент редкости — доверяем ему больше, чем
+    нашей оценке по выборке. Ищем атрибут с 'rarity' в названии.
+    Возвращает Decimal (проценты) или None.
+    """
+    for attr in meta.get("attributes", []) or []:
+        name = str(attr.get("trait_type", "")).strip().lower()
+        if "rarity" not in name:
+            continue
+        raw = str(attr.get("value", "")).replace("%", "").strip()
+        try:
+            val = Decimal(raw)
+        except (InvalidOperation, ValueError):
+            continue
+        if Decimal("0") < val <= Decimal("100"):
+            return val
+    return None
+
+
+def build_trait_index(items):
+    """
+    Считает частоты значений трейтов по выборке:
+        {"backdrop": {"Onyx Black": 3, "Sky Blue": 140}, ...}
+
+    Возвращает (index, total_items). Это ОЦЕНКА по выборке — официального
+    API редкости нет, поэтому точность растёт с размером выборки.
+    """
+    index, total = {}, 0
+    for item in items:
+        traits = item.get("traits") or {}
+        if not traits:
+            continue
+        total += 1
+        for name, value in traits.items():
+            index.setdefault(name, {})
+            index[name][value] = index[name].get(value, 0) + 1
+    return index, total
+
+
+def compute_rarity_pct(item: dict, index: dict, total: int):
+    """
+    Оценивает редкость лота как долю (в %) носителей его САМОГО РЕДКОГО трейта.
+    Меньше процент — реже подарок.
+
+    Приоритет: явный процент от площадки > оценка по выборке.
+    Возвращает (rarity_pct | None, имя_редчайшего_трейта | None).
+    None означает "оценить не удалось" — это НЕ то же самое, что "обычный".
+    """
+    explicit = item.get("explicit_rarity_pct")
+    if explicit is not None:
+        return explicit, "explicit"
+
+    traits = item.get("traits") or {}
+    if not traits or total < MIN_TRAIT_SAMPLE:
+        return None, None
+
+    rarest_pct, rarest_name = None, None
+    for name, value in traits.items():
+        counts = index.get(name)
+        if not counts:
+            continue
+        seen = counts.get(value)
+        if not seen:
+            continue
+        pct = (Decimal(seen) / Decimal(total) * Decimal("100"))
+        if rarest_pct is None or pct < rarest_pct:
+            rarest_pct, rarest_name = pct, name
+
+    if rarest_pct is None:
+        return None, None
+    return rarest_pct.quantize(Decimal("0.01")), rarest_name
+
+
+def is_rare(rarity_pct) -> bool:
+    """Редкий = носителей не больше RARE_TRAIT_THRESHOLD_PCT процентов."""
+    return rarity_pct is not None and rarity_pct <= RARE_TRAIT_THRESHOLD_PCT
+
+
+# --- Ликвидность -------------------------------------------------------------
+
+def compute_competition(prices, floor: Decimal) -> int:
+    """
+    Сколько лотов стоит в пределах COMPETITION_BAND_PCT процентов от floor.
+
+    Зачем: floor говорит "по какой цене висит самый дешёвый", но ничего не
+    говорит о том, продастся ли ваш лот. Если у floor стоит толпа, ваш
+    undercut окажется в очереди и флип не закроется — прибыль на бумаге
+    так и останется на бумаге.
+    """
+    if floor <= 0:
+        return 0
+    band = floor * (Decimal("1") + COMPETITION_BAND_PCT / Decimal("100"))
+    return sum(1 for pr in prices if pr <= band)
+
+
+def fetch_recent_sales_count(collection: str):
+    """
+    Считает продажи коллекции за LIQUIDITY_WINDOW_HOURS часов.
+
+    ВНИМАНИЕ: схема этого эндпоинта TonAPI НЕ ПРОВЕРЕНА (из среды разработки
+    не было сетевого доступа). Поэтому функция выключена по умолчанию
+    (ENABLE_SALES_HISTORY=0) и при любой неожиданности возвращает None
+    вместо выдуманного числа.
+
+    Возвращает int (число сделок) или None, если данные недоступны.
+    """
+    if not ENABLE_SALES_HISTORY:
+        return None
+
+    url = f"https://tonapi.io/v2/nfts/collections/{collection}/history"
+    headers = {"Accept": "application/json"}
+    if TONAPI_KEY:
+        headers["Authorization"] = f"Bearer {TONAPI_KEY}"
+
+    cutoff = time.time() - LIQUIDITY_WINDOW_HOURS * 3600
+    try:
+        resp = requests.get(url, params={"limit": 100}, headers=headers,
+                            timeout=HTTP_TIMEOUT_SEC)
+        resp.raise_for_status()
+        events = resp.json().get("events", [])
+    except Exception as e:  # noqa: BLE001 — нет данных лучше, чем выдуманные
+        log.warning(f"История продаж недоступна ({e}). Фильтр ликвидности пропущен.")
+        return None
+
+    sales = 0
+    for ev in events:
+        if ev.get("timestamp", 0) < cutoff:
+            continue
+        # Продажей считаем событие, в котором участвовал контракт продажи.
+        for action in ev.get("actions", []) or []:
+            if "Sale" in str(action.get("type", "")) or action.get("NftPurchase"):
+                sales += 1
+                break
+    return sales
+
+
+# --- Дедупликация ------------------------------------------------------------
+# {"<address>:<price>": timestamp}. Один и тот же неизменившийся лот не должен
+# уходить в Claude каждые 12 секунд — это прямые деньги за API.
+_seen_cache = {}
+
+
+def _floor_bucket(floor: Decimal) -> str:
+    """
+    Огрубляет floor до 3 значащих цифр (~1% шаг).
+
+    Нужно для ключа дедупликации: floor всё время немного дрожит, и без
+    огрубления кэш сбрасывался бы каждый цикл. Но при РЕАЛЬНОМ сдвиге floor
+    вердикт обязан пересчитаться — лот, который был SKIP при floor=10,
+    вполне может стать BUY при floor=15.
+    """
+    try:
+        return f"{float(floor):.3g}"
+    except (ValueError, OverflowError):
+        return "0"
+
+
+def already_analyzed(item: dict, floor: Decimal) -> bool:
+    """
+    True, если этот лот по ЭТОЙ ЖЕ цене и при ТОМ ЖЕ floor уже анализировался
+    недавно.
+
+    Ключ включает цену и floor: и то и другое — новое торговое событие,
+    которое нужно пересчитать, даже если лот тот же.
+    """
+    key = f"{item['address']}:{item['sale_price_ton']}:{_floor_bucket(floor)}"
+    now = time.monotonic()
+
+    # Попутно чистим протухшие записи, чтобы словарь не рос бесконечно.
+    for k in [k for k, ts in _seen_cache.items() if now - ts > SEEN_TTL_SEC]:
+        _seen_cache.pop(k, None)
+
+    if now - _seen_cache.get(key, -1e9) < SEEN_TTL_SEC:
+        return True
+    _seen_cache[key] = now
+    return False
 
 
 def _percentile(sorted_vals, pct: Decimal) -> Decimal:
@@ -428,15 +668,24 @@ def _percentile(sorted_vals, pct: Decimal) -> Decimal:
 _floor_cache = {}
 
 
-def get_market_snapshot(collection: str):
-    """
-    Возвращает (candidates, floor_price, sample_size, source).
+def _empty_snapshot(source="none"):
+    """Пустой снапшот — чтобы вызывающий код не разбирал особые случаи."""
+    return {"candidates": [], "floor": Decimal("0"), "sample_size": 0,
+            "source": source, "trait_index": {}, "trait_total": 0,
+            "competition": 0, "floor_reliable": False}
 
-    candidates  — самые дешёвые лоты на продажу (кандидаты на покупку).
-    floor_price — ЧЕСТНЫЙ floor: перцентиль по широкой выборке, а не min()
-                  по первой странице.
-    sample_size — сколько лотов на продажу попало в выборку. Если мало,
-                  floor недостоверен и торговать нельзя.
+
+def get_market_snapshot(collection: str) -> dict:
+    """
+    Снимок рынка одним словарём:
+
+      candidates     — самые дешёвые лоты на продажу (кандидаты на покупку)
+      floor          — ЧЕСТНЫЙ floor: перцентиль по широкой выборке, не min()
+      sample_size    — сколько лотов на продажу попало в выборку
+      floor_reliable — достаточна ли выборка, чтобы floor чему-то соответствовал
+      trait_index    — частоты трейтов по выборке (основа оценки редкости)
+      trait_total    — сколько лотов с трейтами попало в индекс
+      competition    — сколько продавцов стоит вплотную к floor (ликвидность)
 
     Почему выборка: у TonAPI /items нет сортировки по цене, он отдаёт
     элементы по индексу. Поэтому тянем FLOOR_SAMPLE_PAGES страниц и считаем
@@ -446,10 +695,9 @@ def get_market_snapshot(collection: str):
     cached = _floor_cache.get(cache_key)
     now = time.monotonic()
 
-    # --- Собираем выборку (или берём кандидатов из свежего кэша) ------------
     all_items, source = _collect_sample(collection)
     if not all_items:
-        return [], Decimal("0"), 0, "none"
+        return _empty_snapshot()
 
     on_sale = [it for it in all_items if it["is_on_sale"] and it["sale_price_ton"] > 0]
     prices = sorted(Decimal(str(it["sale_price_ton"])) for it in on_sale)
@@ -463,9 +711,20 @@ def get_market_snapshot(collection: str):
         if sample_size >= MIN_FLOOR_SAMPLE:
             _floor_cache[cache_key] = (now, floor, sample_size)
 
-    # Кандидаты — самые дешёвые лоты (именно среди них живёт арбитраж).
-    candidates = sorted(on_sale, key=lambda it: it["sale_price_ton"])[:CANDIDATES_TO_ANALYZE]
-    return candidates, floor, sample_size, source
+    # Индекс редкости строим по ВСЕЙ выборке, а не только по лотам на продаже:
+    # редкость — свойство коллекции, а не текущих листингов.
+    trait_index, trait_total = build_trait_index(all_items)
+
+    return {
+        "candidates": sorted(on_sale, key=lambda it: it["sale_price_ton"])[:CANDIDATES_TO_ANALYZE],
+        "floor": floor,
+        "sample_size": sample_size,
+        "source": source,
+        "trait_index": trait_index,
+        "trait_total": trait_total,
+        "competition": compute_competition(prices, floor),
+        "floor_reliable": sample_size >= MIN_FLOOR_SAMPLE and floor > 0,
+    }
 
 
 def _collect_sample(collection: str):
@@ -555,7 +814,7 @@ def is_pretty_mint(mint_index) -> bool:
 
 
 # =============================================================================
-# 5. ИИ-МОЗГ — АНАЛИЗ РЫНКА ЧЕРЕЗ CLAUDE API
+# 6. ИИ-МОЗГ — АНАЛИЗ РЫНКА ЧЕРЕЗ CLAUDE API
 # =============================================================================
 
 # Системный промпт с ЖЁСТКИМИ правилами. ИИ обязан вернуть строгий JSON.
@@ -581,21 +840,35 @@ AI_SYSTEM_PROMPT = f"""\
    ROI_PERCENT = NET_PROFIT / Buy_Price * 100
 
 4) ОТСЕЧЕНИЕ ХАЙПА / ПЕРЕПЛАТЫ (критично!):
-   Поле is_top_100_or_pretty уже вычислено детерминированно — доверяй ему,
-   не пересчитывай сам. Если оно false, то ЛЮБАЯ цена покупки ВЫШЕ
-   Floor_Price — это ПЕРЕПЛАТА за хайп, и ты немедленно выдаёшь
-   ACTION = "SKIP", даже если формально прибыль кажется возможной.
+   Наценка над Floor_Price оправдана ТОЛЬКО двумя причинами:
+     а) is_top_100_or_pretty = true  (красивый или топ-100 номер минта);
+     б) is_rare = true               (редкие трейты: модель/фон/символ).
+   Оба поля вычислены детерминированно — доверяй им, не пересчитывай сам.
+   Если ОБА false, то ЛЮБАЯ цена покупки ВЫШЕ Floor_Price — это ПЕРЕПЛАТА
+   за хайп, и ты немедленно выдаёшь ACTION = "SKIP", даже если формально
+   прибыль кажется возможной.
+
+   ВАЖНО про rarity_pct: это доля носителей самого редкого трейта в процентах
+   (меньше = реже). Значение null означает "редкость оценить не удалось" —
+   это НЕ синоним "редкий". При null наценку над floor считай переплатой.
 
 5) ДОСТОВЕРНОСТЬ FLOOR:
    Если floor_is_reliable = false, выборка рынка слишком мала и floor
    недостоверен. В этом случае ВСЕГДА возвращай ACTION = "SKIP".
 
-6) РЕШЕНИЕ:
+6) ЛИКВИДНОСТЬ:
+   competition — сколько продавцов уже стоит вплотную к floor. Если
+   competition > max_competition, ваш лот встанет в конец очереди и флип
+   не закроется: бумажная прибыль не равна реальной. Возвращай "SKIP".
+   Если recent_sales = 0 (и оно не null), рынок мёртв — тоже "SKIP".
+
+7) РЕШЕНИЕ:
    ACTION = "BUY"  только если ОДНОВРЕМЕННО:
        - NET_PROFIT > 0,
        - ROI_PERCENT >= {MIN_ROI_PCT},
        - нет переплаты по правилу (4),
-       - floor_is_reliable = true.
+       - floor_is_reliable = true,
+       - ликвидность проходит по правилу (6).
    Иначе ACTION = "SKIP". В спорных случаях всегда выбирай SKIP:
    пропущенная сделка стоит ноль, ошибочная покупка стоит денег.
 
@@ -610,7 +883,8 @@ AI_SYSTEM_PROMPT = f"""\
 
 
 def ai_analyze(client: Anthropic, item: dict, floor_price: Decimal,
-               floor_reliable: bool) -> dict:
+               floor_reliable: bool, rarity_pct, rarest_trait,
+               competition: int, recent_sales) -> dict:
     """
     Отправляет один лот + Floor Price в Claude API и возвращает распарсенный
     вердикт (dict с ключами ACTION, ROI_PERCENT, NET_PROFIT_TON, REASON).
@@ -633,6 +907,17 @@ def ai_analyze(client: Anthropic, item: dict, floor_price: Decimal,
         "min_roi_pct": float(MIN_ROI_PCT),
         "is_top_100_or_pretty": is_pretty_mint(item["mint_index"]),
         "floor_is_reliable": floor_reliable,
+        # --- Редкость (Ярус 2) ---
+        "traits": item.get("traits", {}),
+        "rarity_pct": float(rarity_pct) if rarity_pct is not None else None,
+        "rarest_trait": rarest_trait,
+        "is_rare": is_rare(rarity_pct),
+        "rare_threshold_pct": float(RARE_TRAIT_THRESHOLD_PCT),
+        # --- Ликвидность (Ярус 2) ---
+        "competition": competition,
+        "max_competition": MAX_COMPETITION,
+        "recent_sales": recent_sales,
+        "liquidity_window_hours": LIQUIDITY_WINDOW_HOURS,
     }
 
     user_message = (
@@ -711,7 +996,7 @@ def _parse_ai_json(raw: str) -> dict:
 
 
 # =============================================================================
-# 6. БЛОКЧЕЙН — ЗАГЛУШКА ПОКУПКИ (реальная подпись НЕ выполняется)
+# 7. БЛОКЧЕЙН — ЗАГЛУШКА ПОКУПКИ (реальная подпись НЕ выполняется)
 # =============================================================================
 
 def execute_blockchain_buy(item_id: str, price) -> bool:
@@ -734,12 +1019,15 @@ def execute_blockchain_buy(item_id: str, price) -> bool:
 
 
 # =============================================================================
-# 7. ОБРАБОТКА ОДНОГО ЛОТА (сбор -> ИИ -> действие)
+# 8. ОБРАБОТКА ОДНОГО ЛОТА (сбор -> ИИ -> действие)
 # =============================================================================
 
-def process_item(client: Anthropic, item: dict, floor_price: Decimal,
-                 floor_reliable: bool):
+def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
     """Прогоняет один лот через ИИ и, при вердикте BUY, вызывает покупку."""
+    floor_price = snapshot["floor"]
+    floor_reliable = snapshot["floor_reliable"]
+    competition = snapshot["competition"]
+
     buy_price = Decimal(str(item["sale_price_ton"]))
     mint = item["mint_index"]
     pretty = is_pretty_mint(mint)
@@ -755,19 +1043,34 @@ def process_item(client: Anthropic, item: dict, floor_price: Decimal,
         )
         return
 
+    # --- ДЕДУПЛИКАЦИЯ: не переспрашиваем ИИ про тот же лот по той же цене ---
+    # Ставится ДО вызова Claude, потому что смысл именно в экономии на API.
+    if already_analyzed(item, floor_price):
+        log.debug(f"Пропуск (уже анализировали): {_short(item['address'])} @ {buy_price} TON")
+        return
+
+    # --- РЕДКОСТЬ: для Telegram Gifts она важнее номера минта ---------------
+    rarity_pct, rarest_trait = compute_rarity_pct(
+        item, snapshot["trait_index"], snapshot["trait_total"])
+    rare = is_rare(rarity_pct)
+
     # Локальный предрасчёт (для лога; финальное слово — за ИИ).
     local_profit = compute_net_profit(floor_price, buy_price)
     local_roi = compute_roi_pct(local_profit, buy_price)
 
+    rarity_note = (f"редкость {rarity_pct}% по '{rarest_trait}'"
+                   if rarity_pct is not None else "редкость н/д")
     log.info(
         f"Лот {_short(item['address'])} | mint #{mint} "
         f"{'★красивый' if pretty else 'обычный'} | "
+        f"{'♦РЕДКИЙ' if rare else rarity_note} | "
         f"цена {buy_price} TON | floor {floor_price} TON | "
         f"локальный ROI {local_roi}%"
     )
 
     # Вердикт ИИ.
-    verdict = ai_analyze(client, item, floor_price, floor_reliable)
+    verdict = ai_analyze(client, item, floor_price, floor_reliable,
+                         rarity_pct, rarest_trait, competition, recent_sales)
     action = str(verdict.get("ACTION", "SKIP")).upper()
     roi = verdict.get("ROI_PERCENT", 0)
     net = verdict.get("NET_PROFIT_TON", 0)
@@ -789,6 +1092,22 @@ def process_item(client: Anthropic, item: dict, floor_price: Decimal,
                         f"с ИИ (профит {local_profit:.4f} TON, ROI {local_roi}% "
                         f"< порога {MIN_ROI_PCT}%).{_Color.RESET}")
             return
+        # Переплата над floor допустима только за красивый номер ИЛИ редкость.
+        if buy_price > floor_price and not (pretty or rare):
+            log.warning(f"{_Color.RED}ПОКУПКА ОТМЕНЕНА: цена выше floor, "
+                        f"но лот не красивый и не редкий — это переплата."
+                        f"{_Color.RESET}")
+            return
+        if competition > MAX_COMPETITION:
+            log.warning(f"{_Color.RED}ПОКУПКА ОТМЕНЕНА: у floor уже {competition} "
+                        f"продавцов (порог {MAX_COMPETITION}) — флип не закроется."
+                        f"{_Color.RESET}")
+            return
+        if recent_sales is not None and recent_sales < MIN_SALES_IN_WINDOW:
+            log.warning(f"{_Color.RED}ПОКУПКА ОТМЕНЕНА: за {LIQUIDITY_WINDOW_HOURS}ч "
+                        f"продаж {recent_sales} (нужно >= {MIN_SALES_IN_WINDOW}) — "
+                        f"рынок неликвиден.{_Color.RESET}")
+            return
 
         execute_blockchain_buy(item["address"], buy_price)
     else:
@@ -802,7 +1121,7 @@ def _short(addr: str) -> str:
 
 
 # =============================================================================
-# 8. ГЛАВНЫЙ ЦИКЛ МОНИТОРИНГА (MONITORING LOOP)
+# 9. ГЛАВНЫЙ ЦИКЛ МОНИТОРИНГА (MONITORING LOOP)
 # =============================================================================
 
 def preflight_checks():
@@ -851,26 +1170,36 @@ def main():
         log.info(f"{_Color.BOLD}--- Проверка #{cycle} @ {now} ---{_Color.RESET}")
 
         try:
-            candidates, floor, sample_size, source = get_market_snapshot(TARGET_COLLECTION)
-
-            # Floor достоверен только при достаточной выборке рынка.
-            floor_reliable = sample_size >= MIN_FLOOR_SAMPLE and floor > 0
+            snap = get_market_snapshot(TARGET_COLLECTION)
+            candidates = snap["candidates"]
 
             if not candidates:
                 log.warning("Активных лотов на продаже не найдено. Жду следующей проверки.")
-            elif not floor_reliable:
+            elif not snap["floor_reliable"]:
                 log.warning(
-                    f"{_Color.YELLOW}Floor недостоверен: в выборке всего {sample_size} лотов "
-                    f"(нужно >= {MIN_FLOOR_SAMPLE}). Торговля в этом цикле пропущена."
-                    f"{_Color.RESET}"
+                    f"{_Color.YELLOW}Floor недостоверен: в выборке всего "
+                    f"{snap['sample_size']} лотов (нужно >= {MIN_FLOOR_SAMPLE}). "
+                    f"Торговля в этом цикле пропущена.{_Color.RESET}"
                 )
             else:
-                log.info(f"Источник: {source} | Выборка: {sample_size} лотов | "
-                         f"Floor (P{FLOOR_PERCENTILE}): {floor} TON | "
+                log.info(f"Источник: {snap['source']} | Выборка: {snap['sample_size']} лотов | "
+                         f"Floor (P{FLOOR_PERCENTILE}): {snap['floor']} TON | "
+                         f"Конкуренция у floor: {snap['competition']} | "
                          f"Кандидатов: {len(candidates)}")
+
+                if snap["trait_total"] < MIN_TRAIT_SAMPLE:
+                    log.warning(f"{_Color.YELLOW}Редкость не оценивается: трейтов только "
+                                f"у {snap['trait_total']} лотов (нужно >= {MIN_TRAIT_SAMPLE})."
+                                f"{_Color.RESET}")
+
+                # Ликвидность запрашивается ОДИН раз за цикл, а не на каждый лот.
+                recent_sales = fetch_recent_sales_count(TARGET_COLLECTION)
+                if recent_sales is not None:
+                    log.info(f"Продаж за {LIQUIDITY_WINDOW_HOURS}ч: {recent_sales}")
+
                 # Прогоняем самые дешёвые лоты через ИИ.
                 for item in candidates:
-                    process_item(client, item, floor, floor_reliable)
+                    process_item(client, item, snap, recent_sales)
 
         except KeyboardInterrupt:
             raise
