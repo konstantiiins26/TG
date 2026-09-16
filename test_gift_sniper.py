@@ -293,6 +293,210 @@ check("выключенная история возвращает None (без �
 
 
 # =============================================================================
+print("\n[10] Риск-лимиты и хранилище")
+# =============================================================================
+
+import os, tempfile, time as _time
+
+_tmpdir = tempfile.mkdtemp()
+gs.DB_PATH = os.path.join(_tmpdir, "test_state.db")
+gs.db_init()
+
+check("пустая БД: нет открытых позиций", gs.open_positions_count() == 0)
+check("пустая БД: нет трат", gs.spend_since(3600) == Decimal("0"))
+check("пустая БД: нет серии убытков", gs.consecutive_losses() == 0)
+
+lot = {"address": "0:pos1", "collection_address": "0:coll"}
+pid = gs.record_purchase(lot, Decimal("10"), Decimal("12"))
+check("позиция записана", isinstance(pid, int) and pid > 0)
+check("позиция считается открытой", gs.open_positions_count() == 1)
+check("траты учтены", gs.spend_since(3600) == Decimal("10"))
+
+# --- Потолок одной сделки ----------------------------------------------------
+ok, why = gs.check_risk_limits(gs.MAX_SPEND_PER_TRADE_TON + Decimal("1"))
+check("дорогая сделка блокируется", ok is False, why)
+ok, _ = gs.check_risk_limits(Decimal("1"))
+check("нормальная сделка проходит", ok is True)
+
+# --- Часовой лимит -----------------------------------------------------------
+_orig_hour = gs.MAX_SPEND_PER_HOUR_TON
+gs.MAX_SPEND_PER_HOUR_TON = Decimal("12")   # уже потрачено 10
+ok, why = gs.check_risk_limits(Decimal("5"))
+check("часовой лимит блокирует перерасход", ok is False, why)
+ok, _ = gs.check_risk_limits(Decimal("1"))
+check("в пределах часового лимита проходит", ok is True)
+gs.MAX_SPEND_PER_HOUR_TON = _orig_hour
+
+# --- Лимит открытых позиций --------------------------------------------------
+_orig_open = gs.MAX_OPEN_POSITIONS
+gs.MAX_OPEN_POSITIONS = 1
+ok, why = gs.check_risk_limits(Decimal("1"))
+check("лимит открытых позиций блокирует", ok is False, why)
+gs.MAX_OPEN_POSITIONS = _orig_open
+
+# --- PnL и серия убытков -----------------------------------------------------
+pnl = gs.close_position(pid, Decimal("20"))
+check("PnL посчитан при закрытии", pnl is not None and pnl > 0, f"pnl={pnl}")
+check("закрытая позиция больше не открыта", gs.open_positions_count() == 0)
+
+# Ключевой кейс: N убытков подряд обязаны остановить торговлю.
+for i in range(gs.STOP_AFTER_LOSSES):
+    lid = gs.record_purchase({"address": f"0:loss{i}", "collection_address": ""},
+                             Decimal("10"), Decimal("10"))
+    gs.close_position(lid, Decimal("1"))     # продали сильно дешевле -> убыток
+    _time.sleep(0.01)                        # чтобы sell_ts различались
+check("серия убытков посчитана",
+      gs.consecutive_losses() >= gs.STOP_AFTER_LOSSES, f"got={gs.consecutive_losses()}")
+ok, why = gs.check_risk_limits(Decimal("1"))
+check("торговля остановлена после серии убытков", ok is False, why)
+
+# Прибыльная сделка обязана сбросить серию.
+wid = gs.record_purchase({"address": "0:win", "collection_address": ""},
+                         Decimal("1"), Decimal("10"))
+gs.close_position(wid, Decimal("50"))
+check("прибыль сбрасывает серию убытков", gs.consecutive_losses() == 0)
+
+
+# =============================================================================
+print("\n[11] Уведомления не роняют торговлю")
+# =============================================================================
+
+_tok, _chat = gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID
+gs.TELEGRAM_BOT_TOKEN = gs.TELEGRAM_CHAT_ID = ""
+try:
+    gs.notify("тест")
+    check("без токена notify() молча ничего не делает", True)
+except Exception as e:
+    check("без токена notify() молча ничего не делает", False, str(e))
+
+# С битым токеном сеть недоступна — notify обязан проглотить ошибку.
+gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "bad", "bad"
+try:
+    gs.notify("тест")
+    check("сетевая ошибка в notify() не пробрасывается", True)
+except Exception as e:
+    check("сетевая ошибка в notify() не пробрасывается", False, str(e))
+gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = _tok, _chat
+
+
+# =============================================================================
+print("\n[12] evaluate_trade — единая функция решения")
+# =============================================================================
+
+def mk_snap(floor, competition=0, reliable=True, index=None, total=0):
+    return {"floor": Decimal(str(floor)), "competition": competition,
+            "floor_reliable": reliable, "trait_index": index or {}, "trait_total": total}
+
+def mk_lot(price, mint=5000, addr="0:t", traits=None):
+    return gs._normalize_item(addr, "C", "0:coll", mint, Decimal(str(price)), True,
+                              traits=traits or {})
+
+# Глубокая скидка при надёжном floor — покупаем.
+ev = gs.evaluate_trade(mk_lot(5), mk_snap(10), None)
+check("выгодная сделка разрешена", ev["allowed"] is True, ev["reason"])
+
+# Каждая причина отказа срабатывает отдельно.
+check("недостоверный floor блокирует",
+      gs.evaluate_trade(mk_lot(5), mk_snap(10, reliable=False), None)["allowed"] is False)
+check("убыточная сделка блокируется",
+      gs.evaluate_trade(mk_lot(10), mk_snap(10), None)["allowed"] is False)
+check("толпа у floor блокирует",
+      gs.evaluate_trade(mk_lot(5), mk_snap(10, competition=999), None)["allowed"] is False)
+check("мёртвый рынок блокирует",
+      gs.evaluate_trade(mk_lot(5), mk_snap(10), 0)["allowed"] is False)
+
+# Покупка выше floor без премии всегда убыточна — отдельной проверки
+# "переплата" нет намеренно, расчёт прибыли её уже содержит.
+over = gs.evaluate_trade(mk_lot(11, mint=4242), mk_snap(10), None)
+check("покупка выше floor блокируется", over["allowed"] is False)
+check("причина — убыточность (переплата поглощена расчётом)",
+      "убыточно" in over["reason"], over["reason"])
+
+# --- Премия за красоту/редкость ---------------------------------------------
+# По умолчанию нейтральна: красота и редкость НЕ должны тихо завышать прибыль.
+check("премия по умолчанию выключена (1.0)",
+      gs.PREMIUM_MULT == Decimal("1.0"), f"got={gs.PREMIUM_MULT}")
+check("при нейтральной премии красота не меняет расчёт",
+      gs.compute_net_profit(Decimal("10"), Decimal("5"), premium=True)
+      == gs.compute_net_profit(Decimal("10"), Decimal("5"), premium=False))
+
+_orig_prem = gs.PREMIUM_MULT
+gs.PREMIUM_MULT = Decimal("2.0")
+rare_index, rare_total = {"backdrop": {"Onyx": 1, "Blue": 999}}, 1000
+snap_r = mk_snap(10, index=rare_index, total=rare_total)
+
+ev_rare = gs.evaluate_trade(mk_lot(11, mint=4242, traits={"backdrop": "Onyx"}),
+                            snap_r, None)
+check("с премией редкий лот выше floor покупается",
+      ev_rare["allowed"] is True, ev_rare["reason"])
+check("редкость распознана", ev_rare["is_rare"] is True)
+check("отмечено, что премия применена", ev_rare["premium_applied"] is True)
+
+ev_pretty = gs.evaluate_trade(mk_lot(11, mint=777, traits={"backdrop": "Blue"}),
+                              snap_r, None)
+check("красивый номер тоже получает премию", ev_pretty["allowed"] is True,
+      ev_pretty["reason"])
+
+ev_plain = gs.evaluate_trade(mk_lot(11, mint=4242, traits={"backdrop": "Blue"}),
+                             snap_r, None)
+check("обычный лот премии НЕ получает и остаётся убыточным",
+      ev_plain["allowed"] is False, ev_plain["reason"])
+gs.PREMIUM_MULT = _orig_prem
+
+
+# =============================================================================
+print("\n[13] Бэктест: сквозной прогон по синтетической записи")
+# =============================================================================
+
+import json as _json
+
+rec_path = os.path.join(_tmpdir, "hist.jsonl")
+now_ts = _time.time()
+
+# Сценарий: floor стабильно 10, дешёвый лот за 5 -> сделка должна найтись,
+# а через 24ч floor тот же, значит прибыль реальна.
+with open(rec_path, "w", encoding="utf-8") as f:
+    for hour in range(0, 50):
+        row = {"ts": now_ts + hour * 3600, "floor": "10", "sample_size": 100,
+               "competition": 1, "floor_reliable": True,
+               "trait_index": {}, "trait_total": 0,
+               "candidates": [mk_lot(5, addr="0:deal")] if hour == 0 else []}
+        f.write(_json.dumps(row) + "\n")
+
+res = gs.run_backtest(rec_path, hold_hours=24)
+check("бэктест нашёл сделку", res and res["trades"] == 1, str(res))
+check("сделка закрылась", res and res["closed"] == 1, str(res))
+check("сделка прибыльна", res and res["pnl"] > 0, str(res and res["pnl"]))
+check("winrate 100%", res and res["winrate"] == Decimal("100"))
+
+# Позиция без будущего в записи обязана остаться НЕзакрытой, а не считаться
+# прибыльной — иначе бэктест подгоняет результат.
+tail_path = os.path.join(_tmpdir, "tail.jsonl")
+with open(tail_path, "w", encoding="utf-8") as f:
+    f.write(_json.dumps({"ts": now_ts, "floor": "10", "sample_size": 100,
+                         "competition": 1, "floor_reliable": True,
+                         "trait_index": {}, "trait_total": 0,
+                         "candidates": [mk_lot(5, addr="0:late")]}) + "\n")
+res2 = gs.run_backtest(tail_path, hold_hours=24)
+check("сделка без будущего не закрыта", res2 and res2["unresolved"] == 1, str(res2))
+check("незакрытая сделка не попала в winrate", res2 and res2["closed"] == 0)
+
+# Битые строки не должны ронять прогон.
+broken_path = os.path.join(_tmpdir, "broken.jsonl")
+with open(broken_path, "w", encoding="utf-8") as f:
+    f.write("{не json\n")
+    f.write(_json.dumps({"ts": now_ts, "floor": "10", "sample_size": 10,
+                         "competition": 1, "floor_reliable": True,
+                         "trait_index": {}, "trait_total": 0,
+                         "candidates": []}) + "\n")
+check("битая строка пропускается без падения",
+      len(gs._load_recording(broken_path)) == 1)
+
+check("отсутствующий файл обрабатывается",
+      gs.run_backtest(os.path.join(_tmpdir, "нет.jsonl")) is None)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

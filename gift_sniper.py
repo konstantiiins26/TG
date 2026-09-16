@@ -37,7 +37,9 @@ import sys
 import json
 import time
 import base64
+import sqlite3
 import logging
+import argparse
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -95,6 +97,15 @@ ROYALTY_PCT         = Decimal(os.getenv("ROYALTY_PCT", "0.05"))           # ро
 UNDERCUT_PCT        = Decimal(os.getenv("UNDERCUT_PCT", "0.03"))          # насколько встаём НИЖЕ floor, чтобы реально продать
 GAS_FEE_TON         = Decimal(os.getenv("GAS_FEE_TON", "0.15"))           # газ за круг (покупка + продажа), TON
 MIN_ROI_PCT         = Decimal(os.getenv("MIN_ROI_PCT", "5"))              # ниже этого ROI бот не покупает
+
+# Премия за редкость: во сколько раз редкий лот продаётся дороже floor.
+# ПО УМОЛЧАНИЮ 1.0 — премии НЕТ, и это осознанно. Любое значение выше 1.0
+# УВЕЛИЧИВАЕТ расчётную прибыль, то есть двигает бота в сторону "покупай" —
+# ровно туда, где теряют деньги. Поднимать это число можно только после того,
+# как вы откалибруете его по СВОЕЙ записи рынка (--record + --backtest),
+# а не потому, что "редкое вроде дороже стоит".
+# Применяется к лотам с красивым номером ИЛИ редкими трейтами.
+PREMIUM_MULT        = Decimal(os.getenv("PREMIUM_MULT", "1.0"))
 
 # --- Расчёт Floor Price -----------------------------------------------------
 # У TonAPI-эндпоинта /items НЕТ сортировки по цене, поэтому честный floor
@@ -154,6 +165,31 @@ PRETTY_MINTS        = {7, 77, 777, 7777, 111, 1111, 11111,
 
 # --- Константы TON -----------------------------------------------------------
 NANO_PER_TON        = Decimal("1000000000")   # 1 TON = 1e9 нанотонов
+
+# --- Риск-лимиты (Ярус 3) ----------------------------------------------------
+# Главная защита от "бот сошёл с ума и слил депозит". Лимиты хранятся в БД,
+# поэтому ПЕРЕЗАПУСК ИХ НЕ СБРАСЫВАЕТ — иначе они не лимиты, а декорация.
+MAX_SPEND_PER_TRADE_TON = Decimal(os.getenv("MAX_SPEND_PER_TRADE_TON", "50"))    # потолок одной сделки
+MAX_SPEND_PER_HOUR_TON  = Decimal(os.getenv("MAX_SPEND_PER_HOUR_TON", "200"))    # потолок трат за час
+MAX_SPEND_PER_DAY_TON   = Decimal(os.getenv("MAX_SPEND_PER_DAY_TON", "1000"))    # потолок трат за сутки
+MAX_OPEN_POSITIONS      = int(os.getenv("MAX_OPEN_POSITIONS", "10"))             # сколько лотов держим одновременно
+STOP_AFTER_LOSSES       = int(os.getenv("STOP_AFTER_LOSSES", "3"))               # N убытков подряд -> стоп торговли
+
+# --- Хранилище состояния (Ярус 3) --------------------------------------------
+# SQLite: позиции, траты, PnL. Нужен именно файл, а не память в процессе —
+# лимиты и учёт позиций обязаны переживать рестарт.
+DB_PATH             = os.getenv("DB_PATH", "sniper_state.db")
+
+# --- Уведомления в Telegram (Ярус 3) -----------------------------------------
+# Необязательны: без токена бот просто не шлёт уведомления и работает дальше.
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# --- Запись рынка и бэктест (Ярус 3) -----------------------------------------
+# Исторического API у нас нет, поэтому бэктест гоняется по СОБСТВЕННОЙ записи
+# рынка: сначала --record несколько дней, потом --backtest по этому файлу.
+RECORD_PATH         = os.getenv("RECORD_PATH", "market_history.jsonl")
+BACKTEST_HOLD_HOURS = int(os.getenv("BACKTEST_HOLD_HOURS", "24"))   # через сколько часов "продаём"
 
 # --- Служебное ---------------------------------------------------------------
 DRY_RUN             = os.getenv("DRY_RUN", "1") == "1"   # 1 = только заглушка покупки (безопасно)
@@ -765,17 +801,24 @@ def _collect_sample(collection: str):
 # 5. ЛОКАЛЬНАЯ ЭКОНОМИКА (быстрая проверка до вызова ИИ)
 # =============================================================================
 
-def target_sale_price(floor_price: Decimal) -> Decimal:
+def target_sale_price(floor_price: Decimal, premium: bool = False) -> Decimal:
     """
     Цена, по которой мы реально сможем продать.
 
     Продать ПО floor нельзя: чтобы уйти первым, надо встать ниже текущего
     минимума. Поэтому целевая цена = floor минус undercut.
+
+    `premium` (красивый номер или редкие трейты) умножает оценку на
+    PREMIUM_MULT. По умолчанию он равен 1.0 — то есть красота и редкость
+    НЕ повышают оценку и на решение не влияют. Это сознательно: премия —
+    предположение, а не факт, и калибровать её нужно по своей записи рынка.
     """
-    return floor_price * (Decimal("1") - UNDERCUT_PCT)
+    base = floor_price * PREMIUM_MULT if premium else floor_price
+    return base * (Decimal("1") - UNDERCUT_PCT)
 
 
-def compute_net_profit(floor_price: Decimal, buy_price: Decimal) -> Decimal:
+def compute_net_profit(floor_price: Decimal, buy_price: Decimal,
+                       premium: bool = False) -> Decimal:
     """
     Честная формула чистой прибыли:
 
@@ -790,7 +833,7 @@ def compute_net_profit(floor_price: Decimal, buy_price: Decimal) -> Decimal:
     Все три правки смещают оценку в консервативную сторону — раньше бот
     систематически завышал прибыль.
     """
-    sale = target_sale_price(floor_price)
+    sale = target_sale_price(floor_price, premium)
     proceeds = sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)
     return proceeds - buy_price - GAS_FEE_TON
 
@@ -814,7 +857,161 @@ def is_pretty_mint(mint_index) -> bool:
 
 
 # =============================================================================
-# 6. ИИ-МОЗГ — АНАЛИЗ РЫНКА ЧЕРЕЗ CLAUDE API
+# 6. ХРАНИЛИЩЕ, РИСК-ЛИМИТЫ И УВЕДОМЛЕНИЯ
+# =============================================================================
+# Почему SQLite, а не переменные в памяти: лимиты, которые обнуляются при
+# рестарте, — это не лимиты. Упавший и перезапущенный бот обязан помнить,
+# что он уже потратил и сколько убытков подряд поймал.
+
+def db_connect():
+    """Соединение с БД состояния. Таймаут — на случай параллельного доступа."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def db_init():
+    """Создаёт схему, если её ещё нет. Безопасно вызывать при каждом запуске."""
+    with db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS positions (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                address           TEXT NOT NULL,
+                collection        TEXT,
+                buy_price_ton     TEXT NOT NULL,   -- TEXT: Decimal без потерь float
+                buy_ts            REAL NOT NULL,
+                floor_at_buy_ton  TEXT,
+                status            TEXT NOT NULL DEFAULT 'open',
+                sell_price_ton    TEXT,
+                sell_ts           REAL,
+                pnl_ton           TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_buy_ts ON positions(buy_ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON positions(status)")
+
+
+def record_purchase(item: dict, buy_price: Decimal, floor: Decimal) -> int:
+    """Фиксирует открытую позицию. Возвращает её id."""
+    with db_connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO positions (address, collection, buy_price_ton, buy_ts, "
+            "floor_at_buy_ton, status) VALUES (?, ?, ?, ?, ?, 'open')",
+            (item["address"], item.get("collection_address", ""),
+             str(buy_price), time.time(), str(floor)))
+        return cur.lastrowid
+
+
+def close_position(position_id: int, sell_price: Decimal):
+    """
+    Закрывает позицию и считает реальный PnL по той же экономике, что и прогноз.
+
+    Вызывается вручную/интеграцией продажи: автоматической продажи в этой
+    версии нет, поэтому метод существует, но бот его сам не дёргает.
+    """
+    with db_connect() as conn:
+        row = conn.execute("SELECT buy_price_ton FROM positions WHERE id = ?",
+                           (position_id,)).fetchone()
+        if row is None:
+            return None
+        buy = Decimal(row["buy_price_ton"])
+        proceeds = sell_price * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)
+        pnl = proceeds - buy - GAS_FEE_TON
+        conn.execute(
+            "UPDATE positions SET status='closed', sell_price_ton=?, sell_ts=?, "
+            "pnl_ton=? WHERE id = ?",
+            (str(sell_price), time.time(), str(pnl), position_id))
+        return pnl
+
+
+def spend_since(seconds: float) -> Decimal:
+    """Сколько TON потрачено за последние `seconds` секунд."""
+    cutoff = time.time() - seconds
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT buy_price_ton FROM positions WHERE buy_ts >= ?", (cutoff,)).fetchall()
+    return sum((Decimal(r["buy_price_ton"]) for r in rows), Decimal("0"))
+
+
+def open_positions_count() -> int:
+    """Сколько лотов сейчас на руках (куплено, но не продано)."""
+    with db_connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS c FROM positions WHERE status='open'").fetchone()["c"]
+
+
+def consecutive_losses() -> int:
+    """
+    Сколько убыточных сделок подряд закрыто последними.
+
+    Это детектор "стратегия перестала работать": три убытка подряд означают,
+    что предпосылки модели больше не выполняются, и продолжать — значит
+    методично терять деньги.
+    """
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT pnl_ton FROM positions WHERE status='closed' AND pnl_ton IS NOT NULL "
+            "ORDER BY sell_ts DESC LIMIT ?", (STOP_AFTER_LOSSES,)).fetchall()
+    streak = 0
+    for r in rows:
+        if Decimal(r["pnl_ton"]) < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def check_risk_limits(buy_price: Decimal):
+    """
+    Последний контур защиты ПЕРЕД тратой денег.
+
+    Возвращает (ok: bool, reason: str). Проверяется в порядке "от самого
+    дешёвого к самому дорогому запросу".
+    """
+    if buy_price > MAX_SPEND_PER_TRADE_TON:
+        return False, (f"цена {buy_price} TON выше потолка сделки "
+                       f"{MAX_SPEND_PER_TRADE_TON} TON")
+
+    losses = consecutive_losses()
+    if losses >= STOP_AFTER_LOSSES:
+        return False, (f"{losses} убыточных сделок подряд (порог {STOP_AFTER_LOSSES}) "
+                       f"— торговля остановлена")
+
+    open_count = open_positions_count()
+    if open_count >= MAX_OPEN_POSITIONS:
+        return False, f"открыто {open_count} позиций (лимит {MAX_OPEN_POSITIONS})"
+
+    hour_spend = spend_since(3600)
+    if hour_spend + buy_price > MAX_SPEND_PER_HOUR_TON:
+        return False, (f"часовой лимит: потрачено {hour_spend} + {buy_price} > "
+                       f"{MAX_SPEND_PER_HOUR_TON} TON")
+
+    day_spend = spend_since(86400)
+    if day_spend + buy_price > MAX_SPEND_PER_DAY_TON:
+        return False, (f"суточный лимит: потрачено {day_spend} + {buy_price} > "
+                       f"{MAX_SPEND_PER_DAY_TON} TON")
+
+    return True, "лимиты в норме"
+
+
+def notify(text: str):
+    """
+    Шлёт уведомление в Telegram. Полностью необязательно: без токена — тихо
+    ничего не делает. Никогда не роняет торговый цикл и не логирует токен.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=HTTP_TIMEOUT_SEC)
+    except Exception as e:  # noqa: BLE001 — уведомление не стоит торговли
+        log.warning(f"Не удалось отправить уведомление в Telegram: {type(e).__name__}")
+
+
+# =============================================================================
+# 7. ИИ-МОЗГ — АНАЛИЗ РЫНКА ЧЕРЕЗ CLAUDE API
 # =============================================================================
 
 # Системный промпт с ЖЁСТКИМИ правилами. ИИ обязан вернуть строгий JSON.
@@ -996,7 +1193,7 @@ def _parse_ai_json(raw: str) -> dict:
 
 
 # =============================================================================
-# 7. БЛОКЧЕЙН — ЗАГЛУШКА ПОКУПКИ (реальная подпись НЕ выполняется)
+# 8. БЛОКЧЕЙН — ЗАГЛУШКА ПОКУПКИ (реальная подпись НЕ выполняется)
 # =============================================================================
 
 def execute_blockchain_buy(item_id: str, price) -> bool:
@@ -1019,22 +1216,67 @@ def execute_blockchain_buy(item_id: str, price) -> bool:
 
 
 # =============================================================================
-# 8. ОБРАБОТКА ОДНОГО ЛОТА (сбор -> ИИ -> действие)
+# 9. ОБРАБОТКА ОДНОГО ЛОТА (сбор -> ИИ -> действие)
 # =============================================================================
 
-def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
-    """Прогоняет один лот через ИИ и, при вердикте BUY, вызывает покупку."""
-    floor_price = snapshot["floor"]
-    floor_reliable = snapshot["floor_reliable"]
-    competition = snapshot["competition"]
+def evaluate_trade(item: dict, snapshot: dict, recent_sales) -> dict:
+    """
+    ДЕТЕРМИНИРОВАННОЕ решение по лоту: ни ИИ, ни сети, ни побочных эффектов.
 
+    Это единственный источник истины о том, стоит ли покупать. Бэктест гоняет
+    ЭТУ ЖЕ функцию — иначе он проверял бы код, который в бою не исполняется,
+    и его результаты ничего не значили бы.
+
+    Возвращает словарь с полем allowed и причиной отказа.
+    """
+    floor = snapshot["floor"]
     buy_price = Decimal(str(item["sale_price_ton"]))
-    mint = item["mint_index"]
-    pretty = is_pretty_mint(mint)
+    pretty = is_pretty_mint(item.get("mint_index"))
+    rarity_pct, rarest_trait = compute_rarity_pct(
+        item, snapshot.get("trait_index", {}), snapshot.get("trait_total", 0))
+    rare = is_rare(rarity_pct)
+
+    # Красивый номер и редкость влияют на решение ТОЛЬКО через оценку
+    # (PREMIUM_MULT), а не как отдельные ворота. Отдельной проверки
+    # "переплата" здесь нет намеренно: расчёт прибыли уже её содержит —
+    # покупка выше floor без премии всегда убыточна и отсекается ниже.
+    premium = pretty or rare
+    profit = compute_net_profit(floor, buy_price, premium)
+    roi = compute_roi_pct(profit, buy_price)
+
+    verdict = {
+        "allowed": False, "reason": "", "net_profit": profit, "roi_pct": roi,
+        "buy_price": buy_price, "rarity_pct": rarity_pct,
+        "rarest_trait": rarest_trait, "is_rare": rare, "is_pretty": pretty,
+        "premium_applied": premium and PREMIUM_MULT != Decimal("1"),
+    }
+
+    # Порядок проверок — от самой фундаментальной к частной.
+    if not snapshot.get("floor_reliable"):
+        verdict["reason"] = "floor недостоверен (мала выборка рынка)"
+    elif profit <= 0:
+        verdict["reason"] = f"убыточно: профит {profit:.4f} TON"
+    elif roi < MIN_ROI_PCT:
+        verdict["reason"] = f"ROI {roi}% ниже порога {MIN_ROI_PCT}%"
+    elif snapshot.get("competition", 0) > MAX_COMPETITION:
+        verdict["reason"] = (f"у floor {snapshot['competition']} продавцов "
+                             f"(порог {MAX_COMPETITION}) — флип не закроется")
+    elif recent_sales is not None and recent_sales < MIN_SALES_IN_WINDOW:
+        verdict["reason"] = (f"за {LIQUIDITY_WINDOW_HOURS}ч продаж {recent_sales} "
+                             f"(нужно >= {MIN_SALES_IN_WINDOW}) — рынок неликвиден")
+    else:
+        verdict["allowed"] = True
+        verdict["reason"] = f"профит {profit:.4f} TON, ROI {roi}%"
+
+    return verdict
+
+
+def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
+    """Прогоняет один лот через фильтры, ИИ и риск-лимиты; при согласии — покупает."""
+    floor_price = snapshot["floor"]
+    buy_price = Decimal(str(item["sale_price_ton"]))
 
     # --- ЗАЩИТА ОТ СКАМА: адрес коллекции важнее любого названия -----------
-    # Делается ДО вызова ИИ: и дешевле, и ИИ нельзя доверить проверку,
-    # которую можно выполнить детерминированно.
     if not is_collection_trusted(item.get("collection_address", "")):
         log.warning(
             f"{_Color.RED}ОТКЛОНЕНО: лот {_short(item['address'])} "
@@ -1043,76 +1285,58 @@ def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
         )
         return
 
-    # --- ДЕДУПЛИКАЦИЯ: не переспрашиваем ИИ про тот же лот по той же цене ---
-    # Ставится ДО вызова Claude, потому что смысл именно в экономии на API.
+    # --- ДЕДУПЛИКАЦИЯ: не переспрашиваем про тот же лот по той же цене ------
     if already_analyzed(item, floor_price):
         log.debug(f"Пропуск (уже анализировали): {_short(item['address'])} @ {buy_price} TON")
         return
 
-    # --- РЕДКОСТЬ: для Telegram Gifts она важнее номера минта ---------------
-    rarity_pct, rarest_trait = compute_rarity_pct(
-        item, snapshot["trait_index"], snapshot["trait_total"])
-    rare = is_rare(rarity_pct)
+    # --- ДЕТЕРМИНИРОВАННЫЙ ФИЛЬТР ПЕРЕД ИИ ---------------------------------
+    # Считается ДО Claude сознательно: ИИ всё равно не может отменить этот
+    # отказ, поэтому спрашивать его про заведомо отбракованный лот — значит
+    # платить за ответ, который ни на что не влияет.
+    ev = evaluate_trade(item, snapshot, recent_sales)
 
-    # Локальный предрасчёт (для лога; финальное слово — за ИИ).
-    local_profit = compute_net_profit(floor_price, buy_price)
-    local_roi = compute_roi_pct(local_profit, buy_price)
-
-    rarity_note = (f"редкость {rarity_pct}% по '{rarest_trait}'"
-                   if rarity_pct is not None else "редкость н/д")
+    rarity_note = (f"редкость {ev['rarity_pct']}% по '{ev['rarest_trait']}'"
+                   if ev["rarity_pct"] is not None else "редкость н/д")
     log.info(
-        f"Лот {_short(item['address'])} | mint #{mint} "
-        f"{'★красивый' if pretty else 'обычный'} | "
-        f"{'♦РЕДКИЙ' if rare else rarity_note} | "
-        f"цена {buy_price} TON | floor {floor_price} TON | "
-        f"локальный ROI {local_roi}%"
+        f"Лот {_short(item['address'])} | mint #{item.get('mint_index')} "
+        f"{'★красивый' if ev['is_pretty'] else 'обычный'} | "
+        f"{'♦РЕДКИЙ' if ev['is_rare'] else rarity_note} | "
+        f"цена {buy_price} TON | floor {floor_price} TON | ROI {ev['roi_pct']}%"
     )
 
-    # Вердикт ИИ.
-    verdict = ai_analyze(client, item, floor_price, floor_reliable,
-                         rarity_pct, rarest_trait, competition, recent_sales)
+    if not ev["allowed"]:
+        log.info(f"{_Color.YELLOW}SKIP (фильтр){_Color.RESET} | {ev['reason']}")
+        return
+
+    # --- ИИ как ВТОРОЕ мнение по прошедшим фильтр лотам --------------------
+    verdict = ai_analyze(client, item, floor_price, snapshot["floor_reliable"],
+                         ev["rarity_pct"], ev["rarest_trait"],
+                         snapshot["competition"], recent_sales)
     action = str(verdict.get("ACTION", "SKIP")).upper()
-    roi = verdict.get("ROI_PERCENT", 0)
-    net = verdict.get("NET_PROFIT_TON", 0)
     reason = verdict.get("REASON", "")
 
-    if action == "BUY":
-        log.info(f"{_Color.GREEN}{_Color.BOLD}ВЕРДИКТ ИИ: BUY{_Color.RESET} "
-                 f"| ROI {roi}% | профит {net} TON | {reason}")
+    if action != "BUY":
+        log.info(f"{_Color.YELLOW}ВЕРДИКТ ИИ: SKIP{_Color.RESET} | {reason}")
+        return
 
-        # --- ПОСЛЕДНИЙ РУБЕЖ: детерминированная проверка поверх ИИ ----------
-        # ИИ может ошибиться в арифметике или проигнорировать правило.
-        # Деньги тратятся только если локальный расчёт ТОЖЕ согласен.
-        if not floor_reliable:
-            log.warning(f"{_Color.RED}ПОКУПКА ОТМЕНЕНА: floor недостоверен "
-                        f"(мала выборка рынка).{_Color.RESET}")
-            return
-        if local_profit <= 0 or local_roi < MIN_ROI_PCT:
-            log.warning(f"{_Color.RED}ПОКУПКА ОТМЕНЕНА: локальный расчёт не согласен "
-                        f"с ИИ (профит {local_profit:.4f} TON, ROI {local_roi}% "
-                        f"< порога {MIN_ROI_PCT}%).{_Color.RESET}")
-            return
-        # Переплата над floor допустима только за красивый номер ИЛИ редкость.
-        if buy_price > floor_price and not (pretty or rare):
-            log.warning(f"{_Color.RED}ПОКУПКА ОТМЕНЕНА: цена выше floor, "
-                        f"но лот не красивый и не редкий — это переплата."
-                        f"{_Color.RESET}")
-            return
-        if competition > MAX_COMPETITION:
-            log.warning(f"{_Color.RED}ПОКУПКА ОТМЕНЕНА: у floor уже {competition} "
-                        f"продавцов (порог {MAX_COMPETITION}) — флип не закроется."
-                        f"{_Color.RESET}")
-            return
-        if recent_sales is not None and recent_sales < MIN_SALES_IN_WINDOW:
-            log.warning(f"{_Color.RED}ПОКУПКА ОТМЕНЕНА: за {LIQUIDITY_WINDOW_HOURS}ч "
-                        f"продаж {recent_sales} (нужно >= {MIN_SALES_IN_WINDOW}) — "
-                        f"рынок неликвиден.{_Color.RESET}")
-            return
+    log.info(f"{_Color.GREEN}{_Color.BOLD}ВЕРДИКТ ИИ: BUY{_Color.RESET} "
+             f"| ROI {verdict.get('ROI_PERCENT', 0)}% | {reason}")
 
-        execute_blockchain_buy(item["address"], buy_price)
-    else:
-        log.info(f"{_Color.YELLOW}ВЕРДИКТ ИИ: SKIP{_Color.RESET} "
-                 f"| ROI {roi}% | профит {net} TON | {reason}")
+    # --- РИСК-ЛИМИТЫ: последний контур перед тратой денег ------------------
+    ok, limit_reason = check_risk_limits(buy_price)
+    if not ok:
+        log.warning(f"{_Color.RED}ПОКУПКА ЗАБЛОКИРОВАНА РИСК-ЛИМИТОМ: "
+                    f"{limit_reason}{_Color.RESET}")
+        notify(f"⛔️ Покупка заблокирована лимитом\n{_short(item['address'])}\n{limit_reason}")
+        return
+
+    if execute_blockchain_buy(item["address"], buy_price):
+        pos_id = record_purchase(item, buy_price, floor_price)
+        log.info(f"Позиция #{pos_id} записана в {DB_PATH}")
+        notify(f"✅ Куплено #{pos_id}\n{_short(item['address'])}\n"
+               f"цена {buy_price} TON | floor {floor_price} TON\n"
+               f"ожидаемый профит {ev['net_profit']:.4f} TON (ROI {ev['roi_pct']}%)")
 
 
 def _short(addr: str) -> str:
@@ -1121,13 +1345,182 @@ def _short(addr: str) -> str:
 
 
 # =============================================================================
-# 9. ГЛАВНЫЙ ЦИКЛ МОНИТОРИНГА (MONITORING LOOP)
+# 10. ЗАПИСЬ РЫНКА И БЭКТЕСТ
+# =============================================================================
+# Исторического API продаж у нас нет, поэтому бэктест честно гоняется по
+# СОБСТВЕННОЙ записи рынка:
+#     1) python gift_sniper.py --record      (несколько дней копим снапшоты)
+#     2) python gift_sniper.py --backtest    (прогоняем решения по записи)
+# Выдумывать источник истории было бы хуже, чем не иметь бэктеста вовсе.
+
+def record_snapshot(snap: dict, path: str = None):
+    """Дописывает снимок рынка в JSONL. Одна строка — один цикл."""
+    path = path or RECORD_PATH
+    row = {
+        "ts": time.time(),
+        "floor": str(snap["floor"]),
+        "sample_size": snap["sample_size"],
+        "competition": snap["competition"],
+        "floor_reliable": snap["floor_reliable"],
+        "trait_index": snap["trait_index"],
+        "trait_total": snap["trait_total"],
+        "candidates": snap["candidates"],
+    }
+    try:
+        with io_open_append(path) as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.error(f"Не удалось записать снапшот в {path}: {e}")
+
+
+def io_open_append(path):
+    """Отдельная обёртка — чтобы тесты могли подменить путь записи."""
+    return open(path, "a", encoding="utf-8")
+
+
+def _load_recording(path: str):
+    """
+    Читает JSONL-запись рынка и восстанавливает Decimal.
+
+    Битые строки пропускаются с предупреждением, а не роняют весь прогон:
+    запись могла прерваться на середине строки при остановке бота.
+    """
+    snaps = []
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+                row["floor"] = Decimal(row["floor"])
+            except (json.JSONDecodeError, KeyError, InvalidOperation):
+                log.warning(f"{path}:{lineno} — строка повреждена, пропускаю")
+                continue
+            snaps.append(row)
+    snaps.sort(key=lambda r: r["ts"])
+    return snaps
+
+
+def _future_floor(snaps, after_ts: float):
+    """
+    Floor в первом снапшоте, снятом не раньше after_ts.
+
+    Возвращает None, если запись закончилась раньше — такая позиция
+    считается НЕЗАКРЫТОЙ и в winrate не попадает. Домысливать за неё
+    исход означало бы подогнать результат.
+    """
+    for snap in snaps:
+        if snap["ts"] >= after_ts:
+            return snap["floor"]
+    return None
+
+
+def run_backtest(path: str = None, hold_hours: int = None):
+    """
+    Прогоняет записанную историю через боевую функцию решения.
+
+    Модель выхода: покупаем по цене лота, через hold_hours продаём по
+    floor того момента с обычным undercut'ом и теми же комиссиями.
+    """
+    path = path or RECORD_PATH
+    hold_hours = hold_hours if hold_hours is not None else BACKTEST_HOLD_HOURS
+
+    try:
+        snaps = _load_recording(path)
+    except FileNotFoundError:
+        log.error(f"Записи рынка нет: {path}. Сначала соберите её: "
+                  f"python gift_sniper.py --record")
+        return None
+
+    if not snaps:
+        log.error(f"{path} пуст — нечего прогонять.")
+        return None
+
+    span_h = (snaps[-1]["ts"] - snaps[0]["ts"]) / 3600
+    log.info(f"{_Color.BOLD}=== БЭКТЕСТ ==={_Color.RESET}")
+    log.info(f"Снапшотов: {len(snaps)} | Период: {span_h:.1f}ч | "
+             f"Удержание: {hold_hours}ч")
+    if span_h < hold_hours * 2:
+        log.warning(f"{_Color.YELLOW}Запись короче двух периодов удержания — "
+                    f"результат статистически неубедителен.{_Color.RESET}")
+
+    trades, bought_addrs = [], set()
+    for snap in snaps:
+        for item in snap["candidates"]:
+            # Один и тот же лот не покупаем дважды за прогон.
+            if item["address"] in bought_addrs:
+                continue
+            # recent_sales=None: в записи истории продаж нет, и подставлять
+            # вместо неё число значило бы тестировать несуществующие данные.
+            ev = evaluate_trade(item, snap, None)
+            if not ev["allowed"]:
+                continue
+            if ev["buy_price"] > MAX_SPEND_PER_TRADE_TON:
+                continue
+
+            future = _future_floor(snaps, snap["ts"] + hold_hours * 3600)
+            bought_addrs.add(item["address"])
+            trade = {"address": item["address"], "buy": ev["buy_price"],
+                     "expected": ev["net_profit"], "roi": ev["roi_pct"]}
+            if future is None:
+                trade["status"] = "open"        # запись кончилась раньше выхода
+            else:
+                sale = target_sale_price(future, ev["is_rare"] or ev["is_pretty"])
+                proceeds = sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)
+                trade["status"] = "closed"
+                trade["pnl"] = proceeds - ev["buy_price"] - GAS_FEE_TON
+            trades.append(trade)
+
+    return _report_backtest(trades, hold_hours)
+
+
+def _report_backtest(trades, hold_hours):
+    """Печатает итоги бэктеста и возвращает их словарём."""
+    closed = [t for t in trades if t["status"] == "closed"]
+    unresolved = len(trades) - len(closed)
+    wins = [t for t in closed if t["pnl"] > 0]
+
+    total_pnl = sum((t["pnl"] for t in closed), Decimal("0"))
+    invested = sum((t["buy"] for t in closed), Decimal("0"))
+    expected = sum((t["expected"] for t in closed), Decimal("0"))
+
+    log.info(f"Сделок отобрано: {len(trades)} | закрыто: {len(closed)} | "
+             f"не закрыто (запись кончилась): {unresolved}")
+
+    if not closed:
+        log.warning(f"{_Color.YELLOW}Ни одна сделка не закрылась — выводов сделать "
+                    f"нельзя. Нужна запись длиннее {hold_hours}ч.{_Color.RESET}")
+        return {"trades": len(trades), "closed": 0, "unresolved": unresolved}
+
+    winrate = Decimal(len(wins)) / Decimal(len(closed)) * Decimal("100")
+    color = _Color.GREEN if total_pnl > 0 else _Color.RED
+    log.info(f"Winrate: {winrate:.1f}% ({len(wins)}/{len(closed)})")
+    log.info(f"{color}Итоговый PnL: {total_pnl:.4f} TON{_Color.RESET} "
+             f"при вложениях {invested:.4f} TON")
+    if invested > 0:
+        log.info(f"Фактический ROI: {total_pnl / invested * 100:.2f}%")
+    # Расхождение прогноза и факта — главный вывод бэктеста.
+    log.info(f"Прогноз обещал {expected:.4f} TON, факт {total_pnl:.4f} TON "
+             f"(расхождение {total_pnl - expected:.4f} TON)")
+
+    best = max(closed, key=lambda t: t["pnl"])
+    worst = min(closed, key=lambda t: t["pnl"])
+    log.info(f"Лучшая: {best['pnl']:+.4f} TON | Худшая: {worst['pnl']:+.4f} TON")
+
+    return {"trades": len(trades), "closed": len(closed), "unresolved": unresolved,
+            "wins": len(wins), "winrate": winrate, "pnl": total_pnl,
+            "invested": invested, "expected": expected}
+
+
+# =============================================================================
+# 11. ГЛАВНЫЙ ЦИКЛ МОНИТОРИНГА (MONITORING LOOP)
 # =============================================================================
 
-def preflight_checks():
+def preflight_checks(require_ai: bool = True):
     """Проверяет обязательные настройки перед запуском цикла."""
     problems = []
-    if not ANTHROPIC_API_KEY:
+    if require_ai and not ANTHROPIC_API_KEY:
         problems.append("ANTHROPIC_API_KEY не задан (нужен для ИИ-анализа).")
     if not TARGET_COLLECTION or TARGET_COLLECTION.startswith("EQAAAAAA"):
         problems.append("TARGET_COLLECTION не задан — впишите реальный адрес коллекции.")
@@ -1151,16 +1544,32 @@ def preflight_checks():
     return True
 
 
-def main():
-    log.info(f"{_Color.BOLD}=== Telegram Gifts NFT Sniper запускается ==={_Color.RESET}")
-    log.info(f"Модель ИИ: {CLAUDE_MODEL} | Коллекция: {_short(TARGET_COLLECTION)} | "
-             f"Интервал: {POLL_INTERVAL_SEC}s | DRY_RUN: {DRY_RUN}")
+def main(record: bool = False, trade: bool = True):
+    """
+    Главный цикл.
 
-    if not preflight_checks():
+    record — дописывать каждый снапшот рынка в RECORD_PATH (для бэктеста).
+    trade  — выполнять торговую логику. В режиме --record по умолчанию
+             выключено: сбор данных не должен зависеть от ключа Claude
+             и не должен ничего покупать.
+    """
+    log.info(f"{_Color.BOLD}=== Telegram Gifts NFT Sniper запускается ==={_Color.RESET}")
+    mode = "запись рынка" + (" + торговля" if trade else " (без торговли)") if record else "торговля"
+    log.info(f"Режим: {mode} | Коллекция: {_short(TARGET_COLLECTION)} | "
+             f"Интервал: {POLL_INTERVAL_SEC}s | DRY_RUN: {DRY_RUN}")
+    if trade:
+        log.info(f"Модель ИИ: {CLAUDE_MODEL} | БД: {DB_PATH}")
+        log.info(f"Лимиты: сделка <= {MAX_SPEND_PER_TRADE_TON} | час <= "
+                 f"{MAX_SPEND_PER_HOUR_TON} | сутки <= {MAX_SPEND_PER_DAY_TON} TON | "
+                 f"позиций <= {MAX_OPEN_POSITIONS} | стоп после {STOP_AFTER_LOSSES} убытков")
+
+    if not preflight_checks(require_ai=trade):
         sys.exit("[FATAL] Исправьте настройки выше и перезапустите.")
 
-    # Клиент Claude. Ключ читается из ANTHROPIC_API_KEY автоматически.
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    db_init()
+
+    # Клиент Claude нужен только для торговли.
+    client = Anthropic(api_key=ANTHROPIC_API_KEY) if trade else None
 
     cycle = 0
     while True:  # <-- бесконечный цикл реального мониторинга
@@ -1173,7 +1582,15 @@ def main():
             snap = get_market_snapshot(TARGET_COLLECTION)
             candidates = snap["candidates"]
 
-            if not candidates:
+            # Пишем снапшот ДО торговых решений: запись нужна и тогда,
+            # когда торговать нельзя (иначе в истории будут дыры).
+            if record and snap["sample_size"] > 0:
+                record_snapshot(snap)
+
+            if not trade:
+                log.info(f"Записано: floor {snap['floor']} TON | "
+                         f"выборка {snap['sample_size']} | кандидатов {len(candidates)}")
+            elif not candidates:
                 log.warning("Активных лотов на продаже не найдено. Жду следующей проверки.")
             elif not snap["floor_reliable"]:
                 log.warning(
@@ -1213,9 +1630,31 @@ def main():
         time.sleep(sleep_for)
 
 
+def parse_args(argv=None):
+    """Разбор аргументов командной строки."""
+    parser = argparse.ArgumentParser(
+        description="Telegram Gifts NFT Sniper — снайпер и ИИ-аналитик рынка TON.",
+        epilog="Порядок работы: сначала --record несколько дней, "
+               "затем --backtest, и только потом торговля на реальные деньги.")
+    parser.add_argument("--record", action="store_true",
+                        help=f"писать снапшоты рынка в {RECORD_PATH} (для бэктеста)")
+    parser.add_argument("--trade", action="store_true",
+                        help="торговать одновременно с записью (по умолчанию --record не торгует)")
+    parser.add_argument("--backtest", nargs="?", const=RECORD_PATH, metavar="FILE",
+                        help="прогнать решения по записи рынка и выйти")
+    parser.add_argument("--hold-hours", type=int, default=None,
+                        help=f"горизонт удержания в бэктесте (по умолчанию {BACKTEST_HOLD_HOURS})")
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
+    args = parse_args()
     try:
-        main()
+        if args.backtest:
+            # Бэктест ничего не покупает и не ходит в сеть — только считает.
+            sys.exit(0 if run_backtest(args.backtest, args.hold_hours) else 1)
+        # В режиме записи торговля включается только явным --trade.
+        main(record=args.record, trade=args.trade or not args.record)
     except KeyboardInterrupt:
         log.info(f"{_Color.BOLD}Остановлено пользователем. До встречи!{_Color.RESET}")
         sys.exit(0)
