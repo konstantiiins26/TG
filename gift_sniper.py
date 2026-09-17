@@ -286,6 +286,11 @@ DB_PATH             = os.getenv("DB_PATH", "sniper_state.db")
 # Необязательны: без токена бот просто не шлёт уведомления и работает дальше.
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
+# Как часто слать сводку "бот жив". Уведомление каждую минуту перестают
+# читать через час — и пропускают то единственное, ради которого всё
+# затевалось. 0 = сводки выключены, останутся только события (покупка,
+# блокировка лимитом, падение источника данных).
+HEARTBEAT_MIN       = int(os.getenv("HEARTBEAT_MIN", "60"))
 
 # --- Запись рынка и бэктест (Ярус 3) -----------------------------------------
 # Исторического API у нас нет, поэтому бэктест гоняется по СОБСТВЕННОЙ записи
@@ -1477,6 +1482,70 @@ def notify(text: str):
         log.warning(f"Не удалось отправить уведомление в Telegram: {type(e).__name__}")
 
 
+# Тихий счётчик: сводка шлётся раз в HEARTBEAT_MIN минут, а не каждый цикл.
+# Уведомление, приходящее каждую минуту, перестают читать через час — и
+# пропускают то единственное, ради которого всё затевалось.
+_last_heartbeat = 0.0
+
+
+def notify_heartbeat(snapshots: list, force: bool = False):
+    """
+    Периодическая сводка «бот жив, вот что на рынке» в Telegram.
+
+    Зачем отдельно от notify(): следить за ботом с телефона имеет смысл
+    только если сообщения приходят редко и по делу. Молчащий бот неотличим
+    от упавшего, а болтливый — от шума.
+    """
+    global _last_heartbeat
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    now = time.time()
+    if not force and (now - _last_heartbeat) < HEARTBEAT_MIN * 60:
+        return False
+    _last_heartbeat = now
+
+    lines = [f"📊 Снайпер жив ({datetime.now(timezone.utc):%H:%M UTC})"]
+    for snap in snapshots:
+        if snap.get("sample_size", 0) == 0:
+            lines.append(f"• {_short(snap.get('collection', '?'))}: данных нет")
+            continue
+        mark = "" if snap.get("floor_reliable") else " ⚠️ выборка мала"
+        lines.append(f"• {_short(snap.get('collection', '?'))}: "
+                     f"floor {snap['floor']:.2f} | лотов {snap['sample_size']}"
+                     f"{mark}")
+    if BANKROLL_TON > 0:
+        lines.append(f"Банк: {available_bankroll()} TON свободно, "
+                     f"позиций {open_positions_count()}")
+    notify("\n".join(lines))
+    return True
+
+
+def notify_startup(collections):
+    """
+    Сообщение при старте: с какими настройками бот поднялся.
+
+    Настройки задаются переменными окружения, а они теряются при
+    перезапуске на Windows. Тихо стартовать с другими значениями, чем вы
+    думаете, — самый дешёвый способ испортить запись рынка.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    mode = "СИМУЛЯЦИЯ" if DRY_RUN else "ЖИВАЯ ТОРГОВЛЯ"
+    lines = [
+        f"🚀 Снайпер запущен ({mode})",
+        f"Коллекций: {len(collections)} | интервал {POLL_INTERVAL_SEC}с",
+        f"Выборка floor: {FLOOR_SAMPLE_PAGES} стр. x {FLOOR_PAGE_SIZE}, "
+        f"минимум {MIN_FLOOR_SAMPLE}",
+    ]
+    if BANKROLL_TON > 0:
+        lines.append(f"Банк {BANKROLL_TON} TON, потолок сделки "
+                     f"{max_position_size()} TON")
+    if not COLLECTION_WHITELIST:
+        lines.append("⚠️ whitelist пуст — защита от скам-коллекций выключена")
+    notify("\n".join(lines))
+    return True
+
+
 # =============================================================================
 # 7. ИИ-МОЗГ — АНАЛИЗ РЫНКА ЧЕРЕЗ CLAUDE API
 # =============================================================================
@@ -2545,6 +2614,7 @@ def main(record: bool = False, trade: bool = True):
         sys.exit("[FATAL] Исправьте настройки выше и перезапустите.")
 
     db_init()
+    notify_startup(TARGET_COLLECTIONS)
 
     # Клиент Claude нужен только для торговли.
     client = Anthropic(api_key=ANTHROPIC_API_KEY) if trade else None
@@ -2558,13 +2628,20 @@ def main(record: bool = False, trade: bool = True):
 
         # Каждую коллекцию обрабатываем независимо: floor, редкость и
         # ликвидность у них свои, и сбой одной не должен ронять остальные.
+        snaps_this_cycle = []
         for coll in TARGET_COLLECTIONS:
             try:
-                _process_collection(client, coll, record, trade)
+                snap = _process_collection(client, coll, record, trade)
+                if snap is not None:
+                    snaps_this_cycle.append(snap)
             except KeyboardInterrupt:
                 raise
             except Exception as e:  # noqa: BLE001 — одна коллекция не роняет цикл
                 log.error(f"Коллекция {_short(coll)}: ошибка ({e})")
+
+        # Сводка в Telegram: молчащий бот неотличим от упавшего.
+        if HEARTBEAT_MIN > 0:
+            notify_heartbeat(snaps_this_cycle)
 
         # Держим стабильный интервал (учитываем время работы итерации).
         elapsed = time.monotonic() - started
@@ -2625,6 +2702,8 @@ def _process_collection(client, collection: str, record: bool, trade: bool):
             # Прогоняем самые дешёвые лоты через ИИ.
             for item in candidates:
                 process_item(client, item, snap, recent_sales)
+
+        return snap
 
     except KeyboardInterrupt:
         raise

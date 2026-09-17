@@ -1300,6 +1300,84 @@ check("плановый выход через дыру не засчитывае
 
 
 # =============================================================================
+print("\n[27] Уведомления в Telegram")
+# =============================================================================
+
+_sent = []
+
+
+class _CaptureRequests:
+    """Перехватывает исходящие сообщения вместо похода в сеть."""
+
+    def post(self, url, json=None, timeout=None):
+        _sent.append((url, json))
+        return _FakeResponse({"ok": True})
+
+
+_otok, _ochat, _ohb = (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.HEARTBEAT_MIN)
+_oreq = gs.requests
+try:
+    # Без токена — полная тишина, и это не ошибка: уведомления необязательны.
+    gs.TELEGRAM_BOT_TOKEN = ""
+    gs.requests = _CaptureRequests()
+    check("без токена сводка не шлётся",
+          gs.notify_heartbeat([], force=True) is False and not _sent)
+    check("без токена стартовое сообщение не шлётся",
+          gs.notify_startup(["0:a"]) is False and not _sent)
+
+    gs.TELEGRAM_BOT_TOKEN = "123:test"
+    gs.TELEGRAM_CHAT_ID = "42"
+    gs.HEARTBEAT_MIN = 60
+    gs._last_heartbeat = 0.0
+
+    _snap = {"collection": "0:abcdef0123456789", "floor": Decimal("4.72"),
+             "sample_size": 120, "floor_reliable": True}
+    check("сводка уходит при force", gs.notify_heartbeat([_snap], force=True) is True)
+    _body = _sent[-1][1]["text"]
+    check("в сводке есть floor и размер выборки",
+          "4.72" in _body and "120" in _body, _body)
+
+    # Второй вызов подряд должен промолчать: уведомление каждую минуту
+    # перестают читать, и тогда теряется то единственное, ради чего оно есть.
+    _before = len(_sent)
+    check("сводка не повторяется до истечения интервала",
+          gs.notify_heartbeat([_snap]) is False and len(_sent) == _before)
+
+    # Недостоверный floor обязан быть виден в телефоне, а не только в логе.
+    gs._last_heartbeat = 0.0
+    gs.notify_heartbeat([dict(_snap, floor_reliable=False)], force=True)
+    check("мала выборка отмечается в сводке",
+          "выборка мала" in _sent[-1][1]["text"], _sent[-1][1]["text"])
+
+    gs._last_heartbeat = 0.0
+    gs.notify_heartbeat([{"collection": "0:dead", "sample_size": 0}], force=True)
+    check("коллекция без данных отмечается отдельно",
+          "данных нет" in _sent[-1][1]["text"], _sent[-1][1]["text"])
+
+    # Стартовое сообщение должно называть режим и предупреждать про whitelist:
+    # настройки на Windows теряются при перезапуске, и тихий старт с чужими
+    # значениями — самый дешёвый способ испортить запись.
+    _owl, _odry = gs.COLLECTION_WHITELIST, gs.DRY_RUN
+    gs.COLLECTION_WHITELIST, gs.DRY_RUN = [], True
+    gs.notify_startup(["0:a", "0:b"])
+    _body = _sent[-1][1]["text"]
+    check("в старте указан режим симуляции", "СИМУЛЯЦИЯ" in _body, _body)
+    check("в старте указано число коллекций", "Коллекций: 2" in _body, _body)
+    check("пустой whitelist попадает в уведомление",
+          "whitelist пуст" in _body, _body)
+    gs.COLLECTION_WHITELIST, gs.DRY_RUN = _owl, _odry
+
+    # Токен не должен утечь в текст сообщения — только в URL запроса.
+    check("токен не попадает в тело сообщения",
+          all("123:test" not in (j or {}).get("text", "") for _, j in _sent))
+finally:
+    (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+     gs.HEARTBEAT_MIN) = _otok, _ochat, _ohb
+    gs.requests = _oreq
+    gs._last_heartbeat = 0.0
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
