@@ -292,6 +292,23 @@ TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 # рынка: сначала --record несколько дней, потом --backtest по этому файлу.
 RECORD_PATH         = os.getenv("RECORD_PATH", "market_history.jsonl")
 BACKTEST_HOLD_HOURS = int(os.getenv("BACKTEST_HOLD_HOURS", "24"))   # через сколько часов "продаём"
+
+# --- Выход из позиции -------------------------------------------------------
+# Основной сценарий: выставить чуть ниже floor и ждать покупателя. Он уже
+# заложен в расчёт прибыли, поэтому отдельного кода не требует.
+#
+# Стоп-лосс нужен для второго сценария: floor коллекции уехал вниз, и ждать
+# "своей" цены больше не имеет смысла — это уже не флип, а надежда. Порог
+# считается от ЦЕНЫ ПОКУПКИ, а не от floor на момент входа: важно, сколько
+# денег под угрозой, а не насколько ошибся прогноз.
+#
+# ОСТОРОЖНО с маленьким порогом: на тонком рынке floor скачет от одного
+# снятого лота, и слишком чувствительный стоп фиксирует убыток там, где floor
+# вернулся бы сам. Поэтому есть и минимальная выдержка: стоп не срабатывает,
+# пока позиция моложе STOP_LOSS_MIN_HOURS.
+STOP_LOSS_PCT       = Decimal(os.getenv("STOP_LOSS_PCT", "25"))     # floor ниже покупки на N% -> выходим
+STOP_LOSS_MIN_HOURS = Decimal(os.getenv("STOP_LOSS_MIN_HOURS", "6"))  # раньше этого стоп не срабатывает
+ENABLE_STOP_LOSS    = os.getenv("ENABLE_STOP_LOSS", "1") == "1"
 # Запись может быть прерывистой: ПК выключают на ночь, бот падает, сеть лежит.
 # Тогда ближайший снапшот "после 24 часов" окажется через 33 или через 70 часов,
 # и бэктест посчитает его как результат суточного удержания — отчёт скажет
@@ -1222,6 +1239,56 @@ def close_position(position_id: int, sell_price: Decimal):
         return pnl
 
 
+def decide_exit(buy_price: Decimal, current_floor: Decimal, held_hours,
+                hold_hours=None) -> dict:
+    """
+    ДЕТЕРМИНИРОВАННОЕ решение о выходе из позиции. Ни сети, ни побочных
+    эффектов — как и evaluate_trade, эта функция одна и та же для бота и
+    для бэктеста.
+
+    Возвращает {"action": "hold"|"sell"|"stop", "reason": str,
+                "sell_price": Decimal | None}.
+
+      hold — ждём покупателя по цене чуть ниже floor (основной сценарий);
+      sell — вышел срок удержания, продаём по текущему floor с undercut;
+      stop — floor уехал вниз настолько, что ждать больше нечего.
+
+    Почему стоп считается от цены ПОКУПКИ, а не от floor на входе: под
+    угрозой находятся вложенные деньги, а не точность прогноза.
+    """
+    hold_hours = hold_hours if hold_hours is not None else BACKTEST_HOLD_HOURS
+    held = Decimal(str(held_hours))
+    sell_price = target_sale_price(current_floor)
+
+    if buy_price > 0:
+        drop_pct = (Decimal("1") - current_floor / buy_price) * Decimal("100")
+    else:
+        drop_pct = Decimal("0")
+
+    # Стоп проверяется ПЕРВЫМ: если рынок ушёл, дожидаться срока удержания
+    # значит сознательно досиживать в убытке.
+    if (ENABLE_STOP_LOSS and drop_pct >= STOP_LOSS_PCT
+            and held >= STOP_LOSS_MIN_HOURS):
+        return {"action": "stop", "sell_price": sell_price,
+                "reason": (f"floor {current_floor} ниже цены покупки "
+                           f"{buy_price} на {drop_pct:.1f}% "
+                           f"(порог {STOP_LOSS_PCT}%)")}
+
+    if held >= Decimal(str(hold_hours)):
+        return {"action": "sell", "sell_price": sell_price,
+                "reason": f"срок удержания {hold_hours}ч истёк"}
+
+    # Ранняя просадка без выдержки — не повод фиксировать убыток: на тонком
+    # рынке floor скачет от одного снятого лота.
+    if ENABLE_STOP_LOSS and drop_pct >= STOP_LOSS_PCT:
+        return {"action": "hold", "sell_price": None,
+                "reason": (f"просадка {drop_pct:.1f}%, но позиции {held}ч "
+                           f"(стоп с {STOP_LOSS_MIN_HOURS}ч)")}
+
+    return {"action": "hold", "sell_price": None,
+            "reason": f"держим: {held}ч из {hold_hours}ч, floor {current_floor}"}
+
+
 def spend_since(seconds: float) -> Decimal:
     """Сколько TON потрачено за последние `seconds` секунд."""
     cutoff = time.time() - seconds
@@ -1947,20 +2014,50 @@ def _backtest_one(snaps, hold_hours: int, bought_addrs: set):
             if ev["buy_price"] > MAX_SPEND_PER_TRADE_TON:
                 continue
 
-            future, missing = _future_floor(snaps, snap["ts"] + hold_hours * 3600)
             bought_addrs.add(item["address"])
             trade = {"address": item["address"], "buy": ev["buy_price"],
                      "expected": ev["net_profit"], "roi": ev["roi_pct"]}
-            if future is None:
-                trade["status"] = "open"
-                trade["missing"] = missing      # "end" (ждём данных) или "gap" (дыра)
-            else:
-                sale = target_sale_price(future, ev["is_rare"] or ev["is_pretty"])
-                proceeds = sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)
-                trade["status"] = "closed"
-                trade["pnl"] = proceeds - ev["buy_price"] - GAS_FEE_TON
+            trade.update(_simulate_exit(snaps, snap["ts"], ev["buy_price"],
+                                        hold_hours,
+                                        ev["is_rare"] or ev["is_pretty"]))
             trades.append(trade)
     return trades
+
+
+def _simulate_exit(snaps, buy_ts: float, buy_price: Decimal, hold_hours: int,
+                   premium: bool):
+    """
+    Проигрывает выход из позиции по записи, вызывая ТУ ЖЕ decide_exit(),
+    что и боевой бот. Отдельная копия логики выхода не проверяла бы ничего.
+
+    Возвращает поля для записи о сделке: статус, PnL, причину и способ выхода
+    ("sell" — по сроку, "stop" — по стоп-лоссу).
+    """
+    max_slack_sec = float(BACKTEST_MAX_SLACK_HOURS) * 3600
+
+    for snap in snaps:
+        if snap["ts"] <= buy_ts:
+            continue
+        held_hours = (snap["ts"] - buy_ts) / 3600
+        d = decide_exit(buy_price, snap["floor"], held_hours, hold_hours)
+        if d["action"] == "hold":
+            continue
+
+        # Дыра в записи обесценивает только выход ПО СРОКУ: стоп-лосс
+        # сработал бы и на первом же снапшоте после перерыва, а вот "продали
+        # через 24ч" при следующей отметке через 70ч — это не суточный
+        # результат, как бы ни выглядела шапка отчёта.
+        if (d["action"] == "sell"
+                and (snap["ts"] - buy_ts) - hold_hours * 3600 > max_slack_sec):
+            return {"status": "open", "missing": "gap"}
+
+        sale = target_sale_price(snap["floor"], premium)
+        proceeds = sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)
+        return {"status": "closed", "exit": d["action"],
+                "exit_reason": d["reason"], "held_hours": held_hours,
+                "pnl": proceeds - buy_price - GAS_FEE_TON}
+
+    return {"status": "open", "missing": "end"}
 
 
 def probe(address: str):
@@ -2305,6 +2402,12 @@ def _report_backtest(trades, hold_hours):
     log.info(f"Сделок отобрано: {len(trades)} | закрыто: {len(closed)} | "
              f"не закрыто: {unresolved} (запись кончилась: {ends}, "
              f"дыра в записи: {gaps})")
+    stops = [t for t in closed if t.get("exit") == "stop"]
+    if stops and ENABLE_STOP_LOSS:
+        stop_pnl = sum((t["pnl"] for t in stops), Decimal("0"))
+        log.info(f"Из них по стоп-лоссу: {len(stops)} на {stop_pnl:.4f} TON "
+                 f"(порог {STOP_LOSS_PCT}% от цены покупки)")
+
     if gaps:
         log.warning(f"{_Color.YELLOW}{gaps} сделок выброшено из-за перерывов в "
                     f"записи: следующий снапшот нашёлся позже чем через "

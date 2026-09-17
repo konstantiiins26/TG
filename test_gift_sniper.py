@@ -1223,6 +1223,83 @@ check("умеренная скидка без похожих не блокиру
 
 
 # =============================================================================
+print("\n[26] Выход из позиции: держим до floor, стоп при обвале")
+# =============================================================================
+
+_buy = Decimal("10")
+
+# Основной сценарий: ждём покупателя, пока не вышел срок.
+_d = gs.decide_exit(_buy, Decimal("12"), held_hours=5, hold_hours=24)
+check("пока floor держится — держим позицию", _d["action"] == "hold", _d["reason"])
+check("при удержании цена продажи не назначается", _d["sell_price"] is None)
+
+_d = gs.decide_exit(_buy, Decimal("12"), held_hours=24, hold_hours=24)
+check("по истечении срока продаём", _d["action"] == "sell", _d["reason"])
+check("продаём ниже floor (undercut)",
+      _d["sell_price"] < Decimal("12"), str(_d["sell_price"]))
+
+# Стоп-лосс: floor уехал ниже цены ПОКУПКИ более чем на порог.
+_d = gs.decide_exit(_buy, Decimal("7"), held_hours=10, hold_hours=24)
+check("обвал floor включает стоп-лосс", _d["action"] == "stop", _d["reason"])
+check("в причине названы цифры, а не просто 'стоп'",
+      "30.0%" in _d["reason"] and "порог" in _d["reason"], _d["reason"])
+
+# Выдержка: та же просадка, но позиция слишком молодая. На тонком рынке floor
+# скачет от одного снятого лота, и мгновенный стоп фиксировал бы убыток там,
+# где floor вернулся бы сам.
+_d = gs.decide_exit(_buy, Decimal("7"), held_hours=1, hold_hours=24)
+check("ранняя просадка не фиксируется", _d["action"] == "hold", _d["reason"])
+check("но причина объясняет, что стоп отложен",
+      "стоп с" in _d["reason"], _d["reason"])
+
+# Стоп проверяется РАНЬШЕ срока удержания: досиживать в убытке бессмысленно.
+_d = gs.decide_exit(_buy, Decimal("5"), held_hours=48, hold_hours=24)
+check("при обвале выход помечается стопом, а не плановой продажей",
+      _d["action"] == "stop", _d["reason"])
+
+# Порог считается от цены ПОКУПКИ, а не от floor на входе, и он точный:
+# при покупке за 4 стоп начинается ровно с floor 3.0 (падение 25%).
+_d = gs.decide_exit(Decimal("4"), Decimal("3.0"), held_hours=10, hold_hours=24)
+check("падение ровно на порог включает стоп", _d["action"] == "stop", _d["reason"])
+_d = gs.decide_exit(Decimal("4"), Decimal("2.9"), held_hours=10, hold_hours=24)
+check("падение глубже порога тоже включает стоп", _d["action"] == "stop")
+_d = gs.decide_exit(Decimal("4"), Decimal("3.1"), held_hours=10, hold_hours=24)
+check("падение чуть меньше порога стоп НЕ включает",
+      _d["action"] == "hold", _d["reason"])
+
+# Выключенный стоп-лосс возвращает поведение "держать до срока".
+_oen = gs.ENABLE_STOP_LOSS
+gs.ENABLE_STOP_LOSS = False
+try:
+    _d = gs.decide_exit(_buy, Decimal("5"), held_hours=10, hold_hours=24)
+    check("с выключенным стопом позиция держится", _d["action"] == "hold", _d["reason"])
+finally:
+    gs.ENABLE_STOP_LOSS = _oen
+
+# --- Бэктест обязан вызывать ЭТУ ЖЕ функцию --------------------------------
+_exit_snaps = [{"ts": 0.0, "floor": Decimal("10")},
+               {"ts": 10 * 3600, "floor": Decimal("5")}]     # обвал через 10ч
+_res = gs._simulate_exit(_exit_snaps, 0.0, Decimal("10"), 24, False)
+check("бэктест закрывает позицию по стопу, а не ждёт срока",
+      _res["status"] == "closed" and _res["exit"] == "stop", str(_res))
+check("стоп фиксирует убыток, а не рисует прибыль",
+      _res["pnl"] < 0, str(_res.get("pnl")))
+
+_ok_snaps = [{"ts": 0.0, "floor": Decimal("10")},
+             {"ts": 25 * 3600, "floor": Decimal("11")}]
+_res = gs._simulate_exit(_ok_snaps, 0.0, Decimal("5"), 24, False)
+check("нормальный выход помечается как плановая продажа",
+      _res["status"] == "closed" and _res["exit"] == "sell", str(_res))
+
+# Дыра обесценивает выход ПО СРОКУ, но не должна маскировать стоп.
+_gap_snaps = [{"ts": 0.0, "floor": Decimal("10")},
+              {"ts": 70 * 3600, "floor": Decimal("11")}]
+_res = gs._simulate_exit(_gap_snaps, 0.0, Decimal("5"), 24, False)
+check("плановый выход через дыру не засчитывается",
+      _res["status"] == "open" and _res["missing"] == "gap", str(_res))
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
