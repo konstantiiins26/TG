@@ -2235,6 +2235,98 @@ def probe(address: str):
     return not failed
 
 
+def discover_collections(limit: int = 30):
+    """
+    Ищет коллекции, подходящие банку, вместо ручного перебора на getgems.io.
+
+    ЧЕСТНОЕ ПРЕДУПРЕЖДЕНИЕ. Эта функция — единственная в файле, форма ответа
+    для которой НЕ проверена на живых данных: сеть к tonapi.io из среды
+    разработки закрыта, а эндпоинт списка коллекций в этом проекте ни разу
+    не вызывался. Поэтому она написана так, чтобы при неожиданном ответе
+    честно сказать "не разобрал" и напечатать сырой JSON, а не тихо вернуть
+    пустой список, который выглядел бы как "подходящих коллекций нет".
+
+    Что делает: берёт список коллекций, по каждой считает floor той же
+    выборкой, что и обычный цикл, и сопоставляет с банком через
+    affordability(). Дорого по запросам, поэтому режим разовый, не циклический.
+    """
+    log.info(f"{_Color.BOLD}=== ПОИСК КОЛЛЕКЦИЙ ПОД БАНК ==={_Color.RESET}")
+    if BANKROLL_TON <= 0:
+        log.error("BANKROLL_TON не задан — не с чем сопоставлять. "
+                  "Укажите банк: set BANKROLL_TON=10")
+        return None
+
+    headers = {"Accept": "application/json"}
+    if TONAPI_KEY:
+        headers["Authorization"] = f"Bearer {TONAPI_KEY}"
+
+    url = "https://tonapi.io/v2/nfts/collections"
+    try:
+        data = _tonapi_get(url, {"limit": limit, "offset": 0}, headers)
+    except Exception as e:  # noqa: BLE001
+        log.error(f"Список коллекций получить не удалось: {e}")
+        log.info("Эндпоинт не проверен на живых данных — возможно, у него другой "
+                 "адрес или он требует ключ. Пришлите вывод, поправлю.")
+        return None
+
+    raw = data.get("nft_collections") or data.get("collections") or []
+    if not raw:
+        log.warning(f"{_Color.YELLOW}Ответ получен, но список коллекций из него "
+                    f"не разобран. Ключи ответа: {list(data)[:10]}{_Color.RESET}")
+        log.info(json.dumps(data, ensure_ascii=False)[:1500])
+        return None
+
+    log.info(f"Коллекций в ответе: {len(raw)}. Считаю floor по каждой — "
+             f"это {len(raw)} x {FLOOR_SAMPLE_PAGES} запросов, будет небыстро.")
+
+    found = []
+    for coll in raw:
+        addr = coll.get("address") or ""
+        name = ((coll.get("metadata") or {}).get("name")
+                or coll.get("name") or "?")
+        if not addr:
+            continue
+        try:
+            snap = get_market_snapshot(addr)
+        except Exception as e:  # noqa: BLE001 — одна коллекция не роняет поиск
+            log.warning(f"{name}: {type(e).__name__}")
+            continue
+        if not snap.get("floor_reliable"):
+            continue
+
+        aff = affordability(snap["floor"])
+        if aff["verdict"] == "нет":
+            continue
+        found.append({"address": addr, "name": name, "floor": snap["floor"],
+                      "listings": snap["sample_size"],
+                      "verdict": aff["verdict"],
+                      "discount_pct": aff["discount_pct"]})
+
+    if not found:
+        log.warning(f"{_Color.YELLOW}Подходящих коллекций не нашлось. Это может "
+                    f"значить и что их нет в этой выборке, и что выборка не та — "
+                    f"эндпоинт отдаёт коллекции подряд, а не подарки Telegram."
+                    f"{_Color.RESET}")
+        return []
+
+    found.sort(key=lambda c: c["discount_pct"])
+    log.info("")
+    log.info(f"{'Floor':>8} {'Лотов':>7} {'Скидка':>8} {'Банк':>6}  Коллекция")
+    for c in found:
+        colour = _Color.GREEN if c["verdict"] == "да" else _Color.YELLOW
+        log.info(f"{c['floor']:>8.2f} {c['listings']:>7} "
+                 f"{c['discount_pct']:>7.0f}% {colour}{c['verdict']:>6}"
+                 f"{_Color.RESET}  {c['name']}")
+        log.info(f"{'':>32}{_Color.GREY}{c['address']}{_Color.RESET}")
+
+    log.info("")
+    log.info("Готовая строка (верхние 3 по требуемой скидке):")
+    log.info(f"  set TARGET_COLLECTIONS={','.join(c['address'] for c in found[:3])}")
+    log.warning("Доступность банку — это ещё не торгуемость. Активна ли "
+                "коллекция, покажет только запись рынка и --rank.")
+    return found
+
+
 def show_affordability():
     """
     Печатает, коллекции с каким floor доступны текущему банку.
@@ -2725,6 +2817,9 @@ def parse_args(argv=None):
                         help="показать, какие коллекции реально торгуются, и выйти")
     parser.add_argument("--afford", action="store_true",
                         help="показать, коллекции с каким floor по карману банку, и выйти")
+    parser.add_argument("--discover", nargs="?", const=30, type=int, metavar="N",
+                        help="найти коллекции под банк через API и выйти "
+                             "(эндпоинт НЕ проверен на живых данных)")
     parser.add_argument("--probe", metavar="ADDRESS",
                         help="проверить адрес (кошелёк или коллекцию) и показать, "
                              "что парсер извлёк из живого ответа API")
@@ -2742,6 +2837,9 @@ if __name__ == "__main__":
         if args.afford:
             # Чистая арифметика: ни сети, ни записи, ни покупок.
             sys.exit(0 if show_affordability() else 1)
+        if args.discover:
+            # Только чтение API: ни покупок, ни записи.
+            sys.exit(0 if discover_collections(args.discover) else 1)
         if args.rank:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if rank_collections(args.rank) else 1)

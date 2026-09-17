@@ -1378,6 +1378,71 @@ finally:
 
 
 # =============================================================================
+print("\n[28] Поиск коллекций под банк (--discover)")
+# =============================================================================
+
+_ob = gs.BANKROLL_TON
+_oreq = gs.requests
+_osnap = gs.get_market_snapshot
+_oint = gs.TONAPI_MIN_INTERVAL
+gs.TONAPI_MIN_INTERVAL = Decimal("0")
+try:
+    gs.BANKROLL_TON = Decimal("0")
+    check("без банка поиск не запускается", gs.discover_collections() is None)
+
+    gs.BANKROLL_TON = Decimal("10")
+    gs.RESERVE_TON = Decimal("5")
+    gs.MAX_POSITION_PCT = Decimal("10")
+
+    # Форма ответа этого эндпоинта НЕ проверена на живых данных. Главное
+    # требование: при неожиданном ответе честно сказать "не разобрал", а не
+    # вернуть пустой список — пустой список читается как "подходящих нет",
+    # и это увело бы поиск не в ту сторону.
+    gs.requests = _FakeRequests({"unexpected_key": [1, 2, 3]})
+    check("неразобранный ответ возвращает None, а не пустой список",
+          gs.discover_collections() is None)
+
+    _api = {"nft_collections": [
+        {"address": "0:cheap", "metadata": {"name": "Cheap Gifts"}},
+        {"address": "0:rich", "metadata": {"name": "Expensive Gifts"}},
+        {"address": "0:thin", "metadata": {"name": "No Data"}},
+    ]}
+    _floors = {"0:cheap": Decimal("1.0"), "0:rich": Decimal("50.0"),
+               "0:thin": Decimal("0")}
+
+    def _fake_snapshot(addr):
+        floor = _floors[addr]
+        return {"floor": floor, "sample_size": 100 if floor > 0 else 0,
+                "floor_reliable": floor > 0}
+
+    gs.requests = _FakeRequests(_api)
+    gs.get_market_snapshot = _fake_snapshot
+    _found = gs.discover_collections()
+
+    check("найдена только доступная банку коллекция",
+          [c["address"] for c in _found] == ["0:cheap"],
+          str([c["address"] for c in _found]))
+    check("дорогая коллекция отсеяна по банку",
+          all(c["address"] != "0:rich" for c in _found))
+    check("коллекция без достоверного floor отсеяна",
+          all(c["address"] != "0:thin" for c in _found))
+    check("имя коллекции взято из metadata",
+          _found[0]["name"] == "Cheap Gifts", _found[0]["name"])
+
+    # Ни одной подходящей — это [] (искали и не нашли), а не None
+    # (не смогли разобрать). Разница определяет, что делать дальше.
+    _floors["0:cheap"] = Decimal("50.0")
+    gs.requests = _FakeRequests(_api)
+    check("'не нашлось' отличается от 'не разобрал'",
+          gs.discover_collections() == [])
+finally:
+    gs.BANKROLL_TON = _ob
+    gs.requests = _oreq
+    gs.get_market_snapshot = _osnap
+    gs.TONAPI_MIN_INTERVAL = _oint
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
