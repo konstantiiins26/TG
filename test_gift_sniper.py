@@ -1077,6 +1077,80 @@ finally:
 
 
 # =============================================================================
+print("\n[24] Повышенный лимит для исключительно выгодных сделок")
+# =============================================================================
+
+check("по умолчанию механизм ВЫКЛЮЧЕН",
+      gs.MAX_POSITION_PCT_HIGH_ROI == gs.MAX_POSITION_PCT,
+      f"{gs.MAX_POSITION_PCT_HIGH_ROI} vs {gs.MAX_POSITION_PCT}")
+
+_f = Decimal("3.0")
+check("граница ROI=0 совпадает с границей безубыточности",
+      gs.max_buy_at_roi(_f, Decimal("0")) == gs.max_profitable_buy(_f))
+
+# Цена, выведенная для ROI=100%, обязана давать ровно 100% при обратном счёте.
+_b100 = gs.max_buy_at_roi(_f, Decimal("100"))
+_roi_back = gs.compute_roi_pct(gs.compute_net_profit(_f, _b100), _b100)
+check("цена для ROI=100% действительно даёт 100%",
+      abs(_roi_back - Decimal("100")) < Decimal("0.05"), str(_roi_back))
+
+# Регрессия на ошибку, которую я сам допустил: нельзя считать повышенный
+# потолок против границы БЕЗУБЫТОЧНОСТИ. Требование ROI>=100% режет цену
+# вдвое, и смешение этих двух порогов обещало бы доступность там, где её нет.
+check("требование высокого ROI ужимает цену сильнее безубыточности",
+      _b100 < gs.max_profitable_buy(_f) / Decimal("1.9"),
+      f"{_b100} vs {gs.max_profitable_buy(_f)}")
+
+_ob, _or_, _op, _oh, _ohr = (gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT,
+                             gs.HIGH_ROI_PCT, gs.MAX_POSITION_PCT_HIGH_ROI)
+gs.BANKROLL_TON = Decimal("10")
+gs.RESERVE_TON = Decimal("5")
+gs.MAX_POSITION_PCT = Decimal("10")
+gs.HIGH_ROI_PCT = Decimal("100")
+gs.MAX_POSITION_PCT_HIGH_ROI = Decimal("30")
+
+# Предыдущие секции оставили позиции в тестовой БД. Здесь проверяются
+# ИМЕННО лимиты по цене, поэтому состояние БД подменяем на чистое —
+# иначе тест падал бы из-за чужих данных, а не из-за логики.
+_db_stubs = {name: getattr(gs, name) for name in
+             ("deployed_capital", "consecutive_losses",
+              "open_positions_count", "spend_since")}
+gs.deployed_capital = lambda: Decimal("0")
+gs.consecutive_losses = lambda: 0
+gs.open_positions_count = lambda: 0
+gs.spend_since = lambda _sec: Decimal("0")
+try:
+    check("обычная сделка ограничена обычным потолком",
+          gs.max_position_size(Decimal("20")) == Decimal("1"),
+          str(gs.max_position_size(Decimal("20"))))
+    check("сделка с ROI выше порога получает повышенный потолок",
+          gs.max_position_size(Decimal("150")) == Decimal("3"),
+          str(gs.max_position_size(Decimal("150"))))
+    check("ровно на пороге повышенный лимит уже действует",
+          gs.max_position_size(Decimal("100")) == Decimal("3"))
+    check("без указания ROI потолок остаётся обычным",
+          gs.max_position_size() == Decimal("1"))
+
+    # Главное: повышенный потолок НЕ отменяет остальные лимиты. Свободно
+    # 5 TON (банк 10 минус резерв 5), и 6 TON не пройдут ни при каком ROI.
+    _ok, _why = gs.check_risk_limits(Decimal("2.5"), Decimal("150"))
+    check("дорогая сделка с высоким ROI проходит потолок", _ok, _why)
+    _ok, _why = gs.check_risk_limits(Decimal("2.5"), Decimal("20"))
+    check("та же цена при обычном ROI отсекается", not _ok, _why)
+
+    gs.MAX_POSITION_PCT_HIGH_ROI = Decimal("90")
+    _ok, _why = gs.check_risk_limits(Decimal("6"), Decimal("500"))
+    check("резерв не обходится даже при исключительном ROI", not _ok, _why)
+    check("причина отказа указывает на банк, а не на потолок",
+          "резерв" in _why, _why)
+finally:
+    (gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT,
+     gs.HIGH_ROI_PCT, gs.MAX_POSITION_PCT_HIGH_ROI) = _ob, _or_, _op, _oh, _ohr
+    for _name, _fn in _db_stubs.items():
+        setattr(gs, _name, _fn)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

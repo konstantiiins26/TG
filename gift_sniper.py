@@ -224,6 +224,26 @@ BANKROLL_TON        = Decimal(os.getenv("BANKROLL_TON", "0"))             # 0 = 
 RESERVE_TON         = Decimal(os.getenv("RESERVE_TON", "5"))              # неснижаемый остаток (газ, комиссии)
 MAX_POSITION_PCT    = Decimal(os.getenv("MAX_POSITION_PCT", "10"))        # максимум % банка в одной сделке
 
+# Повышенный потолок для сделок с исключительной расчётной доходностью.
+# По умолчанию РАВЕН обычному, то есть механизм ВЫКЛЮЧЕН: включение — это
+# осознанное решение пользователя, а не значение по умолчанию.
+#
+# Зачем он: плоский процент от банка слеп к качеству сделки — он одинаково
+# режет и сделку с маржой 5%, и сделку с маржой 200%. Лот за 3 TON при floor
+# 10 TON приносит больше, чем пять сделок у самого порога рентабельности.
+#
+# Чем за это платят (читайте, прежде чем включать): высокий расчётный ROI —
+# это ровно то место, где модель ошибается чаще всего. Чем глубже скидка, тем
+# выше шанс, что она не ошибка продавца, а информация: клон-коллекция, битый
+# трейт, лот, который не продаётся именно поэтому. Увеличивая ставку на
+# высокий ROI, вы увеличиваете её там, где меньше всего оснований доверять
+# оценке. Поднимать это значение имеет смысл только после того, как бэктест
+# по СВОЕЙ записи покажет, что сделки с высоким ROI действительно закрывались
+# в плюс, а не оказывались ловушками.
+HIGH_ROI_PCT        = Decimal(os.getenv("HIGH_ROI_PCT", "100"))           # с какого ROI сделка считается исключительной
+MAX_POSITION_PCT_HIGH_ROI = Decimal(
+    os.getenv("MAX_POSITION_PCT_HIGH_ROI", str(MAX_POSITION_PCT)))        # = обычному => выключено
+
 # --- КОШЕЛЁК (Ярус 4) --------------------------------------------------------
 # Ключ читается ТОЛЬКО из файла с правами 0600, не из переменной окружения:
 # env видно в `ps`, в логах оркестратора и в дампах контейнера.
@@ -952,11 +972,34 @@ def target_sale_price(floor_price: Decimal, premium: bool = False) -> Decimal:
     return base * (Decimal("1") - UNDERCUT_PCT)
 
 
+def max_buy_at_roi(floor_price: Decimal, min_roi_pct: Decimal,
+                   premium: bool = False) -> Decimal:
+    """
+    Самая высокая цена покупки, при которой ROI ещё не ниже min_roi_pct.
+
+    Выводится из определения ROI = profit/buy:
+        profit = K - buy,  где K = Floor*(1-undercut)*(1-fee-royalty) - gas
+        (K - buy) / buy >= t   =>   buy <= K / (1 + t),   t = min_roi_pct/100
+
+    При min_roi_pct = 0 это в точности граница безубыточности.
+
+    Зачем отдельно от max_profitable_buy: требование «ROI не ниже 100%» режет
+    цену ВДВОЕ сильнее, чем требование «хоть какая-то прибыль». Смешивать их
+    нельзя — иначе получится вывод вида «дорогая коллекция доступна при скидке
+    18%», тогда как ROI в 100% требует там скидки под 60%.
+    """
+    sale = target_sale_price(floor_price, premium)
+    k = sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT) - GAS_FEE_TON
+    if k <= 0:
+        return Decimal("0")
+    return k / (Decimal("1") + Decimal(str(min_roi_pct)) / Decimal("100"))
+
+
 def max_profitable_buy(floor_price: Decimal, premium: bool = False) -> Decimal:
     """
     Верхняя граница цены покупки, выше которой сделка убыточна.
 
-    Выводится из той же формулы, что и compute_net_profit, приравненной к нулю:
+    Частный случай max_buy_at_roi при ROI = 0:
         Buy_max = Floor * (1-undercut) * (1-fee-royalty) - gas
 
     Нужна, чтобы ответить на вопрос «доступна ли эта коллекция моему банку»:
@@ -964,19 +1007,28 @@ def max_profitable_buy(floor_price: Decimal, premium: bool = False) -> Decimal:
     купить даже идеальный лот, и месяцы наблюдения за такой коллекцией
     не приведут ни к одной сделке.
     """
-    sale = target_sale_price(floor_price, premium)
-    return sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT) - GAS_FEE_TON
+    return max_buy_at_roi(floor_price, Decimal("0"), premium)
 
 
-def affordability(floor_price: Decimal) -> dict:
+def affordability(floor_price: Decimal, roi_pct=None) -> dict:
     """
     Сопоставляет коллекцию с банком: что бот реально сможет в ней купить.
 
     Возвращает потолок сделки, максимальную прибыльную цену и требуемую
     скидку от floor. verdict: "да" | "узко" | "нет" | "банк не задан".
+
+    `roi_pct` — если передан, потолок считается с учётом повышенного лимита
+    для исключительно выгодных сделок (MAX_POSITION_PCT_HIGH_ROI).
     """
-    buy_max = max_profitable_buy(floor_price)
-    cap = max_position_size()
+    # Повышенный потолок действует только для сделок с высоким ROI, а такой
+    # ROI сам по себе ограничивает цену сверху. Считать повышенный потолок
+    # против границы безубыточности значило бы обещать доступность там, где
+    # её нет.
+    if roi_pct is None:
+        buy_max = max_profitable_buy(floor_price)
+    else:
+        buy_max = max_buy_at_roi(floor_price, Decimal(str(roi_pct)))
+    cap = max_position_size(roi_pct)
 
     if BANKROLL_TON <= 0:
         verdict = "банк не задан"
@@ -1165,16 +1217,40 @@ def available_bankroll() -> Decimal:
     return BANKROLL_TON - deployed_capital() - RESERVE_TON
 
 
-def max_position_size() -> Decimal:
+def position_pct_for(roi_pct=None) -> Decimal:
+    """
+    Какая доля банка разрешена этой сделке.
+
+    Обычным сделкам — MAX_POSITION_PCT. Сделкам с ROI не ниже HIGH_ROI_PCT —
+    MAX_POSITION_PCT_HIGH_ROI, который по умолчанию равен обычному (механизм
+    выключен). Повышенный процент НЕ отменяет остальные лимиты: банк, резерв,
+    абсолютный потолок сделки и лимиты часа/суток проверяются как обычно.
+    """
+    if roi_pct is None:
+        return MAX_POSITION_PCT
+    try:
+        roi = Decimal(str(roi_pct))
+    except (InvalidOperation, ValueError):
+        return MAX_POSITION_PCT
+    if roi >= HIGH_ROI_PCT:
+        return max(MAX_POSITION_PCT, MAX_POSITION_PCT_HIGH_ROI)
+    return MAX_POSITION_PCT
+
+
+def max_position_size(roi_pct=None) -> Decimal:
     """
     Потолок одной сделки: минимум из абсолютного лимита и доли банка.
 
     Доля банка важнее абсолютного числа: она масштабируется вместе с
     депозитом и не даёт одной сделке унести весь банк.
+
+    `roi_pct` — расчётная доходность конкретной сделки. Передаётся, чтобы
+    исключительно выгодная сделка не отсекалась тем же порогом, что и
+    пограничная; см. MAX_POSITION_PCT_HIGH_ROI.
     """
-    by_pct = BANKROLL_TON * MAX_POSITION_PCT / Decimal("100")
     if BANKROLL_TON <= 0:
         return MAX_SPEND_PER_TRADE_TON
+    by_pct = BANKROLL_TON * position_pct_for(roi_pct) / Decimal("100")
     return min(MAX_SPEND_PER_TRADE_TON, by_pct)
 
 
@@ -1209,17 +1285,22 @@ def load_wallet_key():
     return key, None
 
 
-def check_risk_limits(buy_price: Decimal):
+def check_risk_limits(buy_price: Decimal, roi_pct=None):
     """
     Последний контур защиты ПЕРЕД тратой денег.
 
     Возвращает (ok: bool, reason: str). Проверяется в порядке "от самого
     дешёвого к самому дорогому запросу".
+
+    `roi_pct` влияет ТОЛЬКО на потолок одной сделки и только если включён
+    MAX_POSITION_PCT_HIGH_ROI. Банк, резерв и лимиты часа/суток от него не
+    зависят — иначе высокий расчётный ROI обнулял бы всю защиту разом.
     """
-    cap = max_position_size()
+    pct = position_pct_for(roi_pct)
+    cap = max_position_size(roi_pct)
     if buy_price > cap:
         return False, (f"цена {buy_price} TON выше потолка сделки {cap} TON "
-                       f"({MAX_POSITION_PCT}% банка / абсолютный лимит)")
+                       f"({pct}% банка / абсолютный лимит)")
 
     # Банк — жёсткая граница: за её пределами денег просто нет.
     if BANKROLL_TON > 0:
@@ -1604,7 +1685,14 @@ def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
              f"| ROI {verdict.get('ROI_PERCENT', 0)}% | {reason}")
 
     # --- РИСК-ЛИМИТЫ: последний контур перед тратой денег ------------------
-    ok, limit_reason = check_risk_limits(buy_price)
+    ok, limit_reason = check_risk_limits(buy_price, ev["roi_pct"])
+    if ok and position_pct_for(ev["roi_pct"]) > MAX_POSITION_PCT:
+        # Повышенный лимит сработал — это должно быть видно в логе, а не
+        # раствориться в обычной строке про покупку.
+        log.warning(f"{_Color.YELLOW}Повышенный лимит: ROI {ev['roi_pct']}% >= "
+                    f"{HIGH_ROI_PCT}%, разрешено до "
+                    f"{position_pct_for(ev['roi_pct'])}% банка вместо "
+                    f"{MAX_POSITION_PCT}%.{_Color.RESET}")
     if not ok:
         log.warning(f"{_Color.RED}ПОКУПКА ЗАБЛОКИРОВАНА РИСК-ЛИМИТОМ: "
                     f"{limit_reason}{_Color.RESET}")
@@ -1918,7 +2006,16 @@ def show_affordability():
              f"{ROYALTY_PCT * 100}% с цены продажи, undercut "
              f"{UNDERCUT_PCT * 100}%, газ {GAS_FEE_TON} TON")
     log.info("")
-    log.info(f"{'Floor':>8} {'Прибыльно до':>14} {'Нужна скидка':>14}  Вердикт")
+    high_on = MAX_POSITION_PCT_HIGH_ROI > MAX_POSITION_PCT
+    if high_on:
+        log.info(f"Повышенный лимит ВКЛЮЧЁН: при ROI >= {HIGH_ROI_PCT}% "
+                 f"разрешено до {MAX_POSITION_PCT_HIGH_ROI}% банка "
+                 f"({max_position_size(HIGH_ROI_PCT)} TON)")
+    log.info("")
+    head = f"{'Floor':>8} {'Прибыльно до':>14} {'Нужна скидка':>14}  Вердикт"
+    if high_on:
+        head += "   | при высоком ROI"
+    log.info(head)
 
     rows, best = [], None
     for floor in ("0.3", "0.5", "0.8", "1.0", "1.5", "2.0", "3.0", "5.0", "10.0"):
@@ -1930,8 +2027,15 @@ def show_affordability():
             best = (f, aff)
         colour = (_Color.GREEN if aff["verdict"] == "да"
                   else _Color.YELLOW if aff["verdict"] == "узко" else _Color.RED)
-        log.info(f"{f:>8} {aff['buy_max']:>14.2f} {aff['discount_pct']:>13.0f}%  "
-                 f"{colour}{aff['verdict']}{_Color.RESET}")
+        line = (f"{f:>8} {aff['buy_max']:>14.2f} {aff['discount_pct']:>13.0f}%  "
+                f"{colour}{aff['verdict']}{_Color.RESET}")
+        if high_on:
+            hi = affordability(f, HIGH_ROI_PCT)
+            hi_colour = (_Color.GREEN if hi["verdict"] == "да"
+                         else _Color.YELLOW if hi["verdict"] == "узко" else _Color.RED)
+            line += (f"   | скидка {hi['discount_pct']:>3.0f}%  "
+                     f"{hi_colour}{hi['verdict']}{_Color.RESET}")
+        log.info(line)
 
     log.info("")
     if best is None:
@@ -1945,6 +2049,18 @@ def show_affordability():
                  f"({best[1]['discount_pct']:.0f}% от floor).{_Color.RESET}")
         log.info("Ищите на getgems.io коллекции Telegram Gifts с таким floor "
                  "и впишите их в TARGET_COLLECTIONS.")
+
+    if not high_on:
+        log.info("")
+        log.info("Дорогой, но очень выгодный лот сейчас отсекается тем же потолком, "
+                 "что и пограничный. Включить повышенный лимит:")
+        log.info(f"    set HIGH_ROI_PCT=100            (с какого ROI сделка исключительная)")
+        log.info(f"    set MAX_POSITION_PCT_HIGH_ROI=30  (до скольки % банка её пускать)")
+        log.warning(f"{_Color.YELLOW}Прежде чем включать: высокий расчётный ROI — это "
+                    f"место, где модель ошибается ЧАЩЕ всего. Глубокая скидка нередко "
+                    f"означает не ошибку продавца, а причину (клон-коллекция, битый "
+                    f"трейт, неликвид). Включайте после того, как бэктест покажет, что "
+                    f"сделки с высоким ROI у вас закрывались в плюс.{_Color.RESET}")
 
     log.info("")
     log.warning("Скидка — это то, НАСКОЛЬКО ниже floor должен стоять лот, чтобы "
