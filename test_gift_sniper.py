@@ -1151,6 +1151,78 @@ finally:
 
 
 # =============================================================================
+print("\n[25] Оценка по похожим лотам: ошибка продавца или ловушка")
+# =============================================================================
+
+# Сегменты: Cookbook дешёвый, Bible дорогой. Floor коллекции определяется
+# дешёвым сегментом, и именно поэтому оценивать по нему лот из дорогого
+# сегмента — ошибка, а из дешёвого — самообман.
+def mk_peer_item(model, price, addr="0:p"):
+    return {"address": addr, "sale_price_ton": Decimal(str(price)),
+            "is_on_sale": True, "mint_index": 5000,
+            "traits": {"model": model, "backdrop": "Grey"}}
+
+
+_pool = ([mk_peer_item("Cookbook", p) for p in ("1.0", "1.1", "1.2", "1.3", "1.5")] +
+         [mk_peer_item("Bible", p) for p in ("8.0", "8.5", "9.0", "9.5", "10.0")])
+_peers = gs.build_peer_prices(_pool)
+
+check("сегменты разделены по ключевому трейту",
+      sorted(_peers) == ["Bible", "Cookbook"], str(sorted(_peers)))
+_pf, _pn = gs.peer_floor(mk_peer_item("Bible", "9"), _peers)
+check("floor дорогого сегмента выше floor коллекции",
+      _pf is not None and _pf > Decimal("1.5"), str(_pf))
+check("размер выборки сегмента возвращается", _pn == 5, str(_pn))
+
+# Меньше MIN_PEER_SAMPLE — сравнивать не с чем, и это НЕ "всё хорошо".
+_thin = gs.build_peer_prices([mk_peer_item("Rare", "3.0")])
+_pf, _pn = gs.peer_floor(mk_peer_item("Rare", "1.0"), _thin)
+check("тонкий сегмент не даёт оценки", _pf is None and _pn == 1, f"{_pf} {_pn}")
+_pf, _pn = gs.peer_floor({"traits": {}}, _peers)
+check("лот без ключевого трейта не сравнивается", _pf is None and _pn == 0)
+
+# --- Развилка целиком -------------------------------------------------------
+_snap_peers = {"floor": Decimal("1.0"), "floor_reliable": True, "competition": 0,
+               "trait_index": {}, "trait_total": 0, "peer_prices": _peers}
+
+# Лот из ДОРОГОГО сегмента по цене дешёвого сегмента — ошибка продавца.
+# Оценка берёт минимум, то есть floor коллекции: прибыль не завышается.
+_ev = gs.evaluate_trade(mk_peer_item("Bible", "0.3", "0:mistake"), _snap_peers, None)
+check("дешёвый лот из дорогого сегмента считается по floor коллекции",
+      _ev["eff_floor"] == Decimal("1.0"), str(_ev["eff_floor"]))
+check("оценка по сегменту НЕ завышает прибыль",
+      _ev["eff_floor"] <= _snap_peers["floor"])
+
+# Лот из дешёвого сегмента: floor сегмента выше floor коллекции, берём floor.
+_ev = gs.evaluate_trade(mk_peer_item("Cookbook", "0.5", "0:cheapseg"), _snap_peers, None)
+check("лот дешёвого сегмента оценивается не выше floor коллекции",
+      _ev["eff_floor"] <= Decimal("1.0"), str(_ev["eff_floor"]))
+
+# Главное: глубокая скидка БЕЗ данных о похожих — отказ, а не покупка.
+_snap_blind = dict(_snap_peers, floor=Decimal("10"), peer_prices={})
+_ev = gs.evaluate_trade(mk_peer_item("Unknown", "1.0", "0:blind"), _snap_blind, None)
+check("скидка 90% без похожих лотов отклоняется",
+      not _ev["allowed"] and "сравнить не с чем" in _ev["reason"], _ev["reason"])
+check("скидка посчитана верно",
+      _ev["discount_pct"] == Decimal("90.0"), str(_ev["discount_pct"]))
+
+# Та же скидка, но похожие лоты есть и подтверждают её — сделка проходит.
+_confirm = gs.build_peer_prices([mk_peer_item("Solid", p) for p in
+                                 ("9.0", "9.5", "10.0", "10.5", "11.0")])
+_snap_ok = dict(_snap_peers, floor=Decimal("10"), peer_prices=_confirm)
+_ev = gs.evaluate_trade(mk_peer_item("Solid", "1.0", "0:real"), _snap_ok, None)
+check("та же скидка с подтверждением по похожим разрешена",
+      _ev["allowed"], _ev["reason"])
+
+# Умеренная скидка без данных о похожих проходит как раньше: ворота
+# ставились именно на ГЛУБОКУЮ скидку, а не на любую.
+_snap_mid = dict(_snap_peers, floor=Decimal("10"), peer_prices={})
+_ev = gs.evaluate_trade(mk_peer_item("Unknown", "5.0", "0:mid"), _snap_mid, None)
+check("умеренная скидка без похожих не блокируется",
+      _ev["allowed"], _ev["reason"])
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

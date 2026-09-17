@@ -181,6 +181,25 @@ HTTP_TIMEOUT_SEC    = int(os.getenv("HTTP_TIMEOUT_SEC", "15"))           # та�
 RARE_TRAIT_THRESHOLD_PCT = Decimal(os.getenv("RARE_TRAIT_THRESHOLD_PCT", "5"))  # <= N% носителей = редкий
 MIN_TRAIT_SAMPLE    = int(os.getenv("MIN_TRAIT_SAMPLE", "50"))            # меньше — редкость не оцениваем
 
+# --- Оценка по ПОХОЖИМ лотам, а не по floor всей коллекции ------------------
+# Главный источник ложных "выгодных" сделок: бот оценивает ЛЮБОЙ лот по floor
+# коллекции. Но floor — это цена самой дешёвой модели. Лот с мусорной моделью,
+# стоящий ниже floor, выглядит выгодным, хотя продать его по floor нельзя:
+# конкурировать он будет с такими же мусорными, а не с коллекцией целиком.
+#
+# Поэтому лот сравнивается с лотами, у которых ТОТ ЖЕ ключевой трейт (у
+# Telegram Gifts это модель). Разница между двумя картинами и отличает ошибку
+# продавца от "дёшево по причине":
+#   дешевле СВОИХ ПОХОЖИХ           -> ошибка продавца, берём;
+#   дешевле floor, но как все свои  -> скидки нет, это просто дешёвый сегмент.
+PEER_TRAIT          = os.getenv("PEER_TRAIT", "model")                    # по какому трейту искать похожих
+MIN_PEER_SAMPLE     = int(os.getenv("MIN_PEER_SAMPLE", "4"))              # меньше — оценка по похожим не делается
+
+# Скидка глубже этой считается подозрительной: настоящая ошибка продавца и
+# неликвид выглядят в цене ОДИНАКОВО, различает их только сравнение с
+# похожими. Без данных о похожих такая сделка пропускается.
+DEEP_DISCOUNT_PCT   = Decimal(os.getenv("DEEP_DISCOUNT_PCT", "60"))       # % ниже floor = требуется подтверждение
+
 # --- Ликвидность (Ярус 2) ---------------------------------------------------
 # Floor ничего не говорит о том, ПРОДАСТСЯ ли лот. Если у floor стоит толпа
 # продавцов, ваш undercut встанет в конец очереди и флип не закроется.
@@ -687,6 +706,46 @@ def build_trait_index(items):
     return index, total
 
 
+def build_peer_prices(on_sale_items):
+    """
+    Цены выставленных лотов, сгруппированные по значению ключевого трейта:
+        {"Cookbook": [1.2, 1.5, 4.0], "Bible": [8.0, 9.1], ...}
+
+    Только лоты НА ПРОДАЖЕ: нас интересует, с чем конкурировать при перепродаже,
+    а не какие модели вообще существуют.
+    """
+    peers = {}
+    for it in on_sale_items:
+        value = (it.get("traits") or {}).get(PEER_TRAIT)
+        if not value:
+            continue
+        peers.setdefault(str(value), []).append(Decimal(str(it["sale_price_ton"])))
+    for value in peers:
+        peers[value].sort()
+    return peers
+
+
+def peer_floor(item: dict, peer_prices: dict):
+    """
+    Floor среди лотов с тем же ключевым трейтом: (floor | None, размер выборки).
+
+    Считается тем же перцентилем, что и floor коллекции — по той же причине:
+    один "пылевой" лот не должен определять цену целого сегмента.
+
+    None означает "сравнить не с чем", и это НЕ синоним "всё в порядке".
+    Решение о глубокой скидке без этой цифры не принимается.
+    """
+    value = (item.get("traits") or {}).get(PEER_TRAIT)
+    if not value:
+        return None, 0
+    prices = (peer_prices or {}).get(str(value)) or []
+    prices = [Decimal(str(p)) for p in prices]
+    if len(prices) < MIN_PEER_SAMPLE:
+        return None, len(prices)
+    prices.sort()
+    return _percentile(prices, FLOOR_PERCENTILE).quantize(Decimal("0.000000001")), len(prices)
+
+
 def compute_rarity_pct(item: dict, index: dict, total: int):
     """
     Оценивает редкость лота как долю (в %) носителей его САМОГО РЕДКОГО трейта.
@@ -904,6 +963,9 @@ def get_market_snapshot(collection: str) -> dict:
     trait_index, trait_total = build_trait_index(all_items)
 
     return {
+        # Цены по сегментам: без них лот сравнивать не с чем, и бэктест
+        # повторил бы ровно ту ошибку, от которой мы защищаемся.
+        "peer_prices": build_peer_prices(on_sale),
         # Без этого поля снапшоты разных коллекций в записи неразличимы,
         # и бэктест подставил бы floor чужой коллекции.
         "collection": cache_key,
@@ -1597,12 +1659,25 @@ def evaluate_trade(item: dict, snapshot: dict, recent_sales) -> dict:
         item, snapshot.get("trait_index", {}), snapshot.get("trait_total", 0))
     rare = is_rare(rarity_pct)
 
+    # --- Оценка по похожим лотам ------------------------------------------
+    # Продавать придётся не "коллекции вообще", а в своём сегменте. Берём
+    # МИНИМУМ из floor коллекции и floor сегмента: если сегмент дешевле, по
+    # floor коллекции лот не уйдёт; если дороже — не завышаем оценку, потому
+    # что выборка по сегменту всегда меньше и доверия ей меньше. Минимум
+    # никогда не увеличивает расчётную прибыль относительно прежнего кода.
+    p_floor, peer_n = peer_floor(item, snapshot.get("peer_prices"))
+    eff_floor = min(floor, p_floor) if p_floor is not None else floor
+
+    # Насколько лот дешевле коллекции — только для проверки на ловушку.
+    discount_pct = ((Decimal("1") - buy_price / floor) * Decimal("100")
+                    if floor > 0 else Decimal("0"))
+
     # Красивый номер и редкость влияют на решение ТОЛЬКО через оценку
     # (PREMIUM_MULT), а не как отдельные ворота. Отдельной проверки
     # "переплата" здесь нет намеренно: расчёт прибыли уже её содержит —
     # покупка выше floor без премии всегда убыточна и отсекается ниже.
     premium = pretty or rare
-    profit = compute_net_profit(floor, buy_price, premium)
+    profit = compute_net_profit(eff_floor, buy_price, premium)
     roi = compute_roi_pct(profit, buy_price)
 
     verdict = {
@@ -1610,11 +1685,20 @@ def evaluate_trade(item: dict, snapshot: dict, recent_sales) -> dict:
         "buy_price": buy_price, "rarity_pct": rarity_pct,
         "rarest_trait": rarest_trait, "is_rare": rare, "is_pretty": pretty,
         "premium_applied": premium and PREMIUM_MULT != Decimal("1"),
+        "peer_floor": p_floor, "peer_n": peer_n, "eff_floor": eff_floor,
+        "discount_pct": discount_pct.quantize(Decimal("0.1")),
     }
 
     # Порядок проверок — от самой фундаментальной к частной.
     if not snapshot.get("floor_reliable"):
         verdict["reason"] = "floor недостоверен (мала выборка рынка)"
+    elif discount_pct >= DEEP_DISCOUNT_PCT and p_floor is None:
+        # Ошибка продавца и неликвид в цене выглядят ОДИНАКОВО. Различает их
+        # только сравнение с похожими лотами, и без него глубокая скидка —
+        # это не сигнал, а неизвестность. Дорогая неизвестность.
+        verdict["reason"] = (f"скидка {discount_pct:.0f}% от floor, но сравнить "
+                             f"не с чем: похожих лотов {peer_n} "
+                             f"(нужно >= {MIN_PEER_SAMPLE})")
     elif profit <= 0:
         verdict["reason"] = f"убыточно: профит {profit:.4f} TON"
     elif roi < MIN_ROI_PCT:
@@ -1627,7 +1711,10 @@ def evaluate_trade(item: dict, snapshot: dict, recent_sales) -> dict:
                              f"(нужно >= {MIN_SALES_IN_WINDOW}) — рынок неликвиден")
     else:
         verdict["allowed"] = True
-        verdict["reason"] = f"профит {profit:.4f} TON, ROI {roi}%"
+        basis = (f"по сегменту {eff_floor} TON (похожих {peer_n})"
+                 if p_floor is not None and eff_floor != floor
+                 else f"по floor {eff_floor} TON")
+        verdict["reason"] = f"профит {profit:.4f} TON, ROI {roi}%, {basis}"
 
     return verdict
 
@@ -1734,6 +1821,9 @@ def record_snapshot(snap: dict, path: str = None):
         "floor_reliable": snap["floor_reliable"],
         "trait_index": snap["trait_index"],
         "trait_total": snap["trait_total"],
+        # Decimal не сериализуется в JSON — храним строками, как и floor.
+        "peer_prices": {k: [str(p) for p in v]
+                        for k, v in (snap.get("peer_prices") or {}).items()},
         "candidates": snap["candidates"],
     }
     try:
