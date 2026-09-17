@@ -139,9 +139,10 @@ PREMIUM_MULT        = Decimal(os.getenv("PREMIUM_MULT", "1.0"))
 # получается только выборкой: тянем несколько страниц и берём перцентиль.
 #
 # ЦЕНА ВОПРОСА — нагрузка на API: FLOOR_SAMPLE_PAGES запросов КАЖДЫЙ цикл.
-# При 5 страницах и интервале 12 сек это ~25 запросов/мин. Без ключа TONAPI_KEY
-# вы упрётесь в лимиты. Если ловите 429 — поднимите POLL_INTERVAL_SEC
-# или уменьшите FLOOR_SAMPLE_PAGES (ценой точности floor).
+# ВАЖНО: поднимать POLL_INTERVAL_SEC от 429 почти не помогает. Интервал цикла
+# разносит во времени ПАЧКИ запросов, а страницы внутри пачки уходят подряд,
+# и упираются они в лимит по СЕКУНДАМ. От 429 спасает TONAPI_MIN_INTERVAL
+# (пауза между запросами) и ключ TONAPI_KEY, а не редкий опрос.
 FLOOR_PAGE_SIZE     = int(os.getenv("FLOOR_PAGE_SIZE", "100"))            # размер одной страницы выборки
 FLOOR_SAMPLE_PAGES  = int(os.getenv("FLOOR_SAMPLE_PAGES", "5"))           # сколько страниц тянуть (5 x 100 = 500 лотов)
 FLOOR_PERCENTILE    = Decimal(os.getenv("FLOOR_PERCENTILE", "5"))         # 5-й перцентиль вместо голого min()
@@ -153,6 +154,14 @@ FLOOR_PERCENTILE    = Decimal(os.getenv("FLOOR_PERCENTILE", "5"))         # 5-й
 # независимых продавцов, и один ошибочный "пылевой" лот его не двигает.
 MIN_FLOOR_SAMPLE    = int(os.getenv("MIN_FLOOR_SAMPLE", "40"))            # меньше этого — floor недостоверен, не торгуем
 FLOOR_CACHE_TTL_SEC = int(os.getenv("FLOOR_CACHE_TTL_SEC", "60"))         # кэш floor, чтобы не сканировать рынок каждые 12 сек
+
+# Страницы выборки уходят подряд, а TonAPI без ключа лимитирует по запросам
+# в СЕКУНДУ, а не в минуту. Поэтому 15 страниц за раз ловят 429 даже при
+# интервале цикла 60с: важна не средняя нагрузка, а пачка. Держим паузу
+# между запросами и ретраим 429 с нарастающим ожиданием — потерянная
+# страница молча прореживает выборку, а floor по тонкой выборке завышается.
+TONAPI_MIN_INTERVAL = Decimal(os.getenv("TONAPI_MIN_INTERVAL", "1.1"))    # секунд между запросами к TonAPI
+TONAPI_MAX_RETRIES  = int(os.getenv("TONAPI_MAX_RETRIES", "3"))           # попыток на страницу при 429
 CANDIDATES_TO_ANALYZE = int(os.getenv("CANDIDATES_TO_ANALYZE", "5"))      # сколько самых дешёвых лотов отдавать ИИ
 
 # --- Верификация коллекции (защита от скам-коллекций) -----------------------
@@ -379,6 +388,55 @@ def _nano_to_ton(nano_value) -> Decimal:
         return Decimal("0")
 
 
+_tonapi_last_call = 0.0
+
+
+def _tonapi_get(url: str, params: dict, headers: dict) -> dict:
+    """
+    Запрос к TonAPI с соблюдением лимита по частоте и ретраями на 429.
+
+    Зачем это здесь, а не «поднимите POLL_INTERVAL_SEC»: интервал цикла
+    разносит во времени ПАЧКИ запросов, а не запросы внутри пачки. Пятнадцать
+    страниц уходят за пару секунд и упираются в лимит независимо от того,
+    раз в 12 секунд мы их шлём или раз в минуту.
+
+    Ретраить важно: молча потерянная страница уменьшает выборку, а floor по
+    тонкой выборке систематически ЗАВЫШАЕТСЯ (P5 вырождается в min()), то есть
+    ошибается в сторону «покупай».
+    """
+    global _tonapi_last_call
+    delay = float(TONAPI_MIN_INTERVAL)
+
+    for attempt in range(TONAPI_MAX_RETRIES):
+        waited = time.monotonic() - _tonapi_last_call
+        if waited < delay:
+            time.sleep(delay - waited)
+
+        _tonapi_last_call = time.monotonic()
+        resp = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT_SEC)
+
+        if resp.status_code == 429:
+            if attempt == TONAPI_MAX_RETRIES - 1:
+                resp.raise_for_status()
+            # Retry-After, если сервер его прислал; иначе удваиваем паузу.
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                pause = float(retry_after) if retry_after else delay * (2 ** (attempt + 1))
+            except ValueError:
+                pause = delay * (2 ** (attempt + 1))
+            pause = min(pause, 30.0)
+            log.warning(f"TonAPI: 429, жду {pause:.1f}с и повторяю "
+                        f"(попытка {attempt + 2}/{TONAPI_MAX_RETRIES}).")
+            time.sleep(pause)
+            continue
+
+        resp.raise_for_status()
+        return resp.json()
+
+    # До сюда дойти нельзя: последняя попытка либо вернула данные, либо бросила.
+    raise RuntimeError("TonAPI: исчерпаны попытки")
+
+
 def fetch_items_tonapi(collection: str, limit: int, offset: int = 0):
     """
     ОСНОВНОЙ ИСТОЧНИК: TonAPI.io
@@ -397,9 +455,7 @@ def fetch_items_tonapi(collection: str, limit: int, offset: int = 0):
     if TONAPI_KEY:
         headers["Authorization"] = f"Bearer {TONAPI_KEY}"
 
-    resp = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT_SEC)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _tonapi_get(url, params, headers)
 
     items = []
     for nft in data.get("nft_items", []):

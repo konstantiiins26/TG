@@ -19,6 +19,7 @@
 
 import base64
 import sys
+import time
 from decimal import Decimal
 
 import gift_sniper as gs
@@ -839,8 +840,10 @@ REAL_SALE_RESPONSE = {"nft_items": [
 
 
 class _FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._payload = payload
+        self.status_code = status_code
+        self.headers = {}
 
     def raise_for_status(self):
         return None
@@ -860,11 +863,14 @@ class _FakeRequests:
 
 
 _real_requests = gs.requests
+_real_interval = gs.TONAPI_MIN_INTERVAL
 gs.requests = _FakeRequests(REAL_SALE_RESPONSE)
+gs.TONAPI_MIN_INTERVAL = Decimal("0")     # в тестах ждать нечего и некого
 try:
     parsed = gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
 finally:
     gs.requests = _real_requests
+    gs.TONAPI_MIN_INTERVAL = _real_interval
 
 check("разобраны все 4 предмета", len(parsed) == 4, f"got={len(parsed)}")
 
@@ -911,6 +917,79 @@ try:
           gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale") is True)
 finally:
     gs.DRY_RUN = _odry
+
+
+# =============================================================================
+print("\n[21] Лимит частоты TonAPI: пауза и ретраи на 429")
+# =============================================================================
+
+# Живой прогон 17.09.2026 поймал 429 на страницах 11-15 из 15: интервал цикла
+# разносит ПАЧКИ запросов, а не запросы внутри пачки, а TonAPI без ключа
+# лимитирует по секундам. Потерянная страница опасна не сама по себе —
+# она молча прореживает выборку, а floor по тонкой выборке завышается.
+
+class _SeqRequests:
+    """Отдаёт заранее заданную последовательность ответов."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def get(self, *args, **kwargs):
+        self.calls += 1
+        return self.responses.pop(0)
+
+
+class _TooManyRequests(_FakeResponse):
+    def __init__(self, retry_after=None):
+        super().__init__({}, status_code=429)
+        if retry_after is not None:
+            self.headers = {"Retry-After": str(retry_after)}
+
+    def raise_for_status(self):
+        raise RuntimeError("429 Client Error: Too Many Requests")
+
+
+_real_requests = gs.requests
+_real_interval = gs.TONAPI_MIN_INTERVAL
+_real_retries = gs.TONAPI_MAX_RETRIES
+gs.TONAPI_MIN_INTERVAL = Decimal("0")
+gs.TONAPI_MAX_RETRIES = 3
+try:
+    # 429 с Retry-After, затем успех: страница обязана прийти, а не потеряться.
+    seq = _SeqRequests([_TooManyRequests(retry_after=0),
+                        _FakeResponse(REAL_SALE_RESPONSE)])
+    gs.requests = seq
+    recovered = gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+    check("после 429 запрос повторяется и страница приходит",
+          len(recovered) == 4 and seq.calls == 2, f"calls={seq.calls}")
+
+    # Лимит попыток конечен: бесконечно долбить API нельзя.
+    seq = _SeqRequests([_TooManyRequests(retry_after=0) for _ in range(3)])
+    gs.requests = seq
+    try:
+        gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+        raised = False
+    except RuntimeError:
+        raised = True
+    check("непрерывный 429 в итоге бросает исключение, а не молчит", raised)
+    check("попыток ровно TONAPI_MAX_RETRIES", seq.calls == 3, f"calls={seq.calls}")
+
+    # Пауза между запросами реально выдерживается.
+    gs.TONAPI_MIN_INTERVAL = Decimal("0.2")
+    gs._tonapi_last_call = 0.0
+    gs.requests = _SeqRequests([_FakeResponse(REAL_SALE_RESPONSE) for _ in range(3)])
+    _t0 = time.monotonic()
+    for _ in range(3):
+        gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+    _elapsed = time.monotonic() - _t0
+    check("между запросами выдерживается пауза",
+          _elapsed >= 0.4, f"elapsed={_elapsed:.2f}s")
+finally:
+    gs.requests = _real_requests
+    gs.TONAPI_MIN_INTERVAL = _real_interval
+    gs.TONAPI_MAX_RETRIES = _real_retries
+    gs._tonapi_last_call = 0.0
 
 
 # =============================================================================
