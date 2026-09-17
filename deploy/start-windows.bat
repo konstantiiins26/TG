@@ -17,8 +17,21 @@ set FLOOR_SAMPLE_PAGES=15
 set POLL_INTERVAL_SEC=60
 set DRY_RUN=1
 
-REM --- Bank: nuzhen dlya --afford i dlya rascheta limitov ---
+REM --- Bank ---
+REM Postavte fakticheskiy razmer banka v TON (posmotrite kurs sami).
 set BANKROLL_TON=10
+
+REM Rezerv na gaz. 0.15 TON za operaciyu, flip = ~2 operacii,
+REM znachit 1 TON hvataet primerno na 6-7 operaciy.
+REM Rezerv 5 pri banke 10 oznachal by, chto polovina banka ne rabotaet.
+REM VNIMANIE: esli pozitsiy budet mnogo, 1 TON mozhet konchitsya -
+REM togda ne na chto budet vystavit kuplennoe na prodazhu.
+set RESERVE_TON=1
+
+REM Potolok odnoy sdelki: 20%% banka = 2 TON pri banke 10.
+REM Pri 10%% potolok byl by 1 TON, i rabochiy floor upal by do ~1.3,
+REM gde gaz sedaet pochti vsyu pribyl.
+set MAX_POSITION_PCT=20
 
 REM --- Povyshennyy limit dlya isklyuchitelno vygodnyh sdelok ---
 REM Sdelke s ROI ot 150 procentov razresheno do 20 procentov banka
