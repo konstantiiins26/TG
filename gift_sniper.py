@@ -1614,6 +1614,112 @@ def _backtest_one(snaps, hold_hours: int, bought_addrs: set):
     return trades
 
 
+def probe(address: str):
+    """
+    Диагностика: что РЕАЛЬНО отдаёт API по этому адресу и что из этого
+    удалось разобрать.
+
+    Две задачи сразу:
+      1) если адрес — кошелёк, показать коллекции ваших подарков (их адреса
+         можно сразу вставить в TARGET_COLLECTIONS);
+      2) если адрес — коллекция, показать, что парсер извлёк из ответа,
+         и ЧЕСТНО напечатать сырой JSON там, где не извлёк ничего.
+
+    Пункт 2 существует потому, что форма ответа TonAPI в этом проекте ни разу
+    не проверялась на живых данных. Сырой вывод — это то, по чему парсер
+    можно починить, не гадая.
+    """
+    norm = normalize_ton_address(address)
+    if norm is None:
+        log.error(f"{address!r} не распознан как адрес TON.")
+        return False
+
+    headers = {"Accept": "application/json"}
+    if TONAPI_KEY:
+        headers["Authorization"] = f"Bearer {TONAPI_KEY}"
+
+    log.info(f"{_Color.BOLD}=== ПРОВЕРКА {_short(address)} ==={_Color.RESET}")
+    log.info(f"Нормализованный вид: {norm}")
+
+    # --- Попытка 1: это кошелёк? Тогда покажем коллекции его подарков -------
+    acc_url = f"https://tonapi.io/v2/accounts/{address}/nfts"
+    try:
+        r = requests.get(acc_url, params={"limit": 50}, headers=headers,
+                         timeout=HTTP_TIMEOUT_SEC)
+        if r.status_code == 200:
+            items = r.json().get("nft_items", [])
+            colls = {}
+            for it in items:
+                c = it.get("collection") or {}
+                if c.get("address"):
+                    colls.setdefault(c["address"], c.get("name", "?"))
+            if colls:
+                log.info(f"{_Color.GREEN}Это кошелёк. Коллекций среди его NFT: "
+                         f"{len(colls)}{_Color.RESET}")
+                for addr, name in colls.items():
+                    log.info(f"  {name}")
+                    log.info(f"    {addr}")
+                log.info("")
+                log.info("Готовая строка для запуска:")
+                log.info(f"  export TARGET_COLLECTIONS=\"{','.join(colls)}\"")
+                return True
+    except Exception as e:  # noqa: BLE001 — это лишь одна из гипотез
+        log.debug(f"Не кошелёк или ошибка: {e}")
+
+    # --- Попытка 2: это коллекция? Проверяем парсер на живых данных --------
+    url = f"https://tonapi.io/v2/nfts/collections/{address}/items"
+    try:
+        r = requests.get(url, params={"limit": 5}, headers=headers,
+                         timeout=HTTP_TIMEOUT_SEC)
+    except Exception as e:  # noqa: BLE001
+        log.error(f"Сеть недоступна: {e}")
+        return False
+
+    log.info(f"HTTP {r.status_code} от {url}")
+    if r.status_code != 200:
+        log.error(f"Ответ: {r.text[:400]}")
+        if r.status_code == 429:
+            log.error("Это лимит запросов — получите TONAPI_KEY на tonconsole.com")
+        return False
+
+    raw_items = r.json().get("nft_items", [])
+    if not raw_items:
+        log.warning("Ответ пустой: по этому адресу предметов нет. "
+                    "Скорее всего адрес не коллекции.")
+        return False
+
+    parsed = fetch_items_tonapi(address, limit=5)
+    log.info(f"Предметов в ответе: {len(raw_items)} | разобрано: {len(parsed)}")
+
+    # Проверяем КАЖДОЕ поле отдельно: молчаливо не разобранное поле — это
+    # именно то, что потом ломает расчёты.
+    on_sale = [i for i in parsed if i["is_on_sale"]]
+    checks = [
+        ("цена продажи", sum(1 for i in parsed if i["sale_price_ton"] > 0)),
+        ("лоты на продаже", len(on_sale)),
+        ("номер минта", sum(1 for i in parsed if i["mint_index"] is not None)),
+        ("трейты", sum(1 for i in parsed if i.get("traits"))),
+        ("адрес коллекции", sum(1 for i in parsed if i["collection_address"])),
+    ]
+    log.info("")
+    for name, got in checks:
+        mark = f"{_Color.GREEN}OK{_Color.RESET}" if got else f"{_Color.RED}НЕ РАЗОБРАНО{_Color.RESET}"
+        log.info(f"  {name:<20} {got}/{len(parsed)}  {mark}")
+
+    failed = [n for n, g in checks if not g]
+    if failed:
+        log.info("")
+        log.warning(f"{_Color.YELLOW}Не разобрано: {', '.join(failed)}. "
+                    f"Сырой JSON первого предмета ниже — по нему чинится парсер."
+                    f"{_Color.RESET}")
+        log.info(json.dumps(raw_items[0], ensure_ascii=False, indent=2)[:2500])
+    else:
+        log.info("")
+        log.info(f"{_Color.GREEN}Парсер разобрал всё. Коллекцию можно "
+                 f"добавлять в TARGET_COLLECTIONS.{_Color.RESET}")
+    return not failed
+
+
 def rank_collections(path: str = None):
     """
     Ранжирует коллекции из записи рынка по РЕАЛЬНОЙ активности.
@@ -1966,6 +2072,9 @@ def parse_args(argv=None):
                         help="прогнать решения по записи рынка и выйти")
     parser.add_argument("--rank", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="показать, какие коллекции реально торгуются, и выйти")
+    parser.add_argument("--probe", metavar="ADDRESS",
+                        help="проверить адрес (кошелёк или коллекцию) и показать, "
+                             "что парсер извлёк из живого ответа API")
     parser.add_argument("--hold-hours", type=int, default=None,
                         help=f"горизонт удержания в бэктесте (по умолчанию {BACKTEST_HOLD_HOURS})")
     return parser.parse_args(argv)
@@ -1974,6 +2083,9 @@ def parse_args(argv=None):
 if __name__ == "__main__":
     args = parse_args()
     try:
+        if args.probe:
+            # Только чтение API: ни покупок, ни записи.
+            sys.exit(0 if probe(args.probe) else 1)
         if args.rank:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if rank_collections(args.rank) else 1)
