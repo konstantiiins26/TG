@@ -253,6 +253,13 @@ TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 # рынка: сначала --record несколько дней, потом --backtest по этому файлу.
 RECORD_PATH         = os.getenv("RECORD_PATH", "market_history.jsonl")
 BACKTEST_HOLD_HOURS = int(os.getenv("BACKTEST_HOLD_HOURS", "24"))   # через сколько часов "продаём"
+# Запись может быть прерывистой: ПК выключают на ночь, бот падает, сеть лежит.
+# Тогда ближайший снапшот "после 24 часов" окажется через 33 или через 70 часов,
+# и бэктест посчитает его как результат суточного удержания — отчёт скажет
+# "удержание 24ч", а на деле там неделя. Зазор больше этого порога = позиция
+# НЕ закрыта. Лучше меньше сделок в выборке, чем цифры, означающие не то,
+# что написано в шапке отчёта.
+BACKTEST_MAX_SLACK_HOURS = Decimal(os.getenv("BACKTEST_MAX_SLACK_HOURS", "6"))
 
 # --- Служебное ---------------------------------------------------------------
 DRY_RUN             = os.getenv("DRY_RUN", "1") == "1"   # 1 = только заглушка покупки (безопасно)
@@ -1628,18 +1635,29 @@ def _load_recording(path: str):
     return snaps
 
 
-def _future_floor(snaps, after_ts: float):
+def _future_floor(snaps, after_ts: float, max_slack_sec: float = None):
     """
     Floor в первом снапшоте, снятом не раньше after_ts.
 
-    Возвращает None, если запись закончилась раньше — такая позиция
-    считается НЕЗАКРЫТОЙ и в winrate не попадает. Домысливать за неё
-    исход означало бы подогнать результат.
+    Возвращает (floor, None) либо (None, причина-почему-нет).
+
+    Две разные причины не закрыть позицию, и их важно различать:
+      "end" — запись просто закончилась (ждём ещё данных);
+      "gap" — снапшот есть, но слишком поздний: в записи дыра.
+
+    Дыра опаснее конца записи, потому что она молчит. Без проверки зазора
+    покупка, сделанная вечером перед выключением ПК, "закрылась" бы по floor
+    следующего утра — и отчёт назвал бы это суточным удержанием. Домысливать
+    за такую позицию исход означало бы подогнать результат.
     """
+    if max_slack_sec is None:
+        max_slack_sec = float(BACKTEST_MAX_SLACK_HOURS) * 3600
     for snap in snaps:
         if snap["ts"] >= after_ts:
-            return snap["floor"]
-    return None
+            if snap["ts"] - after_ts > max_slack_sec:
+                return None, "gap"
+            return snap["floor"], None
+    return None, "end"
 
 
 def run_backtest(path: str = None, hold_hours: int = None):
@@ -1702,12 +1720,13 @@ def _backtest_one(snaps, hold_hours: int, bought_addrs: set):
             if ev["buy_price"] > MAX_SPEND_PER_TRADE_TON:
                 continue
 
-            future = _future_floor(snaps, snap["ts"] + hold_hours * 3600)
+            future, missing = _future_floor(snaps, snap["ts"] + hold_hours * 3600)
             bought_addrs.add(item["address"])
             trade = {"address": item["address"], "buy": ev["buy_price"],
                      "expected": ev["net_profit"], "roi": ev["roi_pct"]}
             if future is None:
-                trade["status"] = "open"        # запись кончилась раньше выхода
+                trade["status"] = "open"
+                trade["missing"] = missing      # "end" (ждём данных) или "gap" (дыра)
             else:
                 sale = target_sale_price(future, ev["is_rare"] or ev["is_pretty"])
                 proceeds = sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)
@@ -1946,13 +1965,23 @@ def _report_backtest(trades, hold_hours):
     invested = sum((t["buy"] for t in closed), Decimal("0"))
     expected = sum((t["expected"] for t in closed), Decimal("0"))
 
+    gaps = len([t for t in trades if t.get("missing") == "gap"])
+    ends = unresolved - gaps
     log.info(f"Сделок отобрано: {len(trades)} | закрыто: {len(closed)} | "
-             f"не закрыто (запись кончилась): {unresolved}")
+             f"не закрыто: {unresolved} (запись кончилась: {ends}, "
+             f"дыра в записи: {gaps})")
+    if gaps:
+        log.warning(f"{_Color.YELLOW}{gaps} сделок выброшено из-за перерывов в "
+                    f"записи: следующий снапшот нашёлся позже чем через "
+                    f"{BACKTEST_MAX_SLACK_HOURS}ч после срока выхода. Пишите "
+                    f"рынок непрерывно — прерывистая запись стоит данных."
+                    f"{_Color.RESET}")
 
     if not closed:
         log.warning(f"{_Color.YELLOW}Ни одна сделка не закрылась — выводов сделать "
                     f"нельзя. Нужна запись длиннее {hold_hours}ч.{_Color.RESET}")
-        return {"trades": len(trades), "closed": 0, "unresolved": unresolved}
+        return {"trades": len(trades), "closed": 0, "unresolved": unresolved,
+                "gaps": gaps}
 
     winrate = Decimal(len(wins)) / Decimal(len(closed)) * Decimal("100")
     color = _Color.GREEN if total_pnl > 0 else _Color.RED
@@ -1970,7 +1999,7 @@ def _report_backtest(trades, hold_hours):
     log.info(f"Лучшая: {best['pnl']:+.4f} TON | Худшая: {worst['pnl']:+.4f} TON")
 
     return {"trades": len(trades), "closed": len(closed), "unresolved": unresolved,
-            "wins": len(wins), "winrate": winrate, "pnl": total_pnl,
+            "gaps": gaps, "wins": len(wins), "winrate": winrate, "pnl": total_pnl,
             "invested": invested, "expected": expected}
 
 
