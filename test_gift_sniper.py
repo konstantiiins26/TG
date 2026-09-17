@@ -626,10 +626,10 @@ check("живой режим заблокирован с пустым whitelist"
 gs.REAL_EXECUTOR_AVAILABLE = False
 gs.DRY_RUN = False
 check("нереализованная покупка возвращает False, а не ложный успех",
-      gs.execute_blockchain_buy("0:x", Decimal("1")) is False)
+      gs.execute_blockchain_buy("0:x", Decimal("1"), "0:sale") is False)
 gs.DRY_RUN = True
 check("в симуляции покупка возвращает True",
-      gs.execute_blockchain_buy("0:x", Decimal("1")) is True)
+      gs.execute_blockchain_buy("0:x", Decimal("1"), "0:sale") is True)
 
 (gs.DRY_RUN, gs.CONFIRM_LIVE_TRADING, gs.REAL_EXECUTOR_AVAILABLE) = (_odry, _oconf, _oexec)
 (gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.COLLECTION_WHITELIST) = (_okey, _obank, _owl)
@@ -777,6 +777,140 @@ check("явной редкости в ответе API нет",
 # Эти два предмета не выставлены — поля sale в ответе нет вообще.
 check("без поля sale лот не считается продающимся",
       bool((REAL_NFT.get("sale") or {}).get("price")) is False)
+
+
+# =============================================================================
+print("\n[20] Парсинг ВЫСТАВЛЕННЫХ лотов (реальные sale из TonAPI)")
+# =============================================================================
+
+# Дословные блоки sale из того же ответа (limit=50): из 50 предметов
+# выставлены были ровно 4. Они закрывают то, чего не было в секции [19]:
+# цену, адрес контракта продажи и площадку.
+#
+# ВАЖНОЕ, подтверждённое этими данными: "Gram" в price.token_name — это
+# НЕ отдельный жетон. Рядом стоят currency_type="native" и decimals=9,
+# то есть это нативная монета TON, а значение — нанотоны. Интерфейс Getgems
+# подписывает цены как GRAM, расчёт в коде ведётся в TON — это одно и то же.
+REAL_SALE_RESPONSE = {"nft_items": [
+    {   # Getgems Sales, 50 TON
+        "address": "0:21fb89b58c779dd566b4eae44590542d76234bdbae879cf2ed0c97ecc328d08b",
+        "collection": {"address": "0:b6d76763aead208254178bc312157d5b730e0b1f0dc4b3ada52afb75959cf3b1",
+                       "name": "Timeless Books"},
+        "metadata": {"name": "Timeless Book #45129",
+                     "attributes": [{"trait_type": "Model", "value": "Cookbook"}]},
+        "sale": {
+            "address": "0:972df524a3aafd933ea65c6554f26915be8f26625dfac58406045af350aaa440",
+            "market": {"address": "0:584ee61b2dff0837116d0fcb5078d93964bcbe9c05fd6a141b1bfca5d6a43e18",
+                       "name": "Getgems Sales", "is_scam": False, "is_wallet": False},
+            "price": {"currency_type": "native", "value": "50000000000",
+                      "decimals": 9, "token_name": "Gram", "verification": "whitelist"}},
+    },
+    {   # Другая площадка: Marketapp Marketplace, 555 TON
+        "address": "0:8f5e4206d3995f1fd595e738ec334ec1cc3f039758b5db362051bf08e0572dfc",
+        "collection": {"address": "0:b6d76763aead208254178bc312157d5b730e0b1f0dc4b3ada52afb75959cf3b1",
+                       "name": "Timeless Books"},
+        "metadata": {"name": "Timeless Book #13398", "attributes": []},
+        "sale": {
+            "address": "0:626e7a4210c8240b42ec86cbd9380eb521d01bac71d1fd4fa98c52bfbaedf5f5",
+            "market": {"address": "0:9a9cb80adfbd1662f5108766d73355ac2c03304fda1d25a479670e34efcd72b3",
+                       "name": "Marketapp Marketplace", "is_scam": False, "is_wallet": True},
+            "price": {"currency_type": "native", "value": "555000000000",
+                      "decimals": 9, "token_name": "Gram", "verification": "whitelist"}},
+    },
+    {   # Getgems Sales, 150 TON
+        "address": "0:89fd8449a17ae4f763652e3fb404b294a104ec217c9c6361c5e199c038416f8a",
+        "collection": {"address": "0:b6d76763aead208254178bc312157d5b730e0b1f0dc4b3ada52afb75959cf3b1",
+                       "name": "Timeless Books"},
+        "metadata": {"name": "Timeless Book #21935", "attributes": []},
+        "sale": {
+            "address": "0:6b10025d989a8f18ededc97c0cd333386be9dcf54c42608b70b94c0160ffafe9",
+            "market": {"address": "0:584ee61b2dff0837116d0fcb5078d93964bcbe9c05fd6a141b1bfca5d6a43e18",
+                       "name": "Getgems Sales", "is_scam": False, "is_wallet": False},
+            "price": {"currency_type": "native", "value": "150000000000",
+                      "decimals": 9, "token_name": "Gram", "verification": "whitelist"}},
+    },
+    {   # Не выставлен: поля sale нет вовсе.
+        "address": "0:e8ff70dd4fe2a1c3de574bef08678f0a7de9c27c763dd844e975b6670f8011c7",
+        "collection": {"address": "0:b6d76763aead208254178bc312157d5b730e0b1f0dc4b3ada52afb75959cf3b1",
+                       "name": "Timeless Books"},
+        "metadata": {"name": "Timeless Book #16450", "attributes": []},
+    },
+]}
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeRequests:
+    """Подменяет только requests.get: сети в тестах нет и быть не должно."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def get(self, *args, **kwargs):
+        return _FakeResponse(self.payload)
+
+
+_real_requests = gs.requests
+gs.requests = _FakeRequests(REAL_SALE_RESPONSE)
+try:
+    parsed = gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+finally:
+    gs.requests = _real_requests
+
+check("разобраны все 4 предмета", len(parsed) == 4, f"got={len(parsed)}")
+
+on_sale = [i for i in parsed if i["is_on_sale"]]
+check("выставленными считаются ровно 3", len(on_sale) == 3, f"got={len(on_sale)}")
+
+check("нанотоны переводятся в TON",
+      [i["sale_price_ton"] for i in on_sale] == [Decimal("50"), Decimal("555"), Decimal("150")],
+      str([str(i["sale_price_ton"]) for i in on_sale]))
+
+# Регрессия на главный пробел: платёж уходит на контракт продажи, а не на NFT.
+check("адрес контракта продажи сохранён",
+      on_sale[0]["sale_address"] ==
+      "0:972df524a3aafd933ea65c6554f26915be8f26625dfac58406045af350aaa440",
+      on_sale[0]["sale_address"])
+check("адрес продажи НЕ совпадает с адресом предмета",
+      all(i["sale_address"] != i["address"] for i in on_sale))
+
+# Площадки разные, и протокол покупки у них может отличаться. Пока это только
+# фиксируется в данных, но без этого поля различить их будет нечем.
+check("площадка сохранена",
+      [i["sale_market"] for i in on_sale] ==
+      ["Getgems Sales", "Marketapp Marketplace", "Getgems Sales"],
+      str([i["sale_market"] for i in on_sale]))
+
+not_on_sale = [i for i in parsed if not i["is_on_sale"]][0]
+check("у невыставленного лота адрес продажи пуст",
+      not_on_sale["sale_address"] == "" and not_on_sale["sale_market"] == "")
+
+check("номер минта разобран и у выставленных лотов",
+      [i["mint_index"] for i in on_sale] == [45129, 13398, 21935],
+      str([i["mint_index"] for i in on_sale]))
+
+# --- Без адреса контракта продажи покупка невозможна в принципе -------------
+# Проверка стоит ДО ветки DRY_RUN, поэтому симуляция тоже обязана отказать:
+# "успешная" симуляция покупки, которую в живом режиме совершить нельзя,
+# создаёт ложную уверенность в готовности бота.
+_odry = gs.DRY_RUN
+gs.DRY_RUN = True
+try:
+    check("покупка без адреса продажи отклоняется даже в DRY_RUN",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "") is False)
+    check("покупка с адресом продажи в DRY_RUN проходит",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale") is True)
+finally:
+    gs.DRY_RUN = _odry
 
 
 # =============================================================================

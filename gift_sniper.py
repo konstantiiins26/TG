@@ -399,6 +399,11 @@ def fetch_items_tonapi(collection: str, limit: int, offset: int = 0):
     for nft in data.get("nft_items", []):
         # --- Цена продажи. У TonAPI данные о продаже лежат в nft["sale"]. ---
         sale = nft.get("sale") or {}
+        # Подтверждено живыми данными: sale.address — контракт продажи,
+        # sale.market.name — площадка (встречаются Getgems Sales и
+        # Marketapp Marketplace, у разных площадок может отличаться протокол).
+        sale_address = sale.get("address", "")
+        sale_market = ((sale.get("market") or {}).get("name") or "")
         price_block = sale.get("price") or {}
         sale_price_nano = price_block.get("value")          # строка нанотонов, если лот выставлен
         sale_price_ton = _nano_to_ton(sale_price_nano)
@@ -419,6 +424,8 @@ def fetch_items_tonapi(collection: str, limit: int, offset: int = 0):
             mint_index=mint_index,
             sale_price_ton=sale_price_ton,
             is_on_sale=bool(sale_price_nano and sale_price_ton > 0),
+            sale_address=sale_address,
+            sale_market=sale_market,
         ))
     return items
 
@@ -465,6 +472,10 @@ def fetch_items_getgems(collection: str, limit: int):
             mint_index=node.get("index"),
             sale_price_ton=price_ton,
             is_on_sale=bool(price_nano and price_ton > 0),
+            # ВНИМАНИЕ: адреса контракта продажи этот запрос не возвращает,
+            # поэтому лоты из запасного источника ПОКУПАТЬ НЕЛЬЗЯ —
+            # execute_blockchain_buy() их отклонит. Для расчёта floor и
+            # конкуренции данных хватает, для траты денег — нет.
         ))
     return items
 
@@ -499,7 +510,8 @@ def _extract_mint_index(nft: dict, meta: dict):
 
 def _normalize_item(address, collection_name, collection_address,
                     mint_index, sale_price_ton, is_on_sale,
-                    traits=None, explicit_rarity_pct=None):
+                    traits=None, explicit_rarity_pct=None,
+                    sale_address="", sale_market=""):
     """Единый формат лота для всего приложения (и для отправки в ИИ)."""
     return {
         "address": address,
@@ -512,6 +524,9 @@ def _normalize_item(address, collection_name, collection_address,
         # сильнее номера минта.
         "traits": traits or {},
         "explicit_rarity_pct": explicit_rarity_pct,
+        # Получатель платежа при покупке — контракт продажи, НЕ сам NFT.
+        "sale_address": sale_address,
+        "sale_market": sale_market,
     }
 
 
@@ -1320,7 +1335,7 @@ def _parse_ai_json(raw: str) -> dict:
 # 8. БЛОКЧЕЙН — ЗАГЛУШКА ПОКУПКИ (реальная подпись НЕ выполняется)
 # =============================================================================
 
-def execute_blockchain_buy(item_id: str, price) -> bool:
+def execute_blockchain_buy(item_id: str, price, sale_address: str = "") -> bool:
     """
     Покупка лота. Возвращает True только если сделка ДЕЙСТВИТЕЛЬНО совершена.
 
@@ -1336,6 +1351,16 @@ def execute_blockchain_buy(item_id: str, price) -> bool:
     Важно: функция НИКОГДА не возвращает True, не совершив сделку. Иначе бот
     записал бы в БД позицию, которой нет, и весь учёт PnL стал бы фикцией.
     """
+    # Платёж уходит на КОНТРАКТ ПРОДАЖИ, а не на сам NFT: отправка денег на
+    # адрес предмета их просто потеряет. Проверка стоит ДО ветки DRY_RUN
+    # намеренно — симуляция, рапортующая об успехе там, где живая покупка
+    # невозможна, врёт о готовности бота. Адрес приходит из sale.address
+    # TonAPI; запасной источник (Getgems GraphQL) его не отдаёт вовсе.
+    if not sale_address:
+        log.error(f"{_Color.RED}Адрес контракта продажи неизвестен — платить "
+                  f"некуда. Сделка НЕ совершена ({_short(item_id)}).{_Color.RESET}")
+        return False
+
     if DRY_RUN:
         log.info(f"{_Color.GREEN}[SUCCESS] (СИМУЛЯЦИЯ) Покупка лота "
                  f"{item_id} за {price} TON{_Color.RESET}")
@@ -1468,7 +1493,8 @@ def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
         notify(f"⛔️ Покупка заблокирована лимитом\n{_short(item['address'])}\n{limit_reason}")
         return
 
-    if execute_blockchain_buy(item["address"], buy_price):
+    if execute_blockchain_buy(item["address"], buy_price,
+                             item.get("sale_address", "")):
         pos_id = record_purchase(item, buy_price, floor_price)
         log.info(f"Позиция #{pos_id} записана в {DB_PATH}")
         notify(f"✅ Куплено #{pos_id}\n{_short(item['address'])}\n"
