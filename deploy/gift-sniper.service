@@ -23,7 +23,10 @@ WorkingDirectory=/opt/gift-sniper
 # содержимое юнита видно любому через systemctl cat.
 EnvironmentFile=/etc/gift-sniper/env
 
-ExecStart=/opt/gift-sniper/.venv/bin/python /opt/gift-sniper/gift_sniper.py
+# Режим задаётся переменной SNIPER_ARGS в EnvironmentFile:
+#   SNIPER_ARGS=--record   — только копить запись рынка (с этого начинают)
+#   SNIPER_ARGS=           — торговый цикл (после того, как бэктест убедил)
+ExecStart=/opt/gift-sniper/.venv/bin/python /opt/gift-sniper/gift_sniper.py $SNIPER_ARGS
 
 # Бот должен пережить падение сети или временный сбой API.
 Restart=always
