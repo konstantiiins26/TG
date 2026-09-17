@@ -25,7 +25,75 @@ from decimal import Decimal
 import gift_sniper as gs
 
 
+# =============================================================================
+# ГЕРМЕТИЧНОСТЬ: тесты не должны зависеть от окружения пользователя
+# =============================================================================
+# Все настройки бота читаются из переменных окружения при импорте. Если
+# запустить тесты в том же окне cmd, где стоял `set BANKROLL_TON=10`, проверки
+# начинают мерить чужую конфигурацию вместо кода — и падают на исправном боте.
+# Реальный случай: BANKROLL_TON=10 при позиции 10 TON и резерве 1 давал
+# available_bankroll = −1, из-за чего «нормальная сделка проходит» проваливалась.
+#
+# Поэтому фиксируем ВСЕ настраиваемые величины на документированные значения
+# по умолчанию. Секции, которым нужны другие, меняют их локально и возвращают
+# обратно. «Тесты прошли» обязано означать одно и то же на любой машине.
+_PINNED = {
+    # экономика
+    "MARKETPLACE_FEE_PCT": Decimal("0.02"), "ROYALTY_PCT": Decimal("0.05"),
+    "UNDERCUT_PCT": Decimal("0.03"), "GAS_FEE_TON": Decimal("0.15"),
+    "MIN_ROI_PCT": Decimal("5"), "PREMIUM_MULT": Decimal("1.0"),
+    # floor и выборка
+    "FLOOR_PAGE_SIZE": 100, "FLOOR_SAMPLE_PAGES": 5,
+    "FLOOR_PERCENTILE": Decimal("5"), "MIN_FLOOR_SAMPLE": 40,
+    "FLOOR_CACHE_TTL_SEC": 60, "CANDIDATES_TO_ANALYZE": 5,
+    # редкость и похожие лоты
+    "RARE_TRAIT_THRESHOLD_PCT": Decimal("5"), "MIN_TRAIT_SAMPLE": 50,
+    "PEER_TRAIT": "model", "MIN_PEER_SAMPLE": 4,
+    "DEEP_DISCOUNT_PCT": Decimal("60"),
+    # ликвидность и дедупликация
+    "COMPETITION_BAND_PCT": Decimal("10"), "MAX_COMPETITION": 15,
+    "ENABLE_SALES_HISTORY": False, "LIQUIDITY_WINDOW_HOURS": 72,
+    "MIN_SALES_IN_WINDOW": 1, "SEEN_TTL_SEC": 300,
+    # риск-лимиты и банк
+    "MAX_SPEND_PER_TRADE_TON": Decimal("50"),
+    "MAX_SPEND_PER_HOUR_TON": Decimal("200"),
+    "MAX_SPEND_PER_DAY_TON": Decimal("1000"),
+    "MAX_OPEN_POSITIONS": 10, "STOP_AFTER_LOSSES": 3,
+    "BANKROLL_TON": Decimal("0"), "RESERVE_TON": Decimal("5"),
+    "MAX_POSITION_PCT": Decimal("10"), "HIGH_ROI_PCT": Decimal("100"),
+    "MAX_POSITION_PCT_HIGH_ROI": Decimal("10"),
+    # выход из позиции и бэктест
+    "ENABLE_STOP_LOSS": True, "STOP_LOSS_PCT": Decimal("25"),
+    "STOP_LOSS_MIN_HOURS": Decimal("6"), "BACKTEST_HOLD_HOURS": 24,
+    "BACKTEST_MAX_SLACK_HOURS": Decimal("6"),
+    # сеть и режимы
+    "TONAPI_MIN_INTERVAL": Decimal("1.1"), "TONAPI_MAX_RETRIES": 3,
+    "PURCHASE_GAS_TON": Decimal("0.1"), "TRADING_NETWORK": "testnet",
+    "DRY_RUN": True, "CONFIRM_LIVE_TRADING": "", "COLLECTION_WHITELIST": [],
+    "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "", "HEARTBEAT_MIN": 60,
+}
+for _name, _value in _PINNED.items():
+    setattr(gs, _name, _value)
+
+
 _failures = []
+
+
+def source_default(var_name):
+    """
+    Достаёт значение по умолчанию из `os.getenv("VAR", "default")` в исходнике.
+
+    Нужно там, где тест фиксирует ПРОЕКТНОЕ РЕШЕНИЕ («комиссия 2%»,
+    «механизм выключен»), а не текущую настройку. Сравнивать с глобальной
+    переменной нельзя: она берётся из окружения, и у пользователя со своими
+    `set ...` тест падал бы на верном коде.
+    """
+    import re as _re
+    src = open("gift_sniper.py", encoding="utf-8").read()
+    m = _re.search(rf'os\.getenv\(\s*"{_re.escape(var_name)}"\s*,\s*"([^"]*)"', src)
+    if m is None:
+        raise AssertionError(f"не нашёл значение по умолчанию для {var_name}")
+    return m.group(1)
 
 
 def check(name, condition, detail=""):
@@ -561,24 +629,36 @@ gs.WALLET_KEY_FILE = os.path.join(_tmpdir, "нет.key")
 key, err = gs.load_wallet_key()
 check("отсутствующий файл ключа отвергается", key is None and "не найден" in err)
 
-# Ключевой кейс безопасности: читаемый другими ключ обязан быть отвергнут.
 gs.WALLET_KEY_FILE = key_path
-os.chmod(key_path, 0o644)
-key, err = gs.load_wallet_key()
-check("ключ с правами 0644 отвергается", key is None, f"err={err}")
-check("в ошибке названа причина и лечение",
-      err and "chmod 600" in err, err)
-check("сам ключ в текст ошибки НЕ попал",
-      err and "SECRET_KEY_MATERIAL" not in err, err)
 
-os.chmod(key_path, 0o600)
-key, err = gs.load_wallet_key()
-check("ключ с правами 0600 читается", key == "SECRET_KEY_MATERIAL_DO_NOT_LEAK", f"err={err}")
+if os.name == "nt":
+    # На Windows POSIX-битов нет: os.chmod() управляет только флагом "только
+    # чтение", и st_mode всегда 0o666 либо 0o444. Проверка прав отвергала бы
+    # ЛЮБОЙ файл, поэтому там она заменена на громкое предупреждение.
+    print("  --   Windows: проверки POSIX-прав пропущены (битов нет)")
+    key, err = gs.load_wallet_key()
+    check("на Windows ключ читается, несмотря на отсутствие POSIX-прав",
+          key == "SECRET_KEY_MATERIAL_DO_NOT_LEAK", f"err={err}")
+else:
+    # Ключевой кейс безопасности: читаемый другими ключ обязан быть отвергнут.
+    os.chmod(key_path, 0o644)
+    key, err = gs.load_wallet_key()
+    check("ключ с правами 0644 отвергается", key is None, f"err={err}")
+    check("в ошибке названа причина и лечение",
+          err and "chmod 600" in err, err)
+    check("сам ключ в текст ошибки НЕ попал",
+          err and "SECRET_KEY_MATERIAL" not in err, err)
 
-os.chmod(key_path, 0o660)          # доступен группе
-key, err = gs.load_wallet_key()
-check("ключ, доступный группе, отвергается", key is None)
-os.chmod(key_path, 0o600)
+    os.chmod(key_path, 0o600)
+    key, err = gs.load_wallet_key()
+    check("ключ с правами 0600 читается",
+          key == "SECRET_KEY_MATERIAL_DO_NOT_LEAK", f"err={err}")
+
+    os.chmod(key_path, 0o660)          # доступен группе
+    key, err = gs.load_wallet_key()
+    check("ключ, доступный группе, отвергается", key is None)
+    os.chmod(key_path, 0o600)
+
 gs.WALLET_KEY_FILE = _owk
 
 
@@ -597,15 +677,24 @@ gs.DRY_RUN = True
 check("режим симуляции не требует кошелька и банка",
       gs.preflight_checks(require_ai=True) is True)
 
-# Живой режим при нереализованном исполнителе обязан быть заблокирован —
-# даже если пользователь выставил всё остальное правильно.
+# Исполнитель теперь определяется УСПЕХОМ ИМПОРТА tonutils, а не константой.
+# Смысл проверки прежний: если библиотеки нет, живой режим обязан быть закрыт
+# ЗАРАНЕЕ — иначе бот стартует нормально и упадёт в момент покупки, то есть
+# узнает о проблеме тогда, когда реагировать уже поздно.
 gs.DRY_RUN = False
 gs.CONFIRM_LIVE_TRADING = "I_UNDERSTAND_THE_RISK"
 gs.BANKROLL_TON = Decimal("100")
 gs.COLLECTION_WHITELIST = [friendly]
 gs.WALLET_KEY_FILE = key_path
-check("живой режим заблокирован без реального исполнителя",
+_real_exec = gs.REAL_EXECUTOR_AVAILABLE
+gs.REAL_EXECUTOR_AVAILABLE = False
+check("без библиотеки подписи живой режим заблокирован",
       gs.preflight_checks(require_ai=True) is False)
+gs.REAL_EXECUTOR_AVAILABLE = _real_exec
+
+check("флаг исполнителя отражает фактический импорт, а не константу",
+      gs.REAL_EXECUTOR_AVAILABLE == (gs._EXECUTOR_IMPORT_ERROR == ""),
+      f"{gs.REAL_EXECUTOR_AVAILABLE} / {gs._EXECUTOR_IMPORT_ERROR!r}")
 
 # И даже с исполнителем — без явного подтверждения риска.
 gs.REAL_EXECUTOR_AVAILABLE = True
@@ -1080,9 +1169,23 @@ finally:
 print("\n[24] Повышенный лимит для исключительно выгодных сделок")
 # =============================================================================
 
-check("по умолчанию механизм ВЫКЛЮЧЕН",
-      gs.MAX_POSITION_PCT_HIGH_ROI == gs.MAX_POSITION_PCT,
-      f"{gs.MAX_POSITION_PCT_HIGH_ROI} vs {gs.MAX_POSITION_PCT}")
+# Читаем ЗНАЧЕНИЕ ПО УМОЛЧАНИЮ из исходника: у пользователя, включившего
+# механизм своим `set`, глобальная переменная другая — и тест падал бы на
+# совершенно верном коде.
+# Решение: по умолчанию повышенный лимит РАВЕН обычному, то есть выключен.
+# В исходнике это записано как os.getenv(..., str(MAX_POSITION_PCT)), поэтому
+# проверяем именно это, а не значение глобальной переменной: у пользователя,
+# включившего механизм своим `set`, она другая — и тест падал бы на верном коде.
+_src_high_roi = open("gift_sniper.py", encoding="utf-8").read()
+check("по умолчанию механизм ВЫКЛЮЧЕН (равен обычному лимиту)",
+      'os.getenv("MAX_POSITION_PCT_HIGH_ROI", str(MAX_POSITION_PCT))' in _src_high_roi)
+
+# И семантика: равные проценты обязаны означать "механизм не действует".
+_op_hi, _oh_hi = gs.MAX_POSITION_PCT, gs.MAX_POSITION_PCT_HIGH_ROI
+gs.MAX_POSITION_PCT = gs.MAX_POSITION_PCT_HIGH_ROI = Decimal("10")
+check("при равных процентах высокий ROI потолок не поднимает",
+      gs.position_pct_for(Decimal("999")) == gs.position_pct_for(None))
+gs.MAX_POSITION_PCT, gs.MAX_POSITION_PCT_HIGH_ROI = _op_hi, _oh_hi
 
 _f = Decimal("3.0")
 check("граница ROI=0 совпадает с границей безубыточности",
@@ -1550,15 +1653,19 @@ print("\n[30] Ставка комиссии площадки")
 # Тест стоит здесь потому, что этот параметр уже дважды ставили неверно, и
 # оба раза правка проходила незаметно: завышенная комиссия просто тихо
 # отклоняет сделки, заниженная — тихо завышает прибыль.
-check("комиссия площадки = 2% (ставка Telegram-подарков)",
-      gs.MARKETPLACE_FEE_PCT == Decimal("0.02"), str(gs.MARKETPLACE_FEE_PCT))
+check("комиссия площадки по умолчанию = 2% (ставка Telegram-подарков)",
+      source_default("MARKETPLACE_FEE_PCT") == "0.02",
+      source_default("MARKETPLACE_FEE_PCT"))
 
 # Порядок величины прибыли при этой ставке. Если кто-то поставит 5%,
 # сделка на floor 1.5 перестанет проходить порог ROI — и это будет выглядеть
 # как "рынок плохой", а не как ошибка в конфиге.
-_of, _or2 = gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT
+# Порог ROI тоже приходит из окружения — фиксируем и его, иначе проверка
+# мерит не комиссию, а чужую настройку.
+_of, _or2, _omin = gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT, gs.MIN_ROI_PCT
 try:
     gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT = Decimal("0.02"), Decimal("0.05")
+    gs.MIN_ROI_PCT = Decimal("5")
     _p = gs.compute_net_profit(Decimal("1.5"), Decimal("1.12"))
     check("при 2% сделка на floor 1.5 проходит порог ROI",
           gs.compute_roi_pct(_p, Decimal("1.12")) >= gs.MIN_ROI_PCT,
@@ -1573,7 +1680,85 @@ try:
           abs((_p - _p5) - gs.target_sale_price(Decimal("1.5")) * Decimal("0.03"))
           < Decimal("0.0001"), str(_p - _p5))
 finally:
-    gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT = _of, _or2
+    gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT, gs.MIN_ROI_PCT = _of, _or2, _omin
+
+
+# =============================================================================
+print("\n[31] Исполнитель покупки: True только при реальной отправке")
+# =============================================================================
+
+# Главное правило файла: execute_blockchain_buy() НИКОГДА не возвращает True,
+# не совершив сделку. Иначе в БД появится позиция, которой нет, и учёт PnL
+# станет фикцией. Здесь это проверяется на всех путях отказа.
+
+_odry2 = gs.DRY_RUN
+_oexec2 = gs.REAL_EXECUTOR_AVAILABLE
+_okey = gs.WALLET_KEY_FILE
+_onet = gs.TRADING_NETWORK
+try:
+    gs.DRY_RUN = False
+
+    gs.REAL_EXECUTOR_AVAILABLE = False
+    check("без библиотеки подписи покупка возвращает False",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale") is False)
+
+    gs.REAL_EXECUTOR_AVAILABLE = True
+    gs.WALLET_KEY_FILE = ""
+    check("без файла ключа покупка возвращает False",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale") is False)
+
+    # Адрес продажи проверяется раньше всего: платить некуда.
+    check("без адреса контракта продажи покупка возвращает False",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "") is False)
+
+    # Любое исключение внутри отправки = сделки не было. Возврат True здесь
+    # был бы худшей из возможных ошибок: бот записал бы несуществующую позицию.
+    _osend = gs._send_purchase
+
+    async def _boom(*a, **k):
+        raise RuntimeError("сеть недоступна")
+
+    gs._send_purchase = _boom
+    gs.WALLET_KEY_FILE = key_path
+    check("исключение при отправке НЕ выглядит покупкой",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale") is False)
+    gs._send_purchase = _osend
+
+    # Выбор сети проверяется только если библиотека установлена. Без неё
+    # ЭТИ проверки бессмысленны, но обязана быть другая: понятное сообщение
+    # вместо NameError. Тесты должны проходить и на машине без tonutils —
+    # иначе набор ломается там, где ломаться нечему.
+    if gs._NetworkGlobalID is not None:
+        gs.TRADING_NETWORK = "testnet"
+        check("по умолчанию торгуем в testnet",
+              gs._trading_network() == gs._NetworkGlobalID.TESTNET)
+        gs.TRADING_NETWORK = "mainnet"
+        check("mainnet выбирается только явно",
+              gs._trading_network() == gs._NetworkGlobalID.MAINNET)
+        gs.TRADING_NETWORK = "чепуха"
+        check("нераспознанная сеть НЕ уводит в mainnet",
+              gs._trading_network() == gs._NetworkGlobalID.TESTNET)
+    else:
+        print("  --   tonutils не установлен: проверки выбора сети пропущены")
+        try:
+            gs._trading_network()
+            _clear = False
+        except RuntimeError as e:
+            _clear = "tonutils" in str(e) and "pip install" in str(e)
+        except NameError:
+            _clear = False
+        check("без библиотеки сеть даёт понятную ошибку, а не NameError",
+              _clear)
+
+    # Газ поверх цены — отдельная величина от газа в экономике сделки.
+    check("газ на исполнение контракта задан отдельно от экономики",
+          gs.PURCHASE_GAS_TON > 0 and gs.PURCHASE_GAS_TON != gs.GAS_FEE_TON,
+          f"{gs.PURCHASE_GAS_TON} / {gs.GAS_FEE_TON}")
+finally:
+    gs.DRY_RUN = _odry2
+    gs.REAL_EXECUTOR_AVAILABLE = _oexec2
+    gs.WALLET_KEY_FILE = _okey
+    gs.TRADING_NETWORK = _onet
 
 
 # =============================================================================

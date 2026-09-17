@@ -39,6 +39,7 @@ import time
 import base64
 import sqlite3
 import logging
+import asyncio
 import argparse
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -278,10 +279,31 @@ TRADING_NETWORK     = os.getenv("TRADING_NETWORK", "testnet").lower()     # test
 # Осознанный speed bump: без этой строки живая торговля не запустится.
 CONFIRM_LIVE_TRADING = os.getenv("CONFIRM_LIVE_TRADING", "")
 
-# Реальная подпись транзакций НЕ реализована (см. SETUP.md, раздел "Что ещё
-# не сделано"). Флаг существует, чтобы preflight мог ЗАПРЕТИТЬ живой режим,
-# а не чтобы бот думал, будто купил, ничего не купив.
-REAL_EXECUTOR_AVAILABLE = False
+# Газ СВЕРХ цены лота: контракту продажи нужно чем-то оплатить исполнение и
+# пересылку NFT. Излишек контракт возвращает, поэтому величина щедрая.
+# Это ДРУГАЯ величина, чем GAS_FEE_TON: та — безвозвратная стоимость круга
+# в экономике сделки, эта — сколько приложить к платежу, чтобы он прошёл.
+PURCHASE_GAS_TON    = Decimal(os.getenv("PURCHASE_GAS_TON", "0.1"))
+
+# Флаг определяется УСПЕХОМ ИМПОРТА, а не константой. Иначе бот стартовал бы
+# нормально и упал бы в момент покупки — то есть узнал бы о проблеме тогда,
+# когда на неё уже нельзя реагировать. preflight обязан запретить живой режим
+# ЗАРАНЕЕ.
+try:
+    from tonutils.clients import TonapiClient as _TonapiClient
+    from tonutils.clients.base import NetworkGlobalID as _NetworkGlobalID
+    from tonutils.contracts import WalletV4R2 as _WalletV4R2
+    from ton_core import to_nano as _to_nano
+
+    REAL_EXECUTOR_AVAILABLE = True
+    _EXECUTOR_IMPORT_ERROR = ""
+except ImportError as _exc:                # noqa: BLE001 — отсутствие библиотеки не фатально
+    REAL_EXECUTOR_AVAILABLE = False
+    _EXECUTOR_IMPORT_ERROR = str(_exc)
+    # Имена обязаны существовать даже при провале импорта. Иначе обращение
+    # к ним даёт NameError — ошибку, которая выглядит как поломка кода, а не
+    # как «библиотека не установлена», и уводит диагностику не туда.
+    _TonapiClient = _NetworkGlobalID = _WalletV4R2 = _to_nano = None
 
 # --- Хранилище состояния (Ярус 3) --------------------------------------------
 # SQLite: позиции, траты, PnL. Нужен именно файл, а не память в процессе —
@@ -1443,10 +1465,24 @@ def load_wallet_key():
     if not os.path.isfile(WALLET_KEY_FILE):
         return None, f"файл ключа не найден: {WALLET_KEY_FILE}"
 
-    mode = os.stat(WALLET_KEY_FILE).st_mode
-    if mode & 0o077:
-        return None, (f"НЕБЕЗОПАСНЫЕ ПРАВА на {WALLET_KEY_FILE} "
-                      f"({oct(mode & 0o777)}). Выполните: chmod 600 {WALLET_KEY_FILE}")
+    # Windows не поддерживает POSIX-биты прав: os.chmod() там управляет только
+    # флагом "только чтение", и st_mode всегда выглядит как 0o666 или 0o444.
+    # Проверять их бессмысленно — она отвергала бы ЛЮБОЙ файл, включая
+    # правильно защищённый через ACL, и живая торговля на Windows стала бы
+    # невозможной с сообщением про chmod, которого там нет.
+    #
+    # Ворота не ослабляются, а честно признаются непроверяемыми: молчать об
+    # этом нельзя, иначе пользователь решит, что бот проверил защиту ключа.
+    if os.name == "nt":
+        log.warning(f"{_Color.YELLOW}Windows: права на файл ключа проверить нельзя "
+                    f"(POSIX-битов нет). Защитите {WALLET_KEY_FILE} сами: "
+                    f"Свойства → Безопасность → оставить доступ только своей "
+                    f"учётной записи.{_Color.RESET}")
+    else:
+        mode = os.stat(WALLET_KEY_FILE).st_mode
+        if mode & 0o077:
+            return None, (f"НЕБЕЗОПАСНЫЕ ПРАВА на {WALLET_KEY_FILE} "
+                          f"({oct(mode & 0o777)}). Выполните: chmod 600 {WALLET_KEY_FILE}")
 
     try:
         with open(WALLET_KEY_FILE, encoding="utf-8") as f:
@@ -1807,11 +1843,84 @@ def execute_blockchain_buy(item_id: str, price, sale_address: str = "") -> bool:
         # До сюда дойти нельзя: preflight_checks() не пускает в живой режим.
         # Проверка продублирована намеренно — на случай, если кто-то вызовет
         # функцию в обход main().
-        log.error(f"{_Color.RED}Реальная покупка не реализована. Сделка НЕ совершена. "
-                  f"См. SETUP.md.{_Color.RESET}")
+        log.error(f"{_Color.RED}Исполнитель сделок недоступен ({_EXECUTOR_IMPORT_ERROR}). "
+                  f"Сделка НЕ совершена. См. SETUP.md.{_Color.RESET}")
         return False
 
-    raise NotImplementedError("подключите исполнителя сделок — см. SETUP.md")
+    try:
+        return asyncio.run(_send_purchase(item_id, Decimal(str(price)), sale_address))
+    except Exception as e:  # noqa: BLE001 — падение здесь НЕ должно выглядеть покупкой
+        # Любая ошибка = сделки не было. Возврат True здесь записал бы в БД
+        # позицию, которой нет, и весь учёт PnL стал бы фикцией.
+        log.error(f"{_Color.RED}Покупка не удалась ({type(e).__name__}: {e}). "
+                  f"Сделка НЕ совершена.{_Color.RESET}")
+        return False
+
+
+def _trading_network():
+    """
+    NetworkGlobalID под TRADING_NETWORK. По умолчанию — testnet.
+
+    Без установленной библиотеки бросает понятное исключение, а не NameError:
+    «имя не определено» отправило бы искать ошибку в коде вместо того, чтобы
+    поставить пакет.
+    """
+    if _NetworkGlobalID is None:
+        raise RuntimeError(
+            f"tonutils не установлен ({_EXECUTOR_IMPORT_ERROR}). "
+            f"Для живой торговли: pip install tonutils ton-core")
+    return (_NetworkGlobalID.MAINNET if TRADING_NETWORK == "mainnet"
+            else _NetworkGlobalID.TESTNET)
+
+
+async def _send_purchase(item_id: str, price: Decimal, sale_address: str) -> bool:
+    """
+    Отправляет платёж на КОНТРАКТ ПРОДАЖИ и подтверждает отправку.
+
+    Возвращает True, только если транзакция реально ушла в сеть. Любой отказ —
+    False: позиция, записанная без сделки, превращает учёт PnL в фикцию.
+
+    Почему async: tonutils асинхронный, а бот синхронный. Граница проходит
+    здесь, покупки редки, поэтому asyncio.run() на вызов — приемлемая цена.
+
+    К цене добавляется PURCHASE_GAS_TON: контракту нужно оплатить исполнение
+    и пересылку NFT. Излишек контракт возвращает.
+    """
+    mnemonic, err = load_wallet_key()
+    if err:
+        log.error(f"{_Color.RED}Кошелёк недоступен: {err}{_Color.RESET}")
+        return False
+
+    client = _TonapiClient(_trading_network(), api_key=TONAPI_KEY or None)
+    # from_mnemonic синхронна и возвращает КОРТЕЖ, а не кошелёк (см. TONUTILS_API.md).
+    wallet, _pub, _priv, _words = _WalletV4R2.from_mnemonic(client, mnemonic)
+
+    # Состояние кошелька НЕ грузится конструктором: чтение balance без refresh()
+    # бросает StateNotLoadedError. Это ровно тот случай, где код, написанный
+    # по памяти, выглядит правильным и не работает.
+    await wallet.refresh()
+
+    total = price + PURCHASE_GAS_TON
+    balance_ton = Decimal(wallet.balance) / NANO_PER_TON
+    if balance_ton < total:
+        log.error(f"{_Color.RED}На кошельке {balance_ton:.4f} TON, нужно "
+                  f"{total:.4f} (цена {price} + газ {PURCHASE_GAS_TON}). "
+                  f"Сделка НЕ совершена.{_Color.RESET}")
+        return False
+
+    log.warning(f"{_Color.YELLOW}ОТПРАВКА РЕАЛЬНОЙ ТРАНЗАКЦИИ: {total} TON на "
+                f"контракт продажи {_short(sale_address)} за лот "
+                f"{_short(item_id)} ({TRADING_NETWORK}){_Color.RESET}")
+
+    # transfer() не собирает сообщение, а ОТПРАВЛЯЕТ его. Сумма в нанотонах.
+    msg = await wallet.transfer(destination=sale_address,
+                                amount=_to_nano(float(total)),
+                                bounce=True)
+
+    log.info(f"{_Color.GREEN}[SUCCESS] Транзакция отправлена. "
+             f"Лот {_short(item_id)} за {price} TON{_Color.RESET}")
+    log.info(f"Кошелёк: {wallet.address.to_str()} | сеть: {TRADING_NETWORK}")
+    return msg is not None
 
 
 # =============================================================================
