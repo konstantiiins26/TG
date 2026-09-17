@@ -7,14 +7,15 @@ REM perezagruzki ih nuzhno zadavat zanovo. Etot fail delaet eto za vas.
 REM Fail lezhit v deploy\, a gift_sniper.py - na uroven vyshe.
 cd /d "%~dp0.."
 
-REM --- Vpishite svoi adresa kollekciy cherez zapyatuyu (bez probelov) ---
-set TARGET_COLLECTIONS=EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF
+REM --- Kollekcii cherez zapyatuyu, bez probelov ---
+set TARGET_COLLECTIONS=EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7,EQDc08YxzZWtlKAohSybNc3kXAkAPPtHch-jY_E6KMQ3b1mn,EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG,EQD1YFp12AGEgX6C3uiWh751EcRxPZo6GtBmHziY29jcbQzS,EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs
 set COLLECTION_WHITELIST=%TARGET_COLLECTIONS%
 
-REM 15 stranic x 100 lotov. Pauza mezhdu zaprosami zadana v kode (1.1s),
-REM poetomu cikl zanimaet ~17s i v interval 60s ukladyvaetsya.
+REM 5 kollekciy x 15 stranic = 75 zaprosov. Pauza 1.1s mezhdu nimi
+REM zadana v kode, znachit odin cikl zanimaet ~83 sekundy.
+REM Interval 60s byl by KOROCHE cikla - cikly nalezali by drug na druga.
 set FLOOR_SAMPLE_PAGES=15
-set POLL_INTERVAL_SEC=60
+set POLL_INTERVAL_SEC=120
 set DRY_RUN=1
 
 REM --- Bank ---
