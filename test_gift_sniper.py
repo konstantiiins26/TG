@@ -714,6 +714,72 @@ check("отсутствующий файл обрабатывается",
 
 
 # =============================================================================
+print("\n[19] Парсинг НАСТОЯЩЕГО ответа TonAPI")
+# =============================================================================
+
+# Дословный фрагмент реального ответа
+# GET /v2/nfts/collections/EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF/items
+# (коллекция Telegram Gifts "Timeless Books", получен 17.09.2026).
+# Эти проверки — единственное в наборе, что подтверждено живыми данными,
+# а не моими предположениями о форме ответа.
+REAL_NFT = {
+    "address": "0:e8ff70dd4fe2a1c3de574bef08678f0a7de9c27c763dd844e975b6670f8011c7",
+    # ВНИМАНИЕ: верхнеуровневый index — НЕ номер минта. Здесь он огромный и
+    # отрицательный. Номер лежит только в metadata.name ("... #16450").
+    "index": -181007727810587533,
+    "owner": {"address": "0:158136239adb15dd59df90c641f9efd312cfeb8664f218f4c3e5fce9d95e6c07",
+              "name": "Fragment Gift Minter", "is_scam": False, "is_wallet": True},
+    "collection": {
+        "address": "0:b6d76763aead208254178bc312157d5b730e0b1f0dc4b3ada52afb75959cf3b1",
+        "name": "Timeless Books"},
+    "verified": True,
+    "metadata": {
+        "attributes": [{"trait_type": "Model", "value": "Cookbook"},
+                       {"trait_type": "Backdrop", "value": "Malachite"},
+                       {"trait_type": "Symbol", "value": "Apple"}],
+        "name": "Timeless Book #16450",
+        "image": "https://nft.fragment.com/gift/timelessbook-16450.webp"},
+    "approved_by": ["getgems"],
+    "trust": "whitelist",
+}
+_meta = REAL_NFT["metadata"]
+
+check("номер минта берётся из имени, а не из index",
+      gs._extract_mint_index(REAL_NFT, _meta) == 16450,
+      f"got={gs._extract_mint_index(REAL_NFT, _meta)}")
+
+# Регрессия: верхнеуровневый index — мусор. Если кто-то "починит" парсер,
+# начав его использовать, номера минта станут бессмысленными.
+check("огромный отрицательный index НЕ попадает в номер минта",
+      gs._extract_mint_index(REAL_NFT, _meta) != REAL_NFT["index"])
+check("номер минта в разумных пределах",
+      0 < gs._extract_mint_index(REAL_NFT, _meta) < 1_000_000)
+
+check("трейты разобраны",
+      gs.extract_traits(_meta) == {"model": "Cookbook", "backdrop": "Malachite",
+                                   "symbol": "Apple"},
+      str(gs.extract_traits(_meta)))
+
+check("адрес коллекции на месте",
+      REAL_NFT["collection"]["address"].startswith("0:b6d7"))
+
+_owl = gs.COLLECTION_WHITELIST
+gs.COLLECTION_WHITELIST = ["EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF"]
+check("whitelist по EQ-форме матчит raw-адрес из API",
+      gs.is_collection_trusted(REAL_NFT["collection"]["address"]) is True)
+gs.COLLECTION_WHITELIST = _owl
+
+# Подтверждено на живых данных: процентов редкости в API НЕТ, хотя интерфейс
+# Getgems их показывает. Значит, оценка по выборке — единственный путь.
+check("явной редкости в ответе API нет",
+      gs._explicit_rarity_pct(_meta) is None)
+
+# Эти два предмета не выставлены — поля sale в ответе нет вообще.
+check("без поля sale лот не считается продающимся",
+      bool((REAL_NFT.get("sale") or {}).get("price")) is False)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
