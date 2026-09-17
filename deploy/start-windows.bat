@@ -18,6 +18,15 @@ set FLOOR_SAMPLE_PAGES=15
 set POLL_INTERVAL_SEC=120
 set DRY_RUN=1
 
+REM --- Komissii ---
+REM 2%% - stavka Getgems imenno dlya Telegram-podarkov (ih spravka).
+REM Obshchaya stavka 5%%, no k podarkam ona ne otnositsya.
+set MARKETPLACE_FEE_PCT=0.02
+REM Royalti sozdatelya. Na kartochke Timeless Books bylo 0, no eto odna
+REM kollekciya. Proverte Creator Fee v svoih i postavte fakticheskoe:
+REM snizhenie royalti UVELICHIVAET raschetnuyu pribyl.
+set ROYALTY_PCT=0.05
+
 REM --- Bank ---
 REM Postavte fakticheskiy razmer banka v TON (posmotrite kurs sami).
 set BANKROLL_TON=10

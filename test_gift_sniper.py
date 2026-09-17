@@ -1540,6 +1540,43 @@ check("запись без данных о площадках распознаё
 
 
 # =============================================================================
+print("\n[30] Ставка комиссии площадки")
+# =============================================================================
+
+# Справка Getgems (18.09.2026): 5% с продажи вообще, 1% для Anonymous Telegram
+# Numbers и Usernames, и 2% ДЛЯ TELEGRAM-ПОДАРКОВ. Бот работает именно с
+# подарками, поэтому 2%. Сходится с карточкой лота: 0.09 GRAM на 4.75 = 1.9%.
+#
+# Тест стоит здесь потому, что этот параметр уже дважды ставили неверно, и
+# оба раза правка проходила незаметно: завышенная комиссия просто тихо
+# отклоняет сделки, заниженная — тихо завышает прибыль.
+check("комиссия площадки = 2% (ставка Telegram-подарков)",
+      gs.MARKETPLACE_FEE_PCT == Decimal("0.02"), str(gs.MARKETPLACE_FEE_PCT))
+
+# Порядок величины прибыли при этой ставке. Если кто-то поставит 5%,
+# сделка на floor 1.5 перестанет проходить порог ROI — и это будет выглядеть
+# как "рынок плохой", а не как ошибка в конфиге.
+_of, _or2 = gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT
+try:
+    gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT = Decimal("0.02"), Decimal("0.05")
+    _p = gs.compute_net_profit(Decimal("1.5"), Decimal("1.12"))
+    check("при 2% сделка на floor 1.5 проходит порог ROI",
+          gs.compute_roi_pct(_p, Decimal("1.12")) >= gs.MIN_ROI_PCT,
+          str(gs.compute_roi_pct(_p, Decimal("1.12"))))
+
+    gs.MARKETPLACE_FEE_PCT = Decimal("0.05")
+    _p5 = gs.compute_net_profit(Decimal("1.5"), Decimal("1.12"))
+    check("при 5% та же сделка порог НЕ проходит",
+          gs.compute_roi_pct(_p5, Decimal("1.12")) < gs.MIN_ROI_PCT,
+          str(gs.compute_roi_pct(_p5, Decimal("1.12"))))
+    check("разница между 2% и 5% — это 3% от цены продажи",
+          abs((_p - _p5) - gs.target_sale_price(Decimal("1.5")) * Decimal("0.03"))
+          < Decimal("0.0001"), str(_p - _p5))
+finally:
+    gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT = _of, _or2
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
