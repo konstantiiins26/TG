@@ -1443,6 +1443,103 @@ finally:
 
 
 # =============================================================================
+print("\n[29] Площадки: floor по каждой и арбитраж между ними")
+# =============================================================================
+
+def mk_market_item(market, price, addr="0:m"):
+    return {"address": addr, "sale_price_ton": Decimal(str(price)),
+            "is_on_sale": True, "sale_market": market, "traits": {}}
+
+
+# TonAPI читает блокчейн, поэтому лоты разных площадок приходят вперемешку
+# в одном ответе. Общий floor их усредняет — и прячет разницу.
+_mixed = ([mk_market_item("Getgems Sales", p) for p in
+           ("10.0", "10.5", "11.0", "11.5", "12.0")] +
+          [mk_market_item("Marketapp Marketplace", p) for p in
+           ("6.0", "6.5", "7.0", "7.5", "8.0")])
+_mf = gs.build_market_floors(_mixed)
+
+check("площадки разделены", sorted(_mf) == ["Getgems Sales", "Marketapp Marketplace"],
+      str(sorted(_mf)))
+check("у каждой площадки свой floor",
+      _mf["Marketapp Marketplace"]["floor"] < _mf["Getgems Sales"]["floor"],
+      f"{_mf['Marketapp Marketplace']['floor']} vs {_mf['Getgems Sales']['floor']}")
+check("размер выборки по площадке сохранён",
+      _mf["Getgems Sales"]["n"] == 5, str(_mf["Getgems Sales"]["n"]))
+
+# Общий floor лежит МЕЖДУ floor площадок — это и есть усреднение, из-за
+# которого разница была не видна.
+_all_prices = sorted(Decimal(str(i["sale_price_ton"])) for i in _mixed)
+_common = gs._percentile(_all_prices, gs.FLOOR_PERCENTILE)
+check("общий floor маскирует разницу между площадками",
+      _mf["Marketapp Marketplace"]["floor"] <= _common <= _mf["Getgems Sales"]["floor"],
+      str(_common))
+
+# Тонкая выборка по площадке -> floor не считается. Одна цена не floor.
+_thin = gs.build_market_floors([mk_market_item("Rare Market", "1.0")])
+check("по одному лоту floor площадки не считается",
+      _thin["Rare Market"]["floor"] is None and _thin["Rare Market"]["n"] == 1)
+
+# Лот без названия площадки не теряется: он попадает в отдельную корзину,
+# а не исчезает из выборки молча.
+_noname = gs.build_market_floors([mk_market_item("", p) for p in
+                                  ("1.0", "1.1", "1.2", "1.3")])
+check("лоты без площадки не теряются",
+      "(площадка неизвестна)" in _noname, str(list(_noname)))
+
+# --- Отчёт по записи --------------------------------------------------------
+import tempfile as _tf
+_mdir = _tf.mkdtemp()
+_mpath = os.path.join(_mdir, "markets.jsonl")
+
+
+def _mk_market_snap(ts, cheap_floor, rich_floor):
+    return {"ts": ts, "collection": "0:coll", "floor": str(cheap_floor),
+            "sample_size": 100, "competition": 0, "floor_reliable": True,
+            "trait_index": {}, "trait_total": 0, "peer_prices": {},
+            "candidates": [],
+            "market_floors": {
+                "Marketapp Marketplace": {"n": 20, "floor": str(cheap_floor)},
+                "Getgems Sales": {"n": 20, "floor": str(rich_floor)}}}
+
+
+with open(_mpath, "w", encoding="utf-8") as f:
+    for i in range(10):
+        f.write(_json.dumps(_mk_market_snap(i * 3600, "6.0", "10.0")) + "\n")
+
+_rep = gs.market_report(_mpath)
+check("отчёт по площадкам построен", _rep and len(_rep) == 1, str(_rep))
+check("дешёвая площадка определена верно",
+      _rep[0]["cheapest"] == "Marketapp Marketplace", _rep[0]["cheapest"])
+check("дорогая площадка определена верно",
+      _rep[0]["richest"] == "Getgems Sales", _rep[0]["richest"])
+check("разброс посчитан",
+      abs(_rep[0]["spread_pct"] - Decimal("66.67")) < Decimal("0.1"),
+      str(_rep[0]["spread_pct"]))
+check("арбитраж считается ТОЙ ЖЕ экономикой, что и обычная сделка",
+      _rep[0]["profit"] == gs.compute_net_profit(Decimal("10.0"), Decimal("6.0")),
+      str(_rep[0]["profit"]))
+
+# Разброс меньше комиссий — это не арбитраж, и отчёт обязан так и сказать.
+_narrow = os.path.join(_mdir, "narrow.jsonl")
+with open(_narrow, "w", encoding="utf-8") as f:
+    for i in range(10):
+        f.write(_json.dumps(_mk_market_snap(i * 3600, "10.0", "10.2")) + "\n")
+_rep = gs.market_report(_narrow)
+check("узкий разброс не выдаётся за прибыль", _rep[0]["profit"] < 0,
+      str(_rep[0]["profit"]))
+
+# Старая запись без market_floors: честный отказ, а не пустой отчёт.
+_old = os.path.join(_mdir, "old.jsonl")
+with open(_old, "w", encoding="utf-8") as f:
+    f.write(_json.dumps({"ts": 0, "collection": "0:c", "floor": "1.0",
+                        "sample_size": 10, "competition": 0,
+                        "floor_reliable": True, "candidates": []}) + "\n")
+check("запись без данных о площадках распознаётся",
+      gs.market_report(_old) is None)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

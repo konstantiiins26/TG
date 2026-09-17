@@ -728,6 +728,38 @@ def build_trait_index(items):
     return index, total
 
 
+def build_market_floors(on_sale_items):
+    """
+    Floor ОТДЕЛЬНО по каждой площадке: {"Getgems Sales": {"floor": D, "n": N}}.
+
+    Зачем: TonAPI читает блокчейн, а не базу одной площадки, поэтому в выборке
+    уже лежат лоты с разных маркетплейсов вперемешку. Общий floor их
+    усредняет — и ровно в этом усреднении прячется разница цен между
+    площадками, то есть арбитраж: купить там, где дешевле, продать там, где
+    дороже.
+
+    Это ИЗМЕРЕНИЕ, а не сигнал к покупке. Разница в цене может означать и
+    разные комиссии площадок, и разный состав лотов, и просто тонкий рынок
+    на одной из них. Отличить можно только по записи за несколько дней.
+    """
+    by_market = {}
+    for it in on_sale_items:
+        market = (it.get("sale_market") or "").strip() or "(площадка неизвестна)"
+        by_market.setdefault(market, []).append(Decimal(str(it["sale_price_ton"])))
+
+    out = {}
+    for market, prices in by_market.items():
+        prices.sort()
+        out[market] = {
+            "n": len(prices),
+            # Тем же перцентилем, что и floor коллекции: иначе цифры
+            # несопоставимы между собой.
+            "floor": (_percentile(prices, FLOOR_PERCENTILE).quantize(Decimal("0.000000001"))
+                      if len(prices) >= MIN_PEER_SAMPLE else None),
+        }
+    return out
+
+
 def build_peer_prices(on_sale_items):
     """
     Цены выставленных лотов, сгруппированные по значению ключевого трейта:
@@ -988,6 +1020,8 @@ def get_market_snapshot(collection: str) -> dict:
         # Цены по сегментам: без них лот сравнивать не с чем, и бэктест
         # повторил бы ровно ту ошибку, от которой мы защищаемся.
         "peer_prices": build_peer_prices(on_sale),
+        # Floor по площадкам: разница между ними и есть арбитраж.
+        "market_floors": build_market_floors(on_sale),
         # Без этого поля снапшоты разных коллекций в записи неразличимы,
         # и бэктест подставил бы floor чужой коллекции.
         "collection": cache_key,
@@ -1960,6 +1994,9 @@ def record_snapshot(snap: dict, path: str = None):
         # Decimal не сериализуется в JSON — храним строками, как и floor.
         "peer_prices": {k: [str(p) for p in v]
                         for k, v in (snap.get("peer_prices") or {}).items()},
+        "market_floors": {k: {"n": v["n"],
+                              "floor": (str(v["floor"]) if v["floor"] is not None else None)}
+                          for k, v in (snap.get("market_floors") or {}).items()},
         "candidates": snap["candidates"],
     }
     try:
@@ -2417,6 +2454,106 @@ def show_affordability():
     return rows
 
 
+def market_report(path: str = None):
+    """
+    Сравнивает площадки между собой по записи рынка: где систематически
+    дешевле, и покрывает ли разница комиссии.
+
+    Вопрос, на который отвечает: есть ли смысл покупать на одной площадке,
+    а продавать на другой. Разовый снимок на это не отвечает — разница в
+    один момент может быть случайной; значение имеет то, держится ли она.
+
+    ЧЕГО ЭТОТ ОТЧЁТ НЕ ЗНАЕТ:
+      * комиссии считаются одинаковыми для всех площадок (MARKETPLACE_FEE_PCT),
+        потому что реальные ставки сняты только с Getgems;
+      * разница цен может означать не арбитраж, а разный состав лотов:
+        если на площадке стоят только дешёвые модели, её floor ниже законно;
+      * купить на площадке можно, только если бот умеет говорить с её
+        контрактом продажи. Сейчас реальная покупка не реализована вовсе,
+        так что найденный арбитраж — это план, а не исполнимая сделка.
+    """
+    path = path or RECORD_PATH
+    try:
+        snaps = _load_recording(path)
+    except FileNotFoundError:
+        log.error(f"Записи рынка нет: {path}. Сначала соберите её: "
+                  f"python gift_sniper.py --record")
+        return None
+    if not snaps:
+        log.error(f"{path} пуст — нечего анализировать.")
+        return None
+
+    log.info(f"{_Color.BOLD}=== ПЛОЩАДКИ ==={_Color.RESET}")
+    log.info(f"Запись: {path} | снапшотов {len(snaps)}")
+
+    # Собираем floor каждой площадки по всем снапшотам каждой коллекции.
+    per_coll = {}
+    for snap in snaps:
+        coll = snap.get("collection", "")
+        mf = snap.get("market_floors") or {}
+        for market, info in mf.items():
+            floor = info.get("floor")
+            if floor is None:
+                continue
+            per_coll.setdefault(coll, {}).setdefault(market, []).append(
+                Decimal(str(floor)))
+
+    if not per_coll:
+        log.warning(f"{_Color.YELLOW}В записи нет данных по площадкам. Скорее "
+                    f"всего запись собрана старой версией бота — она не "
+                    f"сохраняла market_floors. Нужна новая запись.{_Color.RESET}")
+        return None
+
+    results = []
+    for coll, markets in per_coll.items():
+        log.info("")
+        log.info(f"{_Color.BOLD}Коллекция {_short(coll)}{_Color.RESET}")
+        log.info(f"  {'Площадка':<28} {'Floor (медиана)':>16} {'Снапшотов':>10}")
+
+        medians = {}
+        for market, floors in sorted(markets.items()):
+            floors.sort()
+            med = floors[len(floors) // 2]
+            medians[market] = med
+            log.info(f"  {market:<28} {med:>16.4f} {len(floors):>10}")
+
+        if len(medians) < 2:
+            log.info(f"  {_Color.GREY}Одна площадка — сравнивать не с чем."
+                     f"{_Color.RESET}")
+            continue
+
+        cheap = min(medians, key=medians.get)
+        rich = max(medians, key=medians.get)
+        spread_pct = ((medians[rich] - medians[cheap]) / medians[cheap]
+                      * Decimal("100"))
+
+        # Купить на дешёвой, продать на дорогой: считаем ТОЙ ЖЕ экономикой,
+        # что и обычную сделку, иначе цифры несопоставимы с остальным ботом.
+        profit = compute_net_profit(medians[rich], medians[cheap])
+        roi = compute_roi_pct(profit, medians[cheap])
+
+        log.info("")
+        log.info(f"  Разброс: {spread_pct:.1f}% между «{cheap}» и «{rich}»")
+        if profit > 0:
+            log.info(f"  {_Color.GREEN}Купить на «{cheap}» по {medians[cheap]:.4f}, "
+                     f"продать на «{rich}»: +{profit:.4f} TON (ROI {roi}%)"
+                     f"{_Color.RESET}")
+        else:
+            log.info(f"  {_Color.YELLOW}Разброс не покрывает комиссии и газ: "
+                     f"{profit:.4f} TON. Арбитража нет.{_Color.RESET}")
+        results.append({"collection": coll, "cheapest": cheap, "richest": rich,
+                        "spread_pct": spread_pct, "profit": profit, "roi": roi})
+
+    log.info("")
+    log.warning("Разница цен между площадками — это ИЗМЕРЕНИЕ, а не сигнал. "
+                "Она может означать разные комиссии, разный состав лотов или "
+                "тонкий рынок на одной из них. И купить на площадке можно "
+                "только когда бот умеет говорить с её контрактом продажи — "
+                "сейчас реальная покупка не реализована вовсе.")
+    _warn_if_recording_short(snaps)
+    return results
+
+
 def rank_collections(path: str = None):
     """
     Ранжирует коллекции из записи рынка по РЕАЛЬНОЙ активности.
@@ -2820,6 +2957,9 @@ def parse_args(argv=None):
     parser.add_argument("--discover", nargs="?", const=30, type=int, metavar="N",
                         help="найти коллекции под банк через API и выйти "
                              "(эндпоинт НЕ проверен на живых данных)")
+    parser.add_argument("--markets", nargs="?", const=RECORD_PATH, metavar="FILE",
+                        help="сравнить площадки по записи: где дешевле и есть ли "
+                             "арбитраж между ними")
     parser.add_argument("--probe", metavar="ADDRESS",
                         help="проверить адрес (кошелёк или коллекцию) и показать, "
                              "что парсер извлёк из живого ответа API")
@@ -2843,6 +2983,9 @@ if __name__ == "__main__":
         if args.rank:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if rank_collections(args.rank) else 1)
+        if args.markets:
+            # Только чтение записи: ни сети, ни покупок.
+            sys.exit(0 if market_report(args.markets) else 1)
         if args.backtest:
             # Бэктест ничего не покупает и не ходит в сеть — только считает.
             sys.exit(0 if run_backtest(args.backtest, args.hold_hours) else 1)
