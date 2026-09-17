@@ -145,7 +145,13 @@ PREMIUM_MULT        = Decimal(os.getenv("PREMIUM_MULT", "1.0"))
 FLOOR_PAGE_SIZE     = int(os.getenv("FLOOR_PAGE_SIZE", "100"))            # размер одной страницы выборки
 FLOOR_SAMPLE_PAGES  = int(os.getenv("FLOOR_SAMPLE_PAGES", "5"))           # сколько страниц тянуть (5 x 100 = 500 лотов)
 FLOOR_PERCENTILE    = Decimal(os.getenv("FLOOR_PERCENTILE", "5"))         # 5-й перцентиль вместо голого min()
-MIN_FLOOR_SAMPLE    = int(os.getenv("MIN_FLOOR_SAMPLE", "8"))             # меньше этого — floor недостоверен, не торгуем
+# Порог взят из арифметики самого перцентиля, а не с потолка. Индекс, на
+# который попадает P5, равен (N-1)*0.05. При N=27 это 1.3 — перцентиль
+# опирается на 2-й и 3-й снизу лоты и фактически вырождается в min() с
+# лишними шагами, ровно то, ради отказа от чего перцентиль и вводился.
+# При N=40 индекс 1.95, при N=100 — 4.95: floor держат уже несколько
+# независимых продавцов, и один ошибочный "пылевой" лот его не двигает.
+MIN_FLOOR_SAMPLE    = int(os.getenv("MIN_FLOOR_SAMPLE", "40"))            # меньше этого — floor недостоверен, не торгуем
 FLOOR_CACHE_TTL_SEC = int(os.getenv("FLOOR_CACHE_TTL_SEC", "60"))         # кэш floor, чтобы не сканировать рынок каждые 12 сек
 CANDIDATES_TO_ANALYZE = int(os.getenv("CANDIDATES_TO_ANALYZE", "5"))      # сколько самых дешёвых лотов отдавать ИИ
 
