@@ -1031,6 +1031,52 @@ check("дыра не даёт бэктесту засчитать выгодны
 
 
 # =============================================================================
+print("\n[23] Доступность коллекции банку")
+# =============================================================================
+
+_ob, _or_, _op = gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT
+gs.BANKROLL_TON = Decimal("10")
+gs.RESERVE_TON = Decimal("5")
+gs.MAX_POSITION_PCT = Decimal("10")
+try:
+    # Граница выводится из формулы прибыли, а не подбирается: покупка ровно
+    # по Buy_max даёт ноль, на копейку дороже — убыток.
+    _floor = Decimal("4.72")
+    _bmax = gs.max_profitable_buy(_floor)
+    check("покупка по Buy_max даёт около нуля",
+          abs(gs.compute_net_profit(_floor, _bmax)) < Decimal("0.000001"),
+          str(gs.compute_net_profit(_floor, _bmax)))
+    check("на копейку дороже Buy_max — уже убыток",
+          gs.compute_net_profit(_floor, _bmax + Decimal("0.01")) < 0)
+
+    # Тот самый случай пользователя: банк 10 TON против floor 4.72.
+    _aff = gs.affordability(_floor)
+    check("потолок сделки при банке 10 TON равен 1 TON",
+          _aff["cap"] == Decimal("1"), str(_aff["cap"]))
+    check("коллекция с floor 4.72 банку недоступна",
+          _aff["verdict"] == "нет", _aff["verdict"])
+    check("требуемая скидка честно огромная",
+          _aff["discount_pct"] > 75, f"{_aff['discount_pct']:.0f}%")
+
+    # Дешёвая коллекция доступна, но газ поднимает требуемую скидку —
+    # «чем дешевле, тем лучше» неверно.
+    check("floor 1.0 банку доступен",
+          gs.affordability(Decimal("1.0"))["verdict"] == "да")
+    check("газ делает совсем дешёвую коллекцию хуже средней",
+          gs.affordability(Decimal("0.3"))["discount_pct"] >
+          gs.affordability(Decimal("1.0"))["discount_pct"])
+
+    # Без банка вердикта нет: молчаливое "да" отправило бы торговать вслепую.
+    gs.BANKROLL_TON = Decimal("0")
+    check("без заданного банка вердикт не выносится",
+          gs.affordability(_floor)["verdict"] == "банк не задан")
+    check("--afford без банка ничего не печатает",
+          gs.show_affordability() is None)
+finally:
+    gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT = _ob, _or_, _op
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

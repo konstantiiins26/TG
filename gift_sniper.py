@@ -952,6 +952,55 @@ def target_sale_price(floor_price: Decimal, premium: bool = False) -> Decimal:
     return base * (Decimal("1") - UNDERCUT_PCT)
 
 
+def max_profitable_buy(floor_price: Decimal, premium: bool = False) -> Decimal:
+    """
+    Верхняя граница цены покупки, выше которой сделка убыточна.
+
+    Выводится из той же формулы, что и compute_net_profit, приравненной к нулю:
+        Buy_max = Floor * (1-undercut) * (1-fee-royalty) - gas
+
+    Нужна, чтобы ответить на вопрос «доступна ли эта коллекция моему банку»:
+    если потолок сделки (риск-лимит) ниже Buy_max, бот физически не сможет
+    купить даже идеальный лот, и месяцы наблюдения за такой коллекцией
+    не приведут ни к одной сделке.
+    """
+    sale = target_sale_price(floor_price, premium)
+    return sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT) - GAS_FEE_TON
+
+
+def affordability(floor_price: Decimal) -> dict:
+    """
+    Сопоставляет коллекцию с банком: что бот реально сможет в ней купить.
+
+    Возвращает потолок сделки, максимальную прибыльную цену и требуемую
+    скидку от floor. verdict: "да" | "узко" | "нет" | "банк не задан".
+    """
+    buy_max = max_profitable_buy(floor_price)
+    cap = max_position_size()
+
+    if BANKROLL_TON <= 0:
+        verdict = "банк не задан"
+    elif buy_max <= 0:
+        verdict = "нет"          # коллекция убыточна при любой цене
+    elif cap >= buy_max:
+        verdict = "да"           # весь прибыльный диапазон по карману
+    elif cap >= buy_max / Decimal("2"):
+        verdict = "узко"         # доступна только нижняя половина диапазона
+    else:
+        verdict = "нет"
+
+    # Скидка от floor, которая нужна, чтобы лот одновременно был прибыльным
+    # и влезал в потолок сделки.
+    reachable = min(cap, buy_max) if buy_max > 0 else Decimal("0")
+    if floor_price > 0 and reachable > 0:
+        discount_pct = (Decimal("1") - reachable / floor_price) * Decimal("100")
+    else:
+        discount_pct = Decimal("100")
+
+    return {"cap": cap, "buy_max": buy_max, "verdict": verdict,
+            "discount_pct": discount_pct}
+
+
 def compute_net_profit(floor_price: Decimal, buy_price: Decimal,
                        premium: bool = False) -> Decimal:
     """
@@ -1842,6 +1891,68 @@ def probe(address: str):
     return not failed
 
 
+def show_affordability():
+    """
+    Печатает, коллекции с каким floor доступны текущему банку.
+
+    Считается без сети: это чистая арифметика риск-лимитов и комиссий.
+    Нужна ДО записи рынка — наблюдать неделю за коллекцией, в которой банк
+    физически не может купить, значит потратить неделю впустую.
+
+    Два края, между которыми лежит рабочий диапазон:
+      дорогие коллекции — потолок сделки (% банка) ниже прибыльной цены;
+      дешёвые коллекции — газ съедает прибыль, нужна огромная скидка.
+    """
+    log.info(f"{_Color.BOLD}=== ЧТО ПО КАРМАНУ БАНКУ ==={_Color.RESET}")
+    if BANKROLL_TON <= 0:
+        log.error("BANKROLL_TON не задан — считать нечего. "
+                  "Укажите банк: set BANKROLL_TON=10")
+        return None
+
+    cap = max_position_size()
+    log.info(f"Банк: {BANKROLL_TON} TON | резерв: {RESERVE_TON} TON | "
+             f"свободно: {available_bankroll()} TON")
+    log.info(f"Потолок одной сделки: {cap} TON "
+             f"(мин. из {MAX_SPEND_PER_TRADE_TON} и {MAX_POSITION_PCT}% банка)")
+    log.info(f"Комиссии: площадка {MARKETPLACE_FEE_PCT * 100}% + роялти "
+             f"{ROYALTY_PCT * 100}% с цены продажи, undercut "
+             f"{UNDERCUT_PCT * 100}%, газ {GAS_FEE_TON} TON")
+    log.info("")
+    log.info(f"{'Floor':>8} {'Прибыльно до':>14} {'Нужна скидка':>14}  Вердикт")
+
+    rows, best = [], None
+    for floor in ("0.3", "0.5", "0.8", "1.0", "1.5", "2.0", "3.0", "5.0", "10.0"):
+        f = Decimal(floor)
+        aff = affordability(f)
+        rows.append((f, aff))
+        if aff["verdict"] in ("да", "узко") and (best is None or
+                                                 aff["discount_pct"] < best[1]["discount_pct"]):
+            best = (f, aff)
+        colour = (_Color.GREEN if aff["verdict"] == "да"
+                  else _Color.YELLOW if aff["verdict"] == "узко" else _Color.RED)
+        log.info(f"{f:>8} {aff['buy_max']:>14.2f} {aff['discount_pct']:>13.0f}%  "
+                 f"{colour}{aff['verdict']}{_Color.RESET}")
+
+    log.info("")
+    if best is None:
+        log.warning(f"{_Color.YELLOW}Банку {BANKROLL_TON} TON не подходит ни один "
+                    f"из проверенных уровней floor. Либо увеличивайте банк, либо "
+                    f"поднимайте MAX_POSITION_PCT — но это ваш риск, а не мой "
+                    f"совет.{_Color.RESET}")
+    else:
+        log.info(f"{_Color.GREEN}Лучший уровень для этого банка: floor около "
+                 f"{best[0]} TON — там нужна самая маленькая скидка "
+                 f"({best[1]['discount_pct']:.0f}% от floor).{_Color.RESET}")
+        log.info("Ищите на getgems.io коллекции Telegram Gifts с таким floor "
+                 "и впишите их в TARGET_COLLECTIONS.")
+
+    log.info("")
+    log.warning("Скидка — это то, НАСКОЛЬКО ниже floor должен стоять лот, чтобы "
+                "сделка была прибыльной И влезла в лимит. Чем она больше, тем "
+                "реже такой лот появляется. Как часто — покажет только запись рынка.")
+    return rows
+
+
 def rank_collections(path: str = None):
     """
     Ранжирует коллекции из записи рынка по РЕАЛЬНОЙ активности.
@@ -1883,16 +1994,34 @@ def rank_collections(path: str = None):
 
     log.info("")
     log.info(f"{'Коллекция':<16} {'Оборот/ч':>9} {'Лотов':>7} {'Floor':>10} "
-             f"{'Разброс':>9}  Статус")
+             f"{'Разброс':>9} {'Скидка':>8} {'Банк':>6}  Статус")
     for st in stats:
         colour = (_Color.RED if st["status"] != "живая"
                   else _Color.GREEN if st["turnover_per_hour"] >= 1 else "")
+        # median_floor хранится как float для JSON; арифметика денег — в Decimal.
+        aff = affordability(Decimal(str(st["median_floor"])))
+        st["affordable"] = aff["verdict"]
+        st["discount_needed_pct"] = aff["discount_pct"]
+        aff_colour = (_Color.GREEN if aff["verdict"] == "да"
+                      else _Color.YELLOW if aff["verdict"] == "узко"
+                      else _Color.RED if aff["verdict"] == "нет" else "")
         log.info(f"{_short(st['collection']):<16} "
                  f"{st['turnover_per_hour']:>9.2f} "
                  f"{st['avg_listings']:>7.0f} "
                  f"{st['median_floor']:>10.2f} "
-                 f"{st['floor_spread_pct']:>8.1f}%  "
+                 f"{st['floor_spread_pct']:>8.1f}% "
+                 f"{aff['discount_pct']:>7.0f}% "
+                 f"{aff_colour}{aff['verdict']:>6}{_Color.RESET}  "
                  f"{colour}{st['status']}{_Color.RESET}")
+
+    # Активная коллекция, в которой банк не может купить, — потраченные впустую
+    # дни записи и лимиты API. Сказать это надо явно, а не оставить в колонке.
+    unreachable = [st for st in stats if st.get("affordable") == "нет"]
+    if unreachable and BANKROLL_TON > 0:
+        log.warning(f"{_Color.YELLOW}Банку {BANKROLL_TON} TON недоступны "
+                    f"{len(unreachable)} из {len(stats)} коллекций: потолок сделки "
+                    f"{max_position_size()} TON ниже их прибыльного диапазона. "
+                    f"Наблюдать за ними можно, купить в них — нет.{_Color.RESET}")
 
     alive = [st for st in stats if st["status"] == "живая"]
     log.info("")
@@ -2206,6 +2335,8 @@ def parse_args(argv=None):
                         help="прогнать решения по записи рынка и выйти")
     parser.add_argument("--rank", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="показать, какие коллекции реально торгуются, и выйти")
+    parser.add_argument("--afford", action="store_true",
+                        help="показать, коллекции с каким floor по карману банку, и выйти")
     parser.add_argument("--probe", metavar="ADDRESS",
                         help="проверить адрес (кошелёк или коллекцию) и показать, "
                              "что парсер извлёк из живого ответа API")
@@ -2220,6 +2351,9 @@ if __name__ == "__main__":
         if args.probe:
             # Только чтение API: ни покупок, ни записи.
             sys.exit(0 if probe(args.probe) else 1)
+        if args.afford:
+            # Чистая арифметика: ни сети, ни записи, ни покупок.
+            sys.exit(0 if show_affordability() else 1)
         if args.rank:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if rank_collections(args.rank) else 1)
