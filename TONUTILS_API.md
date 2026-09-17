@@ -73,6 +73,46 @@ ExternalMessage"* — то есть метод не просто собирае�
 `CARRY_ALL_REMAINING_BALANCE=128`, `BOUNCE_IF_ACTION_FAIL=16`, `DEFAULT=0`.
 Значение по умолчанию у `transfer` — `3` (= 1|2).
 
+## Баланс — ЛОВУШКА: состояние не загружается автоматически
+
+`balance` — синхронное свойство, отдаёт **нанотоны**:
+
+```python
+@property
+def balance(self) -> int:
+    """Contract balance in nanotons."""
+    return self.info.balance
+```
+
+Но `info` — это *кэш* состояния, и он пуст, пока состояние не загружено:
+
+```python
+@property
+def info(self) -> ContractInfo:
+    if self._info is None:
+        raise StateNotLoadedError(self, missing="info")   # ← НЕ ноль, а исключение
+    return self._info
+```
+
+**`from_mnemonic()` состояние НЕ грузит.** Она сводится к `from_private_key()`,
+которая лишь выводит адрес из code+data — в блокчейн не ходит. Поэтому:
+
+```python
+wallet, _pub, _priv, _words = WalletV4R2.from_mnemonic(client, mnemonic)
+wallet.balance          # ❌ StateNotLoadedError
+
+await wallet.refresh()  # async: self._info = await self._load_info(...)
+wallet.balance          # ✅ int, нанотоны
+```
+
+Исключение импортируется как `from tonutils.exceptions import StateNotLoadedError`.
+
+Наивный код («создал кошелёк → прочитал баланс») падает. Это ровно тот случай,
+где написанное по памяти выглядит правильным и не работает.
+
+Исключение из правила: `from_address(client, address, load_state=True)` —
+у неё загрузка состояния включена по умолчанию.
+
 ## Нанотоны и адреса
 
 ```python
@@ -96,6 +136,9 @@ Address("0:" + "a1"*32).to_str()  # -> EQ... форма
 
 4. **Ключ — это мнемоника** (24 слова), её принимает `from_mnemonic`.
    Хранить только в файле с правами 0600, не в переменной окружения.
+
+4а. **Перед проверкой баланса — `await wallet.refresh()`.** Без него чтение
+   `wallet.balance` бросает `StateNotLoadedError`. Баланс в нанотонах.
 
 5. `REAL_EXECUTOR_AVAILABLE` должен определяться **успехом импорта**
    tonutils, а не константой: если библиотеки нет, живой режим обязан быть
