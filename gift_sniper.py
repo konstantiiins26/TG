@@ -79,7 +79,19 @@ WALLET_PRIVATE_KEY  = os.getenv("WALLET_PRIVATE_KEY", "")         # приват
 # --- Рыночные параметры ------------------------------------------------------
 # Адрес коллекции подарков, которую мониторим (raw или user-friendly формат).
 # Пример коллекции Telegram-подарков задайте свой:
-TARGET_COLLECTION   = os.getenv("TARGET_COLLECTION", "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+# Несколько коллекций через запятую. У Telegram Gifts каждый тип подарка —
+# отдельный контракт со своим floor, поэтому "смотреть все подарки" означает
+# "перечислить нужные коллекции". Одного адреса на все подарки не существует.
+#
+# ВНИМАНИЕ про нагрузку: за цикл уходит FLOOR_SAMPLE_PAGES запросов НА КАЖДУЮ
+# коллекцию. 10 коллекций x 5 страниц при интервале 12 сек = 250 запросов/мин,
+# это гарантированный 429. Считайте: collections x pages x (60/interval).
+TARGET_COLLECTIONS = [a.strip() for a in os.getenv(
+    "TARGET_COLLECTIONS",
+    os.getenv("TARGET_COLLECTION", "")).split(",") if a.strip()]
+
+# Обратная совместимость: одиночная переменная всё ещё работает.
+TARGET_COLLECTION   = TARGET_COLLECTIONS[0] if TARGET_COLLECTIONS else ""
 
 # --- Модель ИИ ---------------------------------------------------------------
 # ВНИМАНИЕ: 'claude-3-5-sonnet' — устаревший (legacy) идентификатор.
@@ -1629,10 +1641,11 @@ def preflight_checks(require_ai: bool = True):
     problems = []
     if require_ai and not ANTHROPIC_API_KEY:
         problems.append("ANTHROPIC_API_KEY не задан (нужен для ИИ-анализа).")
-    if not TARGET_COLLECTION or TARGET_COLLECTION.startswith("EQAAAAAA"):
-        problems.append("TARGET_COLLECTION не задан — впишите реальный адрес коллекции.")
-    elif normalize_ton_address(TARGET_COLLECTION) is None:
-        problems.append(f"TARGET_COLLECTION нераспознан как адрес TON: {TARGET_COLLECTION!r}")
+    if not TARGET_COLLECTIONS:
+        problems.append("TARGET_COLLECTIONS не задан — впишите адреса коллекций через запятую.")
+    for addr in TARGET_COLLECTIONS:
+        if normalize_ton_address(addr) is None:
+            problems.append(f"Коллекция нераспознана как адрес TON: {addr!r}")
 
     # Адреса в whitelist тоже должны быть валидны, иначе защита молча не работает.
     for addr in COLLECTION_WHITELIST:
@@ -1643,6 +1656,16 @@ def preflight_checks(require_ai: bool = True):
         for p in problems:
             log.error(p)
         return False
+
+    # Нагрузка растёт линейно по числу коллекций — предупреждаем ДО старта,
+    # а не после того, как API начнёт отдавать 429.
+    req_per_min = len(TARGET_COLLECTIONS) * FLOOR_SAMPLE_PAGES * (60 / max(POLL_INTERVAL_SEC, 1))
+    if req_per_min > 100:
+        log.warning(
+            f"{_Color.YELLOW}~{req_per_min:.0f} запросов/мин к TonAPI "
+            f"({len(TARGET_COLLECTIONS)} коллекций x {FLOOR_SAMPLE_PAGES} страниц "
+            f"x {60/max(POLL_INTERVAL_SEC,1):.1f} циклов/мин). Вероятны 429. "
+            f"Поднимите POLL_INTERVAL_SEC или снизьте FLOOR_SAMPLE_PAGES.{_Color.RESET}")
 
     if not COLLECTION_WHITELIST:
         log.warning(f"{_Color.YELLOW}COLLECTION_WHITELIST пуст — проверка на скам-коллекции "
@@ -1691,8 +1714,10 @@ def main(record: bool = False, trade: bool = True):
     """
     log.info(f"{_Color.BOLD}=== Telegram Gifts NFT Sniper запускается ==={_Color.RESET}")
     mode = "запись рынка" + (" + торговля" if trade else " (без торговли)") if record else "торговля"
-    log.info(f"Режим: {mode} | Коллекция: {_short(TARGET_COLLECTION)} | "
+    log.info(f"Режим: {mode} | Коллекций: {len(TARGET_COLLECTIONS)} | "
              f"Интервал: {POLL_INTERVAL_SEC}s | DRY_RUN: {DRY_RUN}")
+    for c in TARGET_COLLECTIONS:
+        log.info(f"  · {_short(c)}")
     if trade:
         log.info(f"Модель ИИ: {CLAUDE_MODEL} | БД: {DB_PATH}")
         if BANKROLL_TON > 0:
@@ -1720,61 +1745,78 @@ def main(record: bool = False, trade: bool = True):
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         log.info(f"{_Color.BOLD}--- Проверка #{cycle} @ {now} ---{_Color.RESET}")
 
-        try:
-            snap = get_market_snapshot(TARGET_COLLECTION)
-            candidates = snap["candidates"]
-
-            # Пишем снапшот ДО торговых решений: запись нужна и тогда,
-            # когда торговать нельзя (иначе в истории будут дыры).
-            if record and snap["sample_size"] > 0:
-                record_snapshot(snap)
-
-            if not trade:
-                # Не рапортуем о записи, которой не было: при пустой выборке
-                # record_snapshot() выше не вызывался.
-                if snap["sample_size"] > 0:
-                    log.info(f"Записано: floor {snap['floor']} TON | "
-                             f"выборка {snap['sample_size']} | кандидатов {len(candidates)}")
-                else:
-                    log.warning("Данных с рынка нет — снапшот НЕ записан.")
-            elif not candidates:
-                log.warning("Активных лотов на продаже не найдено. Жду следующей проверки.")
-            elif not snap["floor_reliable"]:
-                log.warning(
-                    f"{_Color.YELLOW}Floor недостоверен: в выборке всего "
-                    f"{snap['sample_size']} лотов (нужно >= {MIN_FLOOR_SAMPLE}). "
-                    f"Торговля в этом цикле пропущена.{_Color.RESET}"
-                )
-            else:
-                log.info(f"Источник: {snap['source']} | Выборка: {snap['sample_size']} лотов | "
-                         f"Floor (P{FLOOR_PERCENTILE}): {snap['floor']} TON | "
-                         f"Конкуренция у floor: {snap['competition']} | "
-                         f"Кандидатов: {len(candidates)}")
-
-                if snap["trait_total"] < MIN_TRAIT_SAMPLE:
-                    log.warning(f"{_Color.YELLOW}Редкость не оценивается: трейтов только "
-                                f"у {snap['trait_total']} лотов (нужно >= {MIN_TRAIT_SAMPLE})."
-                                f"{_Color.RESET}")
-
-                # Ликвидность запрашивается ОДИН раз за цикл, а не на каждый лот.
-                recent_sales = fetch_recent_sales_count(TARGET_COLLECTION)
-                if recent_sales is not None:
-                    log.info(f"Продаж за {LIQUIDITY_WINDOW_HOURS}ч: {recent_sales}")
-
-                # Прогоняем самые дешёвые лоты через ИИ.
-                for item in candidates:
-                    process_item(client, item, snap, recent_sales)
-
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:  # noqa: BLE001 — цикл не должен падать целиком
-            log.error(f"Ошибка в цикле мониторинга: {e}")
+        # Каждую коллекцию обрабатываем независимо: floor, редкость и
+        # ликвидность у них свои, и сбой одной не должен ронять остальные.
+        for coll in TARGET_COLLECTIONS:
+            try:
+                _process_collection(client, coll, record, trade)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:  # noqa: BLE001 — одна коллекция не роняет цикл
+                log.error(f"Коллекция {_short(coll)}: ошибка ({e})")
 
         # Держим стабильный интервал (учитываем время работы итерации).
         elapsed = time.monotonic() - started
         sleep_for = max(0, POLL_INTERVAL_SEC - elapsed)
         log.info(f"{_Color.GREY}Итерация заняла {elapsed:.1f}s. Сплю {sleep_for:.1f}s...{_Color.RESET}")
         time.sleep(sleep_for)
+
+
+def _process_collection(client, collection: str, record: bool, trade: bool):
+    """
+    Один полный проход по одной коллекции: снимок рынка, запись, торговля.
+
+    Вынесено из main() ради многоколлекционного режима: у каждой коллекции
+    свой floor и своя редкость, смешивать их нельзя.
+    """
+    try:
+        snap = get_market_snapshot(collection)
+        candidates = snap["candidates"]
+        log.info(f"{_Color.BOLD}[{_short(collection)}]{_Color.RESET}")
+
+        # Пишем снапшот ДО торговых решений: запись нужна и тогда,
+        # когда торговать нельзя (иначе в истории будут дыры).
+        if record and snap["sample_size"] > 0:
+            record_snapshot(snap)
+
+        if not trade:
+            # Не рапортуем о записи, которой не было: при пустой выборке
+            # record_snapshot() выше не вызывался.
+            if snap["sample_size"] > 0:
+                log.info(f"Записано: floor {snap['floor']} TON | "
+                         f"выборка {snap['sample_size']} | кандидатов {len(candidates)}")
+            else:
+                log.warning("Данных с рынка нет — снапшот НЕ записан.")
+        elif not candidates:
+            log.warning("Активных лотов на продаже не найдено. Жду следующей проверки.")
+        elif not snap["floor_reliable"]:
+            log.warning(
+                f"{_Color.YELLOW}Floor недостоверен: в выборке всего "
+                f"{snap['sample_size']} лотов (нужно >= {MIN_FLOOR_SAMPLE}). "
+                f"Торговля в этом цикле пропущена.{_Color.RESET}"
+            )
+        else:
+            log.info(f"Источник: {snap['source']} | Выборка: {snap['sample_size']} лотов | "
+                     f"Floor (P{FLOOR_PERCENTILE}): {snap['floor']} TON | "
+                     f"Конкуренция у floor: {snap['competition']} | "
+                     f"Кандидатов: {len(candidates)}")
+
+            if snap["trait_total"] < MIN_TRAIT_SAMPLE:
+                log.warning(f"{_Color.YELLOW}Редкость не оценивается: трейтов только "
+                            f"у {snap['trait_total']} лотов (нужно >= {MIN_TRAIT_SAMPLE})."
+                            f"{_Color.RESET}")
+
+            # Ликвидность запрашивается ОДИН раз за цикл, а не на каждый лот.
+            recent_sales = fetch_recent_sales_count(collection)
+            if recent_sales is not None:
+                log.info(f"Продаж за {LIQUIDITY_WINDOW_HOURS}ч: {recent_sales}")
+
+            # Прогоняем самые дешёвые лоты через ИИ.
+            for item in candidates:
+                process_item(client, item, snap, recent_sales)
+
+    except KeyboardInterrupt:
+        raise
 
 
 def parse_args(argv=None):

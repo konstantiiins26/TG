@@ -589,7 +589,7 @@ _odry, _oconf, _oexec = gs.DRY_RUN, gs.CONFIRM_LIVE_TRADING, gs.REAL_EXECUTOR_AV
 _okey, _obank, _owl = gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.COLLECTION_WHITELIST
 _oapi = gs.ANTHROPIC_API_KEY
 gs.ANTHROPIC_API_KEY = "sk-ant-test"
-gs.TARGET_COLLECTION = friendly
+gs.TARGET_COLLECTIONS = [friendly]
 
 # Симуляция должна проходить даже без кошелька и банка.
 gs.DRY_RUN = True
@@ -634,6 +634,31 @@ check("в симуляции покупка возвращает True",
 (gs.DRY_RUN, gs.CONFIRM_LIVE_TRADING, gs.REAL_EXECUTOR_AVAILABLE) = (_odry, _oconf, _oexec)
 (gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.COLLECTION_WHITELIST) = (_okey, _obank, _owl)
 gs.ANTHROPIC_API_KEY = _oapi
+
+
+# =============================================================================
+print("\n[17] Несколько коллекций")
+# =============================================================================
+
+_otc, _oak = gs.TARGET_COLLECTIONS, gs.ANTHROPIC_API_KEY
+gs.ANTHROPIC_API_KEY = "sk-ant-test"     # секция [16] вернула исходный (пустой)
+second = make_friendly_address(0, "b2" * 32)
+
+gs.TARGET_COLLECTIONS = [friendly, second]
+check("preflight принимает несколько валидных коллекций",
+      gs.preflight_checks(require_ai=True) is True)
+
+# Одна битая коллекция в списке обязана остановить старт: иначе бот молча
+# работал бы по части списка, а пользователь думал бы, что смотрит всё.
+gs.TARGET_COLLECTIONS = [friendly, "не-адрес"]
+check("битый адрес в списке блокирует старт",
+      gs.preflight_checks(require_ai=True) is False)
+
+gs.TARGET_COLLECTIONS = []
+check("пустой список коллекций блокирует старт",
+      gs.preflight_checks(require_ai=True) is False)
+
+gs.TARGET_COLLECTIONS, gs.ANTHROPIC_API_KEY = _otc, _oak
 
 
 # =============================================================================
