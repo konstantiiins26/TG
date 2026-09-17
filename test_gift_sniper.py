@@ -662,6 +662,58 @@ gs.TARGET_COLLECTIONS, gs.ANTHROPIC_API_KEY = _otc, _oak
 
 
 # =============================================================================
+print("\n[18] Ранжирование коллекций по активности")
+# =============================================================================
+
+rank_path = os.path.join(_tmpdir, "rank.jsonl")
+_now = _time.time()
+_rows = []
+for h in range(48):
+    # Живая: дешёвые лоты каждый час новые.
+    _rows.append({"ts": _now + h*3600, "collection": "0:alive", "floor": "10",
+                  "sample_size": 200, "competition": 3, "floor_reliable": True,
+                  "trait_index": {}, "trait_total": 0,
+                  "candidates": [{"address": f"0:lot{h}", "sale_price_ton": 8.0}]})
+    # Замершая: лот всегда один и тот же.
+    _rows.append({"ts": _now + h*3600, "collection": "0:frozen", "floor": "50",
+                  "sample_size": 40, "competition": 1, "floor_reliable": True,
+                  "trait_index": {}, "trait_total": 0,
+                  "candidates": [{"address": "0:stuck", "sale_price_ton": 45.0}]})
+    # Офлайн: данных нет.
+    _rows.append({"ts": _now + h*3600, "collection": "0:dead", "floor": "0",
+                  "sample_size": 0, "competition": 0, "floor_reliable": False,
+                  "trait_index": {}, "trait_total": 0, "candidates": []})
+with open(rank_path, "w", encoding="utf-8") as f:
+    for r in _rows:
+        f.write(_json.dumps(r) + "\n")
+
+ranked = gs.rank_collections(rank_path)
+check("ранжирование вернуло все коллекции", ranked and len(ranked) == 3, str(ranked and len(ranked)))
+
+by_name = {st["collection"]: st for st in ranked}
+check("живая коллекция распознана", by_name["0:alive"]["status"] == "живая",
+      by_name["0:alive"]["status"])
+check("замершая отличена от живой", by_name["0:frozen"]["status"] == "замерла (оборота нет)",
+      by_name["0:frozen"]["status"])
+check("офлайн отличён от замершей", by_name["0:dead"]["status"] == "офлайн (нет данных)",
+      by_name["0:dead"]["status"])
+
+# Ключевое: у живой оборот строго выше, и она идёт первой в рейтинге.
+check("у живой оборот больше нуля", by_name["0:alive"]["turnover_per_hour"] > 0)
+check("у замершей оборот ноль", by_name["0:frozen"]["turnover_per_hour"] == 0)
+check("рейтинг отсортирован по обороту", ranked[0]["collection"] == "0:alive",
+      ranked[0]["collection"])
+
+# Наличие лотов НЕ означает активность — замершая держит 40 лотов и мертва.
+check("много лотов не делает коллекцию живой",
+      by_name["0:frozen"]["avg_listings"] == 40
+      and by_name["0:frozen"]["status"] != "живая")
+
+check("отсутствующий файл обрабатывается",
+      gs.rank_collections(os.path.join(_tmpdir, "нет.jsonl")) is None)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

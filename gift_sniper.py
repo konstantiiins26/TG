@@ -739,8 +739,8 @@ _floor_cache = {}
 
 def _empty_snapshot(source="none"):
     """Пустой снапшот — чтобы вызывающий код не разбирал особые случаи."""
-    return {"candidates": [], "floor": Decimal("0"), "sample_size": 0,
-            "source": source, "trait_index": {}, "trait_total": 0,
+    return {"collection": "", "candidates": [], "floor": Decimal("0"),
+            "sample_size": 0, "source": source, "trait_index": {}, "trait_total": 0,
             "competition": 0, "floor_reliable": False}
 
 
@@ -785,6 +785,9 @@ def get_market_snapshot(collection: str) -> dict:
     trait_index, trait_total = build_trait_index(all_items)
 
     return {
+        # Без этого поля снапшоты разных коллекций в записи неразличимы,
+        # и бэктест подставил бы floor чужой коллекции.
+        "collection": cache_key,
         "candidates": sorted(on_sale, key=lambda it: it["sale_price_ton"])[:CANDIDATES_TO_ANALYZE],
         "floor": floor,
         "sample_size": sample_size,
@@ -1477,6 +1480,7 @@ def record_snapshot(snap: dict, path: str = None):
     path = path or RECORD_PATH
     row = {
         "ts": time.time(),
+        "collection": snap.get("collection", ""),
         "floor": str(snap["floor"]),
         "sample_size": snap["sample_size"],
         "competition": snap["competition"],
@@ -1564,7 +1568,24 @@ def run_backtest(path: str = None, hold_hours: int = None):
         log.warning(f"{_Color.YELLOW}Запись короче двух периодов удержания — "
                     f"результат статистически неубедителен.{_Color.RESET}")
 
+    # Группируем по коллекциям: floor одной коллекции ничего не говорит о
+    # другой, и смешивать их в одном прогоне — считать мусор.
+    by_coll = {}
+    for snap in snaps:
+        by_coll.setdefault(snap.get("collection", ""), []).append(snap)
+    if len(by_coll) > 1:
+        log.info(f"В записи {len(by_coll)} коллекций — считаю каждую отдельно.")
+
     trades, bought_addrs = [], set()
+    for coll, coll_snaps in by_coll.items():
+        trades.extend(_backtest_one(coll_snaps, hold_hours, bought_addrs))
+
+    return _report_backtest(trades, hold_hours)
+
+
+def _backtest_one(snaps, hold_hours: int, bought_addrs: set):
+    """Прогон по снапшотам ОДНОЙ коллекции."""
+    trades = []
     for snap in snaps:
         for item in snap["candidates"]:
             # Один и тот же лот не покупаем дважды за прогон.
@@ -1590,8 +1611,120 @@ def run_backtest(path: str = None, hold_hours: int = None):
                 trade["status"] = "closed"
                 trade["pnl"] = proceeds - ev["buy_price"] - GAS_FEE_TON
             trades.append(trade)
+    return trades
 
-    return _report_backtest(trades, hold_hours)
+
+def rank_collections(path: str = None):
+    """
+    Ранжирует коллекции из записи рынка по РЕАЛЬНОЙ активности.
+
+    Зачем это нужно: смотреть 30 коллекций бессмысленно, если в 25 из них
+    месяцами ничего не происходит. Но узнать это можно только наблюдением —
+    "мёртвая" коллекция выглядит в API точно так же, как живая.
+
+    Метрика активности — ОБОРОТ ВИТРИНЫ: сколько лотов исчезло из числа
+    самых дешёвых между соседними снапшотами. Лот исчезает, когда его
+    купили или сняли с продажи.
+
+    ЧЕСТНОЕ ОГРАНИЧЕНИЕ: это измеряется по CANDIDATES_TO_ANALYZE самым
+    дешёвым лотам, а не по всему объёму коллекции, и исчезновение лота —
+    это продажа ИЛИ снятие, различить их без истории сделок нельзя.
+    Поэтому метрика сравнительная: она говорит, где активнее, а не сколько
+    именно продано.
+    """
+    path = path or RECORD_PATH
+    try:
+        snaps = _load_recording(path)
+    except FileNotFoundError:
+        log.error(f"Записи рынка нет: {path}. Сначала соберите её: "
+                  f"python gift_sniper.py --record")
+        return None
+    if not snaps:
+        log.error(f"{path} пуст — нечего анализировать.")
+        return None
+
+    by_coll = {}
+    for snap in snaps:
+        by_coll.setdefault(snap.get("collection", ""), []).append(snap)
+
+    log.info(f"{_Color.BOLD}=== АКТИВНОСТЬ КОЛЛЕКЦИЙ ==={_Color.RESET}")
+    log.info(f"Запись: {path} | снапшотов {len(snaps)} | коллекций {len(by_coll)}")
+
+    stats = [_collection_stats(c, sn) for c, sn in by_coll.items()]
+    stats.sort(key=lambda st: st["turnover_per_hour"], reverse=True)
+
+    log.info("")
+    log.info(f"{'Коллекция':<16} {'Оборот/ч':>9} {'Лотов':>7} {'Floor':>10} "
+             f"{'Разброс':>9}  Статус")
+    for st in stats:
+        colour = (_Color.RED if st["status"] != "живая"
+                  else _Color.GREEN if st["turnover_per_hour"] >= 1 else "")
+        log.info(f"{_short(st['collection']):<16} "
+                 f"{st['turnover_per_hour']:>9.2f} "
+                 f"{st['avg_listings']:>7.0f} "
+                 f"{st['median_floor']:>10.2f} "
+                 f"{st['floor_spread_pct']:>8.1f}%  "
+                 f"{colour}{st['status']}{_Color.RESET}")
+
+    alive = [st for st in stats if st["status"] == "живая"]
+    log.info("")
+    if not alive:
+        log.warning(f"{_Color.YELLOW}Ни одной живой коллекции. Либо запись слишком "
+                    f"короткая, либо выбранные коллекции не торгуются.{_Color.RESET}")
+    else:
+        log.info(f"Живых коллекций: {len(alive)} из {len(stats)}. "
+                 f"Рекомендую оставить в TARGET_COLLECTIONS верхние "
+                 f"{min(3, len(alive))} — остальные только жгут лимиты API.")
+    _warn_if_recording_short(snaps)
+    return stats
+
+
+def _collection_stats(collection: str, snaps: list) -> dict:
+    """Считает метрики активности одной коллекции по её снапшотам."""
+    snaps = sorted(snaps, key=lambda s: s["ts"])
+    span_h = max((snaps[-1]["ts"] - snaps[0]["ts"]) / 3600, 0.0001)
+
+    floors = [s["floor"] for s in snaps if s["floor"] > 0]
+    sizes = [s["sample_size"] for s in snaps]
+
+    # Оборот витрины: сколько дешёвых лотов исчезло между снапшотами.
+    seen = [{i["address"] for i in s.get("candidates", [])} for s in snaps]
+    gone = sum(len(a - b) for a, b in zip(seen, seen[1:]))
+
+    median_floor = (sorted(floors)[len(floors) // 2] if floors else Decimal("0"))
+    spread = Decimal("0")
+    if floors and min(floors) > 0:
+        spread = (max(floors) - min(floors)) / min(floors) * Decimal("100")
+
+    # Диагностика "почему тихо" — это разные проблемы с разными решениями.
+    if max(sizes, default=0) == 0:
+        status = "офлайн (нет данных)"
+    elif len(snaps) < 3:
+        status = "мало снапшотов"
+    elif gone == 0:
+        status = "замерла (оборота нет)"
+    else:
+        status = "живая"
+
+    return {
+        "collection": collection or "(без адреса)",
+        "snapshots": len(snaps),
+        "span_hours": span_h,
+        "turnover_per_hour": gone / span_h,
+        "avg_listings": sum(sizes) / len(sizes) if sizes else 0,
+        "median_floor": float(median_floor),
+        "floor_spread_pct": float(spread),
+        "status": status,
+    }
+
+
+def _warn_if_recording_short(snaps):
+    """Короткая запись даёт красивые, но бессмысленные цифры."""
+    span_h = (snaps[-1]["ts"] - snaps[0]["ts"]) / 3600
+    if span_h < 24:
+        log.warning(f"{_Color.YELLOW}Запись покрывает всего {span_h:.1f}ч. "
+                    f"Рынок подарков неравномерен по времени суток — "
+                    f"выводы по выборке меньше суток ненадёжны.{_Color.RESET}")
 
 
 def _report_backtest(trades, hold_hours):
@@ -1831,6 +1964,8 @@ def parse_args(argv=None):
                         help="торговать одновременно с записью (по умолчанию --record не торгует)")
     parser.add_argument("--backtest", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="прогнать решения по записи рынка и выйти")
+    parser.add_argument("--rank", nargs="?", const=RECORD_PATH, metavar="FILE",
+                        help="показать, какие коллекции реально торгуются, и выйти")
     parser.add_argument("--hold-hours", type=int, default=None,
                         help=f"горизонт удержания в бэктесте (по умолчанию {BACKTEST_HOLD_HOURS})")
     return parser.parse_args(argv)
@@ -1839,6 +1974,9 @@ def parse_args(argv=None):
 if __name__ == "__main__":
     args = parse_args()
     try:
+        if args.rank:
+            # Только чтение записи: ни сети, ни покупок.
+            sys.exit(0 if rank_collections(args.rank) else 1)
         if args.backtest:
             # Бэктест ничего не покупает и не ходит в сеть — только считает.
             sys.exit(0 if run_backtest(args.backtest, args.hold_hours) else 1)
