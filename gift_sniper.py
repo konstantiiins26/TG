@@ -1730,8 +1730,13 @@ def main(record: bool = False, trade: bool = True):
                 record_snapshot(snap)
 
             if not trade:
-                log.info(f"Записано: floor {snap['floor']} TON | "
-                         f"выборка {snap['sample_size']} | кандидатов {len(candidates)}")
+                # Не рапортуем о записи, которой не было: при пустой выборке
+                # record_snapshot() выше не вызывался.
+                if snap["sample_size"] > 0:
+                    log.info(f"Записано: floor {snap['floor']} TON | "
+                             f"выборка {snap['sample_size']} | кандидатов {len(candidates)}")
+                else:
+                    log.warning("Данных с рынка нет — снапшот НЕ записан.")
             elif not candidates:
                 log.warning("Активных лотов на продаже не найдено. Жду следующей проверки.")
             elif not snap["floor_reliable"]:
