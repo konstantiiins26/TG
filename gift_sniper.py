@@ -51,6 +51,9 @@ try:
 except ImportError:
     sys.exit("[FATAL] Нет модуля 'requests'. Установите:  pip install requests")
 
+# anthropic нужен ТОЛЬКО для торговли. Диагностика (--probe), ранжирование
+# (--rank) и бэктест обязаны работать без него: падать на импорте при запуске
+# --probe значит требовать ключ Claude ради проверки адреса.
 try:
     from anthropic import Anthropic
     # Типизированные исключения SDK — ловим их отдельно от сетевых ошибок.
@@ -59,8 +62,20 @@ try:
         RateLimitError,
         APIConnectionError,
     )
+    ANTHROPIC_AVAILABLE = True
 except ImportError:
-    sys.exit("[FATAL] Нет модуля 'anthropic'. Установите:  pip install anthropic")
+    ANTHROPIC_AVAILABLE = False
+    Anthropic = None
+
+    # Заглушки, чтобы except-блоки ниже оставались валидными без SDK.
+    class APIStatusError(Exception):
+        pass
+
+    class RateLimitError(Exception):
+        pass
+
+    class APIConnectionError(Exception):
+        pass
 
 
 # =============================================================================
@@ -1878,6 +1893,8 @@ def _report_backtest(trades, hold_hours):
 def preflight_checks(require_ai: bool = True):
     """Проверяет обязательные настройки перед запуском цикла."""
     problems = []
+    if require_ai and not ANTHROPIC_AVAILABLE:
+        problems.append("Нет модуля 'anthropic' (нужен для торговли): pip install anthropic")
     if require_ai and not ANTHROPIC_API_KEY:
         problems.append("ANTHROPIC_API_KEY не задан (нужен для ИИ-анализа).")
     if not TARGET_COLLECTIONS:
