@@ -1,0 +1,48 @@
+# systemd-юнит для круглосуточной работы бота.
+#
+# Установка:
+#   sudo cp deploy/gift-sniper.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gift-sniper
+#   journalctl -u gift-sniper -f        # смотреть логи
+#
+# Меняйте User/пути под себя. Запускать от root НЕ нужно и не нужно вообще.
+
+[Unit]
+Description=Telegram Gifts NFT Sniper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sniper
+Group=sniper
+WorkingDirectory=/opt/gift-sniper
+
+# Секреты — из файла с правами 0600, а не из этого юнита:
+# содержимое юнита видно любому через systemctl cat.
+EnvironmentFile=/etc/gift-sniper/env
+
+ExecStart=/opt/gift-sniper/.venv/bin/python /opt/gift-sniper/gift_sniper.py
+
+# Бот должен пережить падение сети или временный сбой API.
+Restart=always
+RestartSec=30
+
+# Ограничиваем ущерб от возможной компрометации процесса.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/gift-sniper
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

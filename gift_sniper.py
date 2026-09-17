@@ -175,6 +175,27 @@ MAX_SPEND_PER_DAY_TON   = Decimal(os.getenv("MAX_SPEND_PER_DAY_TON", "1000"))   
 MAX_OPEN_POSITIONS      = int(os.getenv("MAX_OPEN_POSITIONS", "10"))             # сколько лотов держим одновременно
 STOP_AFTER_LOSSES       = int(os.getenv("STOP_AFTER_LOSSES", "3"))               # N убытков подряд -> стоп торговли
 
+# --- БАНКРОЛЛ (Ярус 4) -------------------------------------------------------
+# "Банк" — сумма, которой боту разрешено оперировать. Задаётся ВАМИ, деньги
+# лежат на ВАШЕМ кошельке; бот только считает, сколько из них уже в позициях.
+BANKROLL_TON        = Decimal(os.getenv("BANKROLL_TON", "0"))             # 0 = банк не задан, торговля запрещена
+RESERVE_TON         = Decimal(os.getenv("RESERVE_TON", "5"))              # неснижаемый остаток (газ, комиссии)
+MAX_POSITION_PCT    = Decimal(os.getenv("MAX_POSITION_PCT", "10"))        # максимум % банка в одной сделке
+
+# --- КОШЕЛЁК (Ярус 4) --------------------------------------------------------
+# Ключ читается ТОЛЬКО из файла с правами 0600, не из переменной окружения:
+# env видно в `ps`, в логах оркестратора и в дампах контейнера.
+# Ключ НИКОГДА не логируется и не попадает в БД, уведомления или git.
+WALLET_KEY_FILE     = os.getenv("WALLET_KEY_FILE", "")
+TRADING_NETWORK     = os.getenv("TRADING_NETWORK", "testnet").lower()     # testnet | mainnet
+# Осознанный speed bump: без этой строки живая торговля не запустится.
+CONFIRM_LIVE_TRADING = os.getenv("CONFIRM_LIVE_TRADING", "")
+
+# Реальная подпись транзакций НЕ реализована (см. SETUP.md, раздел "Что ещё
+# не сделано"). Флаг существует, чтобы preflight мог ЗАПРЕТИТЬ живой режим,
+# а не чтобы бот думал, будто купил, ничего не купив.
+REAL_EXECUTOR_AVAILABLE = False
+
 # --- Хранилище состояния (Ярус 3) --------------------------------------------
 # SQLite: позиции, траты, PnL. Нужен именно файл, а не память в процессе —
 # лимиты и учёт позиций обязаны переживать рестарт.
@@ -961,6 +982,70 @@ def consecutive_losses() -> int:
     return streak
 
 
+def deployed_capital() -> Decimal:
+    """Сколько денег банка сейчас лежит в открытых позициях."""
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT buy_price_ton FROM positions WHERE status='open'").fetchall()
+    return sum((Decimal(r["buy_price_ton"]) for r in rows), Decimal("0"))
+
+
+def available_bankroll() -> Decimal:
+    """
+    Свободные средства банка: банк минус то, что уже в позициях, минус резерв.
+
+    Резерв не трогаем никогда: если потратить всё до копейки, не останется
+    на газ, и вы не сможете даже продать купленное.
+    """
+    if BANKROLL_TON <= 0:
+        return Decimal("0")
+    return BANKROLL_TON - deployed_capital() - RESERVE_TON
+
+
+def max_position_size() -> Decimal:
+    """
+    Потолок одной сделки: минимум из абсолютного лимита и доли банка.
+
+    Доля банка важнее абсолютного числа: она масштабируется вместе с
+    депозитом и не даёт одной сделке унести весь банк.
+    """
+    by_pct = BANKROLL_TON * MAX_POSITION_PCT / Decimal("100")
+    if BANKROLL_TON <= 0:
+        return MAX_SPEND_PER_TRADE_TON
+    return min(MAX_SPEND_PER_TRADE_TON, by_pct)
+
+
+def load_wallet_key():
+    """
+    Читает приватный ключ из файла, проверяя права доступа.
+
+    Возвращает (key | None, error | None). Ключ НИКОГДА не логируется,
+    не пишется в БД и не уходит в уведомления.
+
+    Права строже 0600 — обязательны: ключ, читаемый группой или всеми,
+    считается скомпрометированным.
+    """
+    if not WALLET_KEY_FILE:
+        return None, "WALLET_KEY_FILE не задан"
+    if not os.path.isfile(WALLET_KEY_FILE):
+        return None, f"файл ключа не найден: {WALLET_KEY_FILE}"
+
+    mode = os.stat(WALLET_KEY_FILE).st_mode
+    if mode & 0o077:
+        return None, (f"НЕБЕЗОПАСНЫЕ ПРАВА на {WALLET_KEY_FILE} "
+                      f"({oct(mode & 0o777)}). Выполните: chmod 600 {WALLET_KEY_FILE}")
+
+    try:
+        with open(WALLET_KEY_FILE, encoding="utf-8") as f:
+            key = f.read().strip()
+    except OSError as e:
+        return None, f"не удалось прочитать файл ключа: {e}"
+
+    if not key:
+        return None, "файл ключа пуст"
+    return key, None
+
+
 def check_risk_limits(buy_price: Decimal):
     """
     Последний контур защиты ПЕРЕД тратой денег.
@@ -968,9 +1053,18 @@ def check_risk_limits(buy_price: Decimal):
     Возвращает (ok: bool, reason: str). Проверяется в порядке "от самого
     дешёвого к самому дорогому запросу".
     """
-    if buy_price > MAX_SPEND_PER_TRADE_TON:
-        return False, (f"цена {buy_price} TON выше потолка сделки "
-                       f"{MAX_SPEND_PER_TRADE_TON} TON")
+    cap = max_position_size()
+    if buy_price > cap:
+        return False, (f"цена {buy_price} TON выше потолка сделки {cap} TON "
+                       f"({MAX_POSITION_PCT}% банка / абсолютный лимит)")
+
+    # Банк — жёсткая граница: за её пределами денег просто нет.
+    if BANKROLL_TON > 0:
+        free = available_bankroll()
+        if buy_price > free:
+            return False, (f"свободно {free} TON (банк {BANKROLL_TON} − в позициях "
+                           f"{deployed_capital()} − резерв {RESERVE_TON}), "
+                           f"нужно {buy_price} TON")
 
     losses = consecutive_losses()
     if losses >= STOP_AFTER_LOSSES:
@@ -1198,21 +1292,34 @@ def _parse_ai_json(raw: str) -> dict:
 
 def execute_blockchain_buy(item_id: str, price) -> bool:
     """
-    ЗАГЛУШКА покупки. Реальная транзакция НЕ подписывается и НЕ отправляется,
-    чтобы не рисковать средствами до полноценных тестов.
+    Покупка лота. Возвращает True только если сделка ДЕЙСТВИТЕЛЬНО совершена.
 
-    Здесь, когда будете готовы, подключите реальную логику (например,
-    tonutils / pytoniq): собрать сообщение покупки на смарт-контракт продажи
-    и подписать его WALLET_PRIVATE_KEY. Пока — только зелёный лог успеха.
+    Два режима:
+      DRY_RUN=1 — симуляция: зелёный лог, никаких транзакций, средства целы.
+      DRY_RUN=0 — реальная подпись... которая пока НЕ РЕАЛИЗОВАНА.
+
+    Почему здесь нет "почти рабочей" реализации: подписать транзакцию TON
+    можно только через внешнюю библиотеку, API которой я не смог проверить
+    в среде разработки. Код траты денег, написанный по памяти и ни разу не
+    исполнявшийся, — это не автоматизация, а способ потерять банк.
+
+    Важно: функция НИКОГДА не возвращает True, не совершив сделку. Иначе бот
+    записал бы в БД позицию, которой нет, и весь учёт PnL стал бы фикцией.
     """
-    if not DRY_RUN:
-        # Место для будущей реальной реализации.
-        log.warning("DRY_RUN=0, но реальная покупка не реализована — работаю как заглушка.")
+    if DRY_RUN:
+        log.info(f"{_Color.GREEN}[SUCCESS] (СИМУЛЯЦИЯ) Покупка лота "
+                 f"{item_id} за {price} TON{_Color.RESET}")
+        return True
 
-    # Симулируем "отправку" транзакции.
-    log.info(f"{_Color.GREEN}[SUCCESS] Отправлена транзакция на покупку лота "
-             f"{item_id} за {price} TON{_Color.RESET}")
-    return True
+    if not REAL_EXECUTOR_AVAILABLE:
+        # До сюда дойти нельзя: preflight_checks() не пускает в живой режим.
+        # Проверка продублирована намеренно — на случай, если кто-то вызовет
+        # функцию в обход main().
+        log.error(f"{_Color.RED}Реальная покупка не реализована. Сделка НЕ совершена. "
+                  f"См. SETUP.md.{_Color.RESET}")
+        return False
+
+    raise NotImplementedError("подключите исполнителя сделок — см. SETUP.md")
 
 
 # =============================================================================
@@ -1541,6 +1648,35 @@ def preflight_checks(require_ai: bool = True):
         log.warning(f"{_Color.YELLOW}COLLECTION_WHITELIST пуст — проверка на скам-коллекции "
                     f"ОТКЛЮЧЕНА. Укажите доверенные адреса перед реальной торговлей."
                     f"{_Color.RESET}")
+
+    # --- ВОРОТА В ЖИВОЙ РЕЖИМ ----------------------------------------------
+    # Каждое условие — отдельный способ потерять деньги. Ни одно не
+    # проверяется "по возможности": все обязательны.
+    if require_ai and not DRY_RUN:
+        blockers = []
+        if not REAL_EXECUTOR_AVAILABLE:
+            blockers.append("реальная подпись транзакций не реализована (см. SETUP.md)")
+        if CONFIRM_LIVE_TRADING != "I_UNDERSTAND_THE_RISK":
+            blockers.append("не подтверждён риск: CONFIRM_LIVE_TRADING=I_UNDERSTAND_THE_RISK")
+        if BANKROLL_TON <= 0:
+            blockers.append("BANKROLL_TON не задан — бот не знает, чем ему разрешено рисковать")
+        if BANKROLL_TON > 0 and RESERVE_TON >= BANKROLL_TON:
+            blockers.append(f"RESERVE_TON ({RESERVE_TON}) >= BANKROLL_TON ({BANKROLL_TON})")
+        if not COLLECTION_WHITELIST:
+            blockers.append("COLLECTION_WHITELIST пуст — защита от скам-коллекций обязательна вживую")
+        _, key_err = load_wallet_key()
+        if key_err:
+            blockers.append(f"кошелёк: {key_err}")
+        if TRADING_NETWORK not in ("testnet", "mainnet"):
+            blockers.append(f"TRADING_NETWORK должен быть testnet или mainnet, а не {TRADING_NETWORK!r}")
+
+        if blockers:
+            log.error(f"{_Color.RED}{_Color.BOLD}ЖИВАЯ ТОРГОВЛЯ ЗАБЛОКИРОВАНА:{_Color.RESET}")
+            for b in blockers:
+                log.error(f"  • {b}")
+            log.error("Запустите с DRY_RUN=1 либо устраните причины выше.")
+            return False
+
     return True
 
 
@@ -1559,6 +1695,12 @@ def main(record: bool = False, trade: bool = True):
              f"Интервал: {POLL_INTERVAL_SEC}s | DRY_RUN: {DRY_RUN}")
     if trade:
         log.info(f"Модель ИИ: {CLAUDE_MODEL} | БД: {DB_PATH}")
+        if BANKROLL_TON > 0:
+            log.info(f"Банк: {BANKROLL_TON} TON | резерв {RESERVE_TON} | "
+                     f"в позициях {deployed_capital()} | свободно {available_bankroll()} | "
+                     f"потолок сделки {max_position_size()} TON")
+        log.info(f"Сеть: {TRADING_NETWORK} | режим: "
+                 f"{'СИМУЛЯЦИЯ (средства целы)' if DRY_RUN else 'ЖИВАЯ ТОРГОВЛЯ'}")
         log.info(f"Лимиты: сделка <= {MAX_SPEND_PER_TRADE_TON} | час <= "
                  f"{MAX_SPEND_PER_HOUR_TON} | сутки <= {MAX_SPEND_PER_DAY_TON} TON | "
                  f"позиций <= {MAX_OPEN_POSITIONS} | стоп после {STOP_AFTER_LOSSES} убытков")

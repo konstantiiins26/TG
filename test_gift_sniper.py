@@ -497,6 +497,146 @@ check("отсутствующий файл обрабатывается",
 
 
 # =============================================================================
+print("\n[14] Банкролл")
+# =============================================================================
+
+gs.DB_PATH = os.path.join(_tmpdir, "bankroll.db")
+gs.db_init()
+
+_ob, _or_, _op = gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT
+gs.BANKROLL_TON = Decimal("100")
+gs.RESERVE_TON = Decimal("5")
+gs.MAX_POSITION_PCT = Decimal("10")
+gs.MAX_SPEND_PER_TRADE_TON = Decimal("50")
+
+check("свободно = банк − резерв при нуле позиций",
+      gs.available_bankroll() == Decimal("95"), f"got={gs.available_bankroll()}")
+check("потолок сделки = 10% банка (меньше абсолютного)",
+      gs.max_position_size() == Decimal("10"), f"got={gs.max_position_size()}")
+
+gs.record_purchase({"address": "0:b1", "collection_address": ""}, Decimal("30"), Decimal("40"))
+check("капитал в позициях учтён", gs.deployed_capital() == Decimal("30"))
+check("свободно уменьшилось на размер позиции",
+      gs.available_bankroll() == Decimal("65"), f"got={gs.available_bankroll()}")
+
+# Резерв неприкосновенен: он не должен уходить в сделки.
+gs.record_purchase({"address": "0:b2", "collection_address": ""}, Decimal("60"), Decimal("70"))
+check("резерв не отдаётся под сделки",
+      gs.available_bankroll() == Decimal("5"), f"got={gs.available_bankroll()}")
+ok, why = gs.check_risk_limits(Decimal("9"))
+check("сделка сверх свободных средств блокируется", ok is False, why)
+
+# Доля банка должна ограничивать сильнее абсолютного лимита.
+gs.BANKROLL_TON = Decimal("20")
+check("потолок = 10% от 20 = 2", gs.max_position_size() == Decimal("2"))
+ok, why = gs.check_risk_limits(Decimal("5"))
+check("превышение доли банка блокируется", ok is False, why)
+
+# Без заданного банка доля не применяется — работает абсолютный лимит.
+gs.BANKROLL_TON = Decimal("0")
+check("без банка действует абсолютный лимит",
+      gs.max_position_size() == gs.MAX_SPEND_PER_TRADE_TON)
+check("без банка свободных средств нет", gs.available_bankroll() == Decimal("0"))
+
+gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT = _ob, _or_, _op
+
+
+# =============================================================================
+print("\n[15] Кошелёк: права на файл ключа")
+# =============================================================================
+
+import stat as _stat
+
+_owk = gs.WALLET_KEY_FILE
+key_path = os.path.join(_tmpdir, "wallet.key")
+with open(key_path, "w", encoding="utf-8") as f:
+    f.write("SECRET_KEY_MATERIAL_DO_NOT_LEAK\n")
+
+gs.WALLET_KEY_FILE = ""
+key, err = gs.load_wallet_key()
+check("без пути ключ не загружается", key is None and err is not None)
+
+gs.WALLET_KEY_FILE = os.path.join(_tmpdir, "нет.key")
+key, err = gs.load_wallet_key()
+check("отсутствующий файл ключа отвергается", key is None and "не найден" in err)
+
+# Ключевой кейс безопасности: читаемый другими ключ обязан быть отвергнут.
+gs.WALLET_KEY_FILE = key_path
+os.chmod(key_path, 0o644)
+key, err = gs.load_wallet_key()
+check("ключ с правами 0644 отвергается", key is None, f"err={err}")
+check("в ошибке названа причина и лечение",
+      err and "chmod 600" in err, err)
+check("сам ключ в текст ошибки НЕ попал",
+      err and "SECRET_KEY_MATERIAL" not in err, err)
+
+os.chmod(key_path, 0o600)
+key, err = gs.load_wallet_key()
+check("ключ с правами 0600 читается", key == "SECRET_KEY_MATERIAL_DO_NOT_LEAK", f"err={err}")
+
+os.chmod(key_path, 0o660)          # доступен группе
+key, err = gs.load_wallet_key()
+check("ключ, доступный группе, отвергается", key is None)
+os.chmod(key_path, 0o600)
+gs.WALLET_KEY_FILE = _owk
+
+
+# =============================================================================
+print("\n[16] Ворота в живую торговлю")
+# =============================================================================
+
+_odry, _oconf, _oexec = gs.DRY_RUN, gs.CONFIRM_LIVE_TRADING, gs.REAL_EXECUTOR_AVAILABLE
+_okey, _obank, _owl = gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.COLLECTION_WHITELIST
+_oapi = gs.ANTHROPIC_API_KEY
+gs.ANTHROPIC_API_KEY = "sk-ant-test"
+gs.TARGET_COLLECTION = friendly
+
+# Симуляция должна проходить даже без кошелька и банка.
+gs.DRY_RUN = True
+check("режим симуляции не требует кошелька и банка",
+      gs.preflight_checks(require_ai=True) is True)
+
+# Живой режим при нереализованном исполнителе обязан быть заблокирован —
+# даже если пользователь выставил всё остальное правильно.
+gs.DRY_RUN = False
+gs.CONFIRM_LIVE_TRADING = "I_UNDERSTAND_THE_RISK"
+gs.BANKROLL_TON = Decimal("100")
+gs.COLLECTION_WHITELIST = [friendly]
+gs.WALLET_KEY_FILE = key_path
+check("живой режим заблокирован без реального исполнителя",
+      gs.preflight_checks(require_ai=True) is False)
+
+# И даже с исполнителем — без явного подтверждения риска.
+gs.REAL_EXECUTOR_AVAILABLE = True
+gs.CONFIRM_LIVE_TRADING = ""
+check("живой режим заблокирован без подтверждения риска",
+      gs.preflight_checks(require_ai=True) is False)
+
+gs.CONFIRM_LIVE_TRADING = "I_UNDERSTAND_THE_RISK"
+gs.BANKROLL_TON = Decimal("0")
+check("живой режим заблокирован без заданного банка",
+      gs.preflight_checks(require_ai=True) is False)
+
+gs.BANKROLL_TON = Decimal("100")
+gs.COLLECTION_WHITELIST = []
+check("живой режим заблокирован с пустым whitelist",
+      gs.preflight_checks(require_ai=True) is False)
+
+# Самое важное: покупка НИКОГДА не рапортует успех, не совершив сделку.
+gs.REAL_EXECUTOR_AVAILABLE = False
+gs.DRY_RUN = False
+check("нереализованная покупка возвращает False, а не ложный успех",
+      gs.execute_blockchain_buy("0:x", Decimal("1")) is False)
+gs.DRY_RUN = True
+check("в симуляции покупка возвращает True",
+      gs.execute_blockchain_buy("0:x", Decimal("1")) is True)
+
+(gs.DRY_RUN, gs.CONFIRM_LIVE_TRADING, gs.REAL_EXECUTOR_AVAILABLE) = (_odry, _oconf, _oexec)
+(gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.COLLECTION_WHITELIST) = (_okey, _obank, _owl)
+gs.ANTHROPIC_API_KEY = _oapi
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
