@@ -30,6 +30,18 @@ set FLOOR_SAMPLE_PAGES=15
 set POLL_INTERVAL_SEC=120
 set DRY_RUN=1
 
+REM --- Sutochnyy byudzhet zaprosov k TonAPI ---
+REM Klyuch snimaet ogranichenie po CHASTOTE, no NE sutochnoe. 75 zaprosov
+REM kazhdye 120s = 54 000 v sutki, i kvota sgoraet k obedu (progon 18.09.2026).
+REM Bot sam rastyagivaet interval tak, chtoby ostatka hvatilo do polunochi UTC.
+REM Znachenie po umolchaniyu uzhe 10000 - stroka nizhe nuzhna tolko chtoby
+REM postavit drugoe. 0 = vyklyuchit ogranichenie.
+REM
+REM NE umenshayte FLOOR_SAMPLE_PAGES radi ekonomii kvoty: vyborka na sale-lotah
+REM padaet proporcionalno stranicam, a pri vyborke menshe MIN_FLOOR_SAMPLE (40)
+REM torgovlya propuskaetsya voobshche. Luchshe redkiy shag, chem sleploy floor.
+set TONAPI_DAILY_BUDGET=10000
+
 REM --- Komissii ---
 REM 2%% - stavka Getgems imenno dlya Telegram-podarkov (ih spravka).
 REM Obshchaya stavka 5%%, no k podarkam ona ne otnositsya.

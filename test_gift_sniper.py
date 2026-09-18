@@ -1885,6 +1885,78 @@ finally:
 
 
 # =============================================================================
+print("\n[36] Расход бюджета переживает перезапуск")
+# =============================================================================
+
+from datetime import datetime, timezone, timedelta
+
+# Квота живёт на стороне TonAPI, а счётчик — в памяти процесса. Бот,
+# перезапущенный в обед, без сохранения считает бюджет нетронутым, разгоняется
+# до POLL_INTERVAL_SEC и добивает остаток квоты — ровно та слепота, ради
+# которой бюджет и вводился. Правило файла: лимит, обнуляющийся при рестарте,
+# — не лимит.
+
+_ob36 = (gs.DB_PATH, gs._tonapi_used_today, gs._tonapi_budget_day,
+         gs.TONAPI_DAILY_BUDGET)
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "budget.db")
+    gs.TONAPI_DAILY_BUDGET = 10000
+    gs.db_init()
+
+    _today = datetime.now(timezone.utc).date()
+    gs._tonapi_budget_day, gs._tonapi_used_today = _today, 4321
+    gs.budget_flush()
+
+    # «Перезапуск»: память обнулили, из БД расход обязан вернуться.
+    gs._tonapi_used_today, gs._tonapi_budget_day = 0, None
+    gs.budget_restore()
+    check("расход суток восстанавливается после перезапуска",
+          gs._tonapi_used_today == 4321, str(gs._tonapi_used_today))
+
+    # Вчерашний расход к сегодняшнему бюджету отношения не имеет: квота
+    # сбрасывается в полночь UTC. Подставить его = зря замедлить бота на сутки.
+    with gs.db_connect() as _c:
+        _c.execute("DELETE FROM api_budget")
+        _c.execute("INSERT INTO api_budget (day, used) VALUES (?, ?)",
+                   ((_today - timedelta(days=1)).isoformat(), 9999))
+    gs._tonapi_used_today, gs._tonapi_budget_day = 0, None
+    gs.budget_restore()
+    check("вчерашний расход НЕ переносится на сегодня",
+          gs._tonapi_used_today == 0, str(gs._tonapi_used_today))
+
+    # Пустая БД (первый запуск) — не ошибка и не «бюджет потрачен».
+    with gs.db_connect() as _c:
+        _c.execute("DELETE FROM api_budget")
+    gs._tonapi_used_today, gs._tonapi_budget_day = 0, None
+    gs.budget_restore()
+    check("первый запуск начинает сутки с нуля", gs._tonapi_used_today == 0)
+
+    # Счётчик сам сбрасывается на диск, а не только в конце цикла: иначе
+    # падение посреди цикла теряет весь его расход.
+    gs._tonapi_budget_day = _today
+    gs._tonapi_used_today = gs._BUDGET_FLUSH_EVERY - 1
+    gs._count_tonapi_request()
+    with gs.db_connect() as _c:
+        _row = _c.execute("SELECT used FROM api_budget WHERE day = ?",
+                          (_today.isoformat(),)).fetchone()
+    check("счётчик сбрасывается на диск сам, без конца цикла",
+          _row is not None and _row["used"] == gs._BUDGET_FLUSH_EVERY,
+          str(_row["used"]) if _row else "нет записи")
+
+    # Сбой записи не роняет наблюдение: данные рынка важнее учёта запросов.
+    gs.DB_PATH = os.path.join(_tmpdir, "нет-такой-папки", "budget.db")
+    try:
+        gs.budget_flush()
+        _survived = True
+    except Exception:
+        _survived = False
+    check("недоступная БД не роняет бота на сохранении счётчика", _survived)
+finally:
+    (gs.DB_PATH, gs._tonapi_used_today, gs._tonapi_budget_day,
+     gs.TONAPI_DAILY_BUDGET) = _ob36
+
+
+# =============================================================================
 print("\n[30] Ставка комиссии площадки")
 # =============================================================================
 

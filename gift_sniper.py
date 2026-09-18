@@ -544,6 +544,13 @@ _tonapi_budget_day = None
 _tonapi_quota_until = 0.0
 
 
+# Как часто счётчик сбрасывается на диск. Писать при КАЖДОМ запросе — лишние
+# 10 000 транзакций SQLite в сутки; терять при падении больше одного цикла —
+# значит снова начать день с завышенным остатком бюджета.
+_BUDGET_FLUSH_EVERY = 25
+_budget_db_broken = False
+
+
 def _count_tonapi_request():
     """Счётчик запросов за сутки UTC. Обнуляется вместе с квотой — в полночь."""
     global _tonapi_used_today, _tonapi_budget_day
@@ -551,6 +558,62 @@ def _count_tonapi_request():
     if _tonapi_budget_day != today:
         _tonapi_budget_day, _tonapi_used_today = today, 0
     _tonapi_used_today += 1
+    if _tonapi_used_today % _BUDGET_FLUSH_EVERY == 0:
+        budget_flush()
+
+
+def budget_flush():
+    """
+    Сохраняет счётчик суток в БД.
+
+    Зачем вообще: расход квоты живёт в памяти процесса, а квота — на стороне
+    TonAPI. Бот, перезапущенный в обед, без этого считает бюджет нетронутым
+    и разгоняется до POLL_INTERVAL_SEC, хотя у сервера осталась половина. То
+    есть ровно тот случай, ради которого в этом файле вообще есть SQLite:
+    лимит, обнуляющийся при рестарте, — не лимит.
+
+    Сбой записи не роняет бота (наблюдение важнее учёта), но и не молчит.
+    """
+    global _budget_db_broken
+    if _tonapi_budget_day is None:
+        return
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO api_budget (day, used) VALUES (?, ?) "
+                "ON CONFLICT(day) DO UPDATE SET used=excluded.used",
+                (_tonapi_budget_day.isoformat(), _tonapi_used_today))
+        _budget_db_broken = False
+    except Exception as e:                      # noqa: BLE001 — учёт не критичен
+        if not _budget_db_broken:
+            _budget_db_broken = True
+            log.warning(f"Не удалось сохранить счётчик бюджета TonAPI ({e}). "
+                        f"После перезапуска расход будет занижен.")
+
+
+def budget_restore():
+    """
+    Поднимает расход текущих суток из БД. Вызывать один раз при старте.
+
+    Запись за ПРОШЛЫЕ сутки не берётся: квота сбрасывается в полночь UTC,
+    и вчерашний расход к сегодняшнему бюджету отношения не имеет.
+    """
+    global _tonapi_used_today, _tonapi_budget_day
+    today = datetime.now(timezone.utc).date()
+    try:
+        with db_connect() as conn:
+            row = conn.execute("SELECT used FROM api_budget WHERE day = ?",
+                               (today.isoformat(),)).fetchone()
+    except Exception as e:                      # noqa: BLE001
+        log.warning(f"Не удалось прочитать счётчик бюджета TonAPI ({e}).")
+        return
+    if row is None:
+        return
+    _tonapi_budget_day, _tonapi_used_today = today, int(row["used"])
+    if _tonapi_used_today:
+        log.info(f"{_Color.GREY}Бюджет TonAPI: с полуночи UTC уже потрачено "
+                 f"{_tonapi_used_today}/{TONAPI_DAILY_BUDGET} "
+                 f"(из прошлого запуска).{_Color.RESET}")
 
 
 def budget_paced_interval(collections: int) -> float:
@@ -1395,6 +1458,13 @@ def db_init():
                 sell_price_ton    TEXT,
                 sell_ts           REAL,
                 pnl_ton           TEXT
+            )
+        """)
+        # Расход суточной квоты TonAPI переживает перезапуск: см. budget_flush().
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS api_budget (
+                day   TEXT PRIMARY KEY,   -- дата UTC в ISO; квота сбрасывается в полночь
+                used  INTEGER NOT NULL
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_buy_ts ON positions(buy_ts)")
@@ -3099,6 +3169,7 @@ def main(record: bool = False, trade: bool = True):
         sys.exit("[FATAL] Исправьте настройки выше и перезапустите.")
 
     db_init()
+    budget_restore()   # расход квоты с полуночи UTC, пережитый перезапуском
     notify_startup(TARGET_COLLECTIONS)
 
     # Клиент Claude нужен только для торговли.
@@ -3132,6 +3203,7 @@ def main(record: bool = False, trade: bool = True):
         # до полуночи UTC. Сожжённая к обеду квота = дырявая запись рынка, а
         # дыра обесценивает сделки в бэктесте сильнее, чем редкий шаг.
         elapsed = time.monotonic() - started
+        budget_flush()
         interval = budget_paced_interval(len(TARGET_COLLECTIONS))
         if interval > POLL_INTERVAL_SEC * 1.05:
             log.info(f"{_Color.YELLOW}Бюджет TonAPI: потрачено "
