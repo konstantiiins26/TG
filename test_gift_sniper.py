@@ -68,7 +68,7 @@ _PINNED = {
     "BACKTEST_MAX_SLACK_HOURS": Decimal("6"),
     # сеть и режимы
     "TONAPI_MIN_INTERVAL": Decimal("1.1"), "TONAPI_MAX_RETRIES": 3,
-    "PURCHASE_GAS_TON": Decimal("0.1"), "TRADING_NETWORK": "testnet",
+    "PURCHASE_GAS_TON": Decimal("0.3"), "TRADING_NETWORK": "testnet",
     "ALLOWED_MARKETS": ["Getgems Sales"],
     "DRY_RUN": True, "CONFIRM_LIVE_TRADING": "", "COLLECTION_WHITELIST": [],
     "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "", "HEARTBEAT_MIN": 60,
@@ -1926,6 +1926,13 @@ try:
     check("газ на исполнение контракта задан отдельно от экономики",
           gs.PURCHASE_GAS_TON > 0 and gs.PURCHASE_GAS_TON != gs.GAS_FEE_TON,
           f"{gs.PURCHASE_GAS_TON} / {gs.GAS_FEE_TON}")
+
+    # 0.3 — столько прикладывает сам интерфейс Getgems (диалог покупки,
+    # 18.09.2026). Недостача газа роняет транзакцию, а излишек возвращается,
+    # поэтому опускать это значение нельзя.
+    check("газ на покупку не ниже того, что прикладывает Getgems",
+          Decimal(source_default("PURCHASE_GAS_TON")) >= Decimal("0.3"),
+          source_default("PURCHASE_GAS_TON"))
 finally:
     gs.DRY_RUN = _odry2
     gs.REAL_EXECUTOR_AVAILABLE = _oexec2
