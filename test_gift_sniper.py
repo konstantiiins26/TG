@@ -933,6 +933,7 @@ class _FakeResponse:
         self._payload = payload
         self.status_code = status_code
         self.headers = {}
+        self.text = ""
 
     def raise_for_status(self):
         return None
@@ -1030,8 +1031,9 @@ class _SeqRequests:
 
 
 class _TooManyRequests(_FakeResponse):
-    def __init__(self, retry_after=None):
+    def __init__(self, retry_after=None, text="rate limit: too many requests"):
         super().__init__({}, status_code=429)
+        self.text = text
         if retry_after is not None:
             self.headers = {"Retry-After": str(retry_after)}
 
@@ -1058,10 +1060,14 @@ try:
     gs.requests = seq
     try:
         gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
-        raised = False
-    except RuntimeError:
-        raised = True
+        raised = _msg = False
+    except gs.RateLimited as e:
+        raised, _msg = True, str(e)
     check("непрерывный 429 в итоге бросает исключение, а не молчит", raised)
+    # Сообщение обязано называть лечение: без ключа квота анонимного доступа
+    # так мала, что «подождать» не помогает — нужен TONAPI_KEY.
+    check("в сообщении названо лечение (ключ TonAPI)",
+          _msg and "TONAPI_KEY" in _msg and "tonconsole" in _msg, str(_msg))
     check("попыток ровно TONAPI_MAX_RETRIES", seq.calls == 3, f"calls={seq.calls}")
 
     # Пауза между запросами реально выдерживается.
@@ -1640,6 +1646,115 @@ with open(_old, "w", encoding="utf-8") as f:
                         "floor_reliable": True, "candidates": []}) + "\n")
 check("запись без данных о площадках распознаётся",
       gs.market_report(_old) is None)
+
+
+# =============================================================================
+print("\n[32] Лимит квоты прекращает обход страниц, а не грызёт их дальше")
+# =============================================================================
+
+# Живой прогон 17.09.2026: 429 на ПЕРВОЙ же странице, все три попытки. Это не
+# темп запросов, а исчерпанная квота анонимного доступа. Продолжать обход
+# оставшихся 14 страниц бессмысленно — при пяти коллекциях это 70 заведомо
+# мусорных запросов за цикл, которые только углубляют блокировку.
+
+class _AlwaysLimited:
+    def __init__(self):
+        self.calls = 0
+
+    def get(self, *a, **k):
+        self.calls += 1
+        return _TooManyRequests(retry_after=0)
+
+
+_oreq32 = gs.requests
+_oint32 = gs.TONAPI_MIN_INTERVAL
+_opages = gs.FLOOR_SAMPLE_PAGES
+gs.TONAPI_MIN_INTERVAL = Decimal("0")
+gs.FLOOR_SAMPLE_PAGES = 15
+try:
+    _lim = _AlwaysLimited()
+    gs.requests = _lim
+    _items, _source = gs._collect_sample("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF")
+
+    # 3 попытки на первую страницу + 1 запрос к Getgems-фолбэку = 4.
+    # Если бы обход продолжался, было бы 15 x 3 = 45 запросов.
+    check("после лимита остальные страницы НЕ запрашиваются",
+          _lim.calls <= 4, f"запросов={_lim.calls}")
+    check("выборка пуста, а не наполовину собрана", _items == [])
+    check("источник помечен как недоступный", _source == "none", _source)
+finally:
+    gs.requests = _oreq32
+    gs.TONAPI_MIN_INTERVAL = _oint32
+    gs.FLOOR_SAMPLE_PAGES = _opages
+
+
+# =============================================================================
+print("\n[33] Суточная квота: ждать надо часы, а не секунды")
+# =============================================================================
+
+# Дословный ответ TonAPI, снятый пользователем в браузере 17.09.2026:
+#   {"error":"rate limit: anonymous tier daily traffic is spent,
+#             resets at UTC midnight"}
+# Это НЕ «слишком часто» — это «на сегодня всё». Ретраить бессмысленно, а
+# продолжать слать запросы до полуночи UTC — жечь исчерпанный лимит и
+# засорять лог.
+_DAILY_BODY = ('{"error":"rate limit: anonymous tier daily traffic is spent, '
+               'resets at UTC midnight"}')
+
+_oreq33, _oint33 = gs.requests, gs.TONAPI_MIN_INTERVAL
+_oquota = gs._tonapi_quota_until
+gs.TONAPI_MIN_INTERVAL = Decimal("0")
+gs._tonapi_quota_until = 0.0
+try:
+    _daily = _SeqRequests([_TooManyRequests(retry_after=0, text=_DAILY_BODY)])
+    gs.requests = _daily
+    try:
+        gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+        _raised, _why = False, ""
+    except gs.RateLimited as e:
+        _raised, _why = True, str(e)
+
+    check("суточная квота распознана", _raised, _why)
+    check("на суточную квоту НЕ тратятся ретраи",
+          _daily.calls == 1, f"запросов={_daily.calls}")
+    check("в сообщении назван срок сброса",
+          "полночь UTC" in _why, _why)
+    check("в сообщении названо лечение",
+          "TONAPI_KEY" in _why, _why)
+
+    # Метка выставлена — следующий запрос не должен даже уйти в сеть.
+    check("после суточной квоты запросы не уходят вовсе",
+          gs._tonapi_quota_until > time.time())
+    _after = _SeqRequests([_FakeResponse(REAL_SALE_RESPONSE)])
+    gs.requests = _after
+    try:
+        gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+        _blocked = False
+    except gs.RateLimited:
+        _blocked = True
+    check("запрос до сброса квоты даже не отправляется",
+          _blocked and _after.calls == 0, f"запросов={_after.calls}")
+
+    # Сброс квоты возвращает бота к работе сам, без перезапуска.
+    gs._tonapi_quota_until = 0.0
+    gs.requests = _SeqRequests([_FakeResponse(REAL_SALE_RESPONSE)])
+    check("после сброса квоты работа возобновляется",
+          len(gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)) == 4)
+
+    # Обычный 429 («слишком часто») ретраится как раньше — путать нельзя.
+    gs._tonapi_quota_until = 0.0
+    _burst = _SeqRequests([_TooManyRequests(retry_after=0),
+                           _FakeResponse(REAL_SALE_RESPONSE)])
+    gs.requests = _burst
+    check("обычный 429 по-прежнему ретраится",
+          len(gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)) == 4
+          and _burst.calls == 2, f"запросов={_burst.calls}")
+    check("обычный 429 НЕ выставляет суточную метку",
+          gs._tonapi_quota_until == 0.0)
+finally:
+    gs.requests = _oreq33
+    gs.TONAPI_MIN_INTERVAL = _oint33
+    gs._tonapi_quota_until = _oquota
 
 
 # =============================================================================

@@ -11,6 +11,18 @@ REM --- Kollekcii cherez zapyatuyu, bez probelov ---
 set TARGET_COLLECTIONS=EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7,EQDc08YxzZWtlKAohSybNc3kXAkAPPtHch-jY_E6KMQ3b1mn,EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG,EQD1YFp12AGEgX6C3uiWh751EcRxPZo6GtBmHziY29jcbQzS,EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs
 set COLLECTION_WHITELIST=%TARGET_COLLECTIONS%
 
+REM =====================================================================
+REM  KLYUCH TONAPI - vpishite ego srazu posle znaka = v stroke nizhe.
+REM  Bez klyucha u anonimnogo dostupa SUTOCHNAYA kvota, i ona
+REM  konchaetsya za neskolko ciklov. Server otvechaet:
+REM  "anonymous tier daily traffic is spent, resets at UTC midnight".
+REM  Klyuch besplatnyy: tonconsole.com -> vhod cherez Telegram ->
+REM  sozdat proekt -> razdel TonAPI -> skopirovat API key.
+REM  Bez probelov i bez kavychek. Primer:
+REM      set TONAPI_KEY=AE7YD3K...dlinnaya_stroka...9XQ
+REM =====================================================================
+set TONAPI_KEY=AGXEDCFLFVJEXQQAAAAHD3LV6TY27UF2KI5NCRETSKOCL4YSAZKLMQ2QL7NN2TV3MX3VPWQ
+
 REM 5 kollekciy x 15 stranic = 75 zaprosov. Pauza 1.1s mezhdu nimi
 REM zadana v kode, znachit odin cikl zanimaet ~83 sekundy.
 REM Interval 60s byl by KOROCHE cikla - cikly nalezali by drug na druga.

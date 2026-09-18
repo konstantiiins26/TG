@@ -89,6 +89,11 @@ except ImportError:
 
 # --- Ключи / секреты ---------------------------------------------------------
 ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY", "")          # ключ Claude API (обязателен)
+# Живой прогон 17.09.2026 показал: без ключа квота настолько мала, что 429
+# прилетает на ПЕРВОЙ странице и переживает все ретраи. Пауза между
+# запросами от этого не спасает — это квота, а не темп. Ключ бесплатный
+# (tonconsole.com) и снимает проблему; без него держите одну-две коллекции
+# и FLOOR_SAMPLE_PAGES не больше 3-5.
 TONAPI_KEY          = os.getenv("TONAPI_KEY", "")                 # ключ TonAPI.io (опционален, но желателен)
 WALLET_PRIVATE_KEY  = os.getenv("WALLET_PRIVATE_KEY", "")         # приватный ключ кошелька — используется ТОЛЬКО заглушкой
 
@@ -484,7 +489,26 @@ def _nano_to_ton(nano_value) -> Decimal:
         return Decimal("0")
 
 
+class RateLimited(Exception):
+    """
+    Лимит TonAPI исчерпан. Отдельный тип, потому что реакция на него
+    принципиально иная, чем на обычный сбой: сбой одной страницы разумно
+    пережить и работать с остальными, а упёршись в лимит — бессмысленно
+    долбить оставшиеся 14 страниц, это только углубляет блокировку.
+    """
+
+
 _tonapi_last_call = 0.0
+# Момент, до которого TonAPI заведомо откажет: суточная квота анонимного
+# доступа исчерпана. Сервер сам называет срок — «resets at UTC midnight».
+_tonapi_quota_until = 0.0
+
+
+def _next_utc_midnight() -> float:
+    """Ближайшая полночь UTC как unix-время: когда сбрасывается суточная квота."""
+    now = datetime.now(timezone.utc)
+    tomorrow = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return tomorrow.timestamp() + 86400
 
 
 def _tonapi_get(url: str, params: dict, headers: dict) -> dict:
@@ -500,8 +524,16 @@ def _tonapi_get(url: str, params: dict, headers: dict) -> dict:
     тонкой выборке систематически ЗАВЫШАЕТСЯ (P5 вырождается в min()), то есть
     ошибается в сторону «покупай».
     """
-    global _tonapi_last_call
+    global _tonapi_last_call, _tonapi_quota_until
     delay = float(TONAPI_MIN_INTERVAL)
+
+    # Суточная квота исчерпана — запрос гарантированно отклонят. Отправлять
+    # его значило бы жечь и без того исчерпанный лимит и засорять лог.
+    if time.time() < _tonapi_quota_until:
+        left = (_tonapi_quota_until - time.time()) / 3600
+        raise RateLimited(
+            f"суточная квота TonAPI исчерпана, сброс через {left:.1f}ч "
+            f"(полночь UTC). Лечение — бесплатный TONAPI_KEY на tonconsole.com")
 
     for attempt in range(TONAPI_MAX_RETRIES):
         waited = time.monotonic() - _tonapi_last_call
@@ -512,8 +544,22 @@ def _tonapi_get(url: str, params: dict, headers: dict) -> dict:
         resp = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT_SEC)
 
         if resp.status_code == 429:
+            # Суточная квота — это не «слишком часто», а «на сегодня всё».
+            # Ретраить её бессмысленно: ждать надо часы, а не секунды.
+            body = (resp.text or "")[:300]
+            if "daily" in body.lower() or "traffic is spent" in body.lower():
+                _tonapi_quota_until = _next_utc_midnight()
+                left = (_tonapi_quota_until - time.time()) / 3600
+                raise RateLimited(
+                    f"суточная квота анонимного доступа TonAPI исчерпана "
+                    f"(сброс через {left:.1f}ч, в полночь UTC). Ретраи не "
+                    f"помогут. Лечение — бесплатный TONAPI_KEY на tonconsole.com")
+
             if attempt == TONAPI_MAX_RETRIES - 1:
-                resp.raise_for_status()
+                raise RateLimited(
+                    f"TonAPI отклоняет запросы (429) после {TONAPI_MAX_RETRIES} "
+                    f"попыток. Без ключа квота очень мала: получите бесплатный "
+                    f"TONAPI_KEY на tonconsole.com")
             # Retry-After, если сервер его прислал; иначе удваиваем паузу.
             retry_after = resp.headers.get("Retry-After")
             try:
@@ -1076,6 +1122,14 @@ def _collect_sample(collection: str):
     for page in range(FLOOR_SAMPLE_PAGES):
         try:
             batch = fetch_items_tonapi(collection, FLOOR_PAGE_SIZE, offset=page * FLOOR_PAGE_SIZE)
+        except RateLimited as e:
+            # Упёрлись в квоту: оставшиеся страницы запрашивать бессмысленно.
+            # Каждая новая попытка только углубляет блокировку, а при пяти
+            # коллекциях это 70 заведомо мусорных запросов за цикл.
+            log.error(f"{_Color.RED}Лимит TonAPI на странице "
+                      f"{page + 1}/{FLOOR_SAMPLE_PAGES}. Остальные страницы "
+                      f"пропускаю. {e}{_Color.RESET}")
+            break
         except Exception as e:  # noqa: BLE001 — страница могла не прийти, это не фатально
             failures += 1
             log.warning(f"TonAPI: страница {page + 1}/{FLOOR_SAMPLE_PAGES} не получена ({e}).")
