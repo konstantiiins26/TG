@@ -68,6 +68,7 @@ _PINNED = {
     "BACKTEST_MAX_SLACK_HOURS": Decimal("6"),
     # сеть и режимы
     "TONAPI_MIN_INTERVAL": Decimal("1.1"), "TONAPI_MAX_RETRIES": 3,
+    "TONAPI_DAILY_BUDGET": 10000, "POLL_INTERVAL_SEC": 12,
     "PURCHASE_GAS_TON": Decimal("0.3"), "TRADING_NETWORK": "testnet",
     "ALLOWED_MARKETS": ["Getgems Sales"],
     "DRY_RUN": True, "CONFIRM_LIVE_TRADING": "", "COLLECTION_WHITELIST": [],
@@ -1812,6 +1813,75 @@ try:
           gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale", "Что угодно") is True)
 finally:
     gs.DRY_RUN, gs.REAL_EXECUTOR_AVAILABLE, gs.ALLOWED_MARKETS = _odry34, _oexec34, _omk
+
+
+# =============================================================================
+print("\n[35] Суточный бюджет запросов растягивает интервал")
+# =============================================================================
+
+# 5 коллекций x 15 страниц каждые 120с = 54 000 запросов в сутки. Живой прогон
+# 18.09.2026 сжёг квоту даже С КЛЮЧОМ и ушёл в слепоту до полуночи. Дыра в
+# записи хуже редкого шага: она обесценивает сделки в бэктесте, а редкий шаг
+# всего лишь огрубляет наблюдение.
+
+_ob35 = (gs.TONAPI_DAILY_BUDGET, gs.POLL_INTERVAL_SEC, gs.FLOOR_SAMPLE_PAGES,
+         gs._tonapi_used_today, gs._tonapi_budget_day)
+try:
+    gs.POLL_INTERVAL_SEC = 120
+    gs.FLOOR_SAMPLE_PAGES = 15
+    gs.TONAPI_DAILY_BUDGET = 10000
+    gs._tonapi_used_today = 0
+
+    # Результат зависит от того, сколько осталось до полуночи UTC, поэтому
+    # момент фиксируем. Иначе тест проходил бы утром и падал вечером — а
+    # тест, зависящий от часа запуска, ничего не проверяет.
+    _real_midnight = gs._next_utc_midnight
+    SECONDS_LEFT = 12 * 3600          # ровно полсуток до сброса квоты
+    gs._next_utc_midnight = lambda: time.time() + SECONDS_LEFT
+    try:
+        iv = gs.budget_paced_interval(5)
+        check("при большой нагрузке интервал растягивается",
+              iv > gs.POLL_INTERVAL_SEC, f"{iv:.0f}с при пороге {gs.POLL_INTERVAL_SEC}")
+
+        # Бюджета должно хватить ровно до полуночи, не меньше и не сильно больше.
+        cycles = SECONDS_LEFT / iv
+        check("запросов при таком интервале не больше бюджета",
+              cycles * 5 * 15 <= gs.TONAPI_DAILY_BUDGET * 1.01,
+              f"{cycles*75:.0f} против {gs.TONAPI_DAILY_BUDGET}")
+
+        # Уже потраченное учитывается: остаток бюджета меньше — интервал больше.
+        gs._tonapi_used_today = 9000
+        check("потраченный бюджет удлиняет интервал",
+              gs.budget_paced_interval(5) > iv,
+              f"{gs.budget_paced_interval(5):.0f} против {iv:.0f}")
+        gs._tonapi_used_today = 0
+    finally:
+        gs._next_utc_midnight = _real_midnight
+
+    # Механизм умеет только ЗАМЕДЛЯТЬ: разгонять бота он не должен.
+    gs.FLOOR_SAMPLE_PAGES = 1
+    check("при малой нагрузке интервал НЕ становится меньше заданного",
+          gs.budget_paced_interval(1) == gs.POLL_INTERVAL_SEC,
+          str(gs.budget_paced_interval(1)))
+
+    # Нулевой бюджет = ограничение выключено.
+    gs.TONAPI_DAILY_BUDGET = 0
+    gs.FLOOR_SAMPLE_PAGES = 15
+    check("нулевой бюджет отключает растягивание",
+          gs.budget_paced_interval(5) == gs.POLL_INTERVAL_SEC)
+
+    # Счётчик привязан к суткам UTC и обнуляется вместе с квотой.
+    gs.TONAPI_DAILY_BUDGET = 10000
+    gs._tonapi_used_today = 0
+    gs._tonapi_budget_day = None
+    gs._count_tonapi_request()
+    check("запросы считаются", gs._tonapi_used_today == 1)
+    gs._tonapi_budget_day = None            # имитируем наступление новых суток
+    gs._count_tonapi_request()
+    check("в новые сутки счётчик обнуляется", gs._tonapi_used_today == 1)
+finally:
+    (gs.TONAPI_DAILY_BUDGET, gs.POLL_INTERVAL_SEC, gs.FLOOR_SAMPLE_PAGES,
+     gs._tonapi_used_today, gs._tonapi_budget_day) = _ob35
 
 
 # =============================================================================

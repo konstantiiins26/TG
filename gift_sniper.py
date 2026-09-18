@@ -182,6 +182,16 @@ FLOOR_CACHE_TTL_SEC = int(os.getenv("FLOOR_CACHE_TTL_SEC", "60"))         # кэ
 # страница молча прореживает выборку, а floor по тонкой выборке завышается.
 TONAPI_MIN_INTERVAL = Decimal(os.getenv("TONAPI_MIN_INTERVAL", "1.1"))    # секунд между запросами к TonAPI
 TONAPI_MAX_RETRIES  = int(os.getenv("TONAPI_MAX_RETRIES", "3"))           # попыток на страницу при 429
+
+# СУТОЧНЫЙ БЮДЖЕТ ЗАПРОСОВ. Квота у TonAPI дневная, и её легко сжечь за часы:
+# 5 коллекций x 15 страниц каждые 120 секунд — это 54 000 запросов в сутки.
+# Сожжённый к обеду лимит означает, что до полуночи UTC бот слеп, а запись
+# рынка — дырявая; дыра же обесценивает сделки в бэктесте.
+#
+# Поэтому бот САМ растягивает интервал так, чтобы бюджета хватило ровно до
+# полуночи. Редкие снапшоты хуже частых, но сплошная запись с редким шагом
+# несравнимо полезнее густой записи с 18-часовым провалом.
+TONAPI_DAILY_BUDGET = int(os.getenv("TONAPI_DAILY_BUDGET", "10000"))      # 0 = не ограничивать
 CANDIDATES_TO_ANALYZE = int(os.getenv("CANDIDATES_TO_ANALYZE", "5"))      # сколько самых дешёвых лотов отдавать ИИ
 
 # --- Верификация коллекции (защита от скам-коллекций) -----------------------
@@ -526,9 +536,45 @@ class RateLimited(Exception):
 
 
 _tonapi_last_call = 0.0
+# Сколько запросов к TonAPI сделано за текущие сутки UTC и за какие именно.
+_tonapi_used_today = 0
+_tonapi_budget_day = None
 # Момент, до которого TonAPI заведомо откажет: суточная квота анонимного
 # доступа исчерпана. Сервер сам называет срок — «resets at UTC midnight».
 _tonapi_quota_until = 0.0
+
+
+def _count_tonapi_request():
+    """Счётчик запросов за сутки UTC. Обнуляется вместе с квотой — в полночь."""
+    global _tonapi_used_today, _tonapi_budget_day
+    today = datetime.now(timezone.utc).date()
+    if _tonapi_budget_day != today:
+        _tonapi_budget_day, _tonapi_used_today = today, 0
+    _tonapi_used_today += 1
+
+
+def budget_paced_interval(collections: int) -> float:
+    """
+    Интервал цикла, при котором суточного бюджета хватит ДО ПОЛУНОЧИ UTC.
+
+    Возвращает max(POLL_INTERVAL_SEC, нужный интервал): ускорять бот этот
+    механизм не может, только замедлять.
+
+    Зачем считать, а не ставить фиксированный интервал: число коллекций и
+    глубина выборки меняются, и «правильный» интервал вместе с ними. Цифра,
+    подобранная руками под 5 коллекций, станет неверной на седьмой.
+    """
+    if TONAPI_DAILY_BUDGET <= 0:
+        return POLL_INTERVAL_SEC
+
+    per_cycle = max(1, collections * FLOOR_SAMPLE_PAGES)
+    left = TONAPI_DAILY_BUDGET - _tonapi_used_today
+    if left <= 0:
+        return POLL_INTERVAL_SEC          # бюджет исчерпан; квота сама остановит
+
+    seconds_left = max(60.0, _next_utc_midnight() - time.time())
+    cycles_affordable = left / per_cycle
+    return max(POLL_INTERVAL_SEC, seconds_left / max(cycles_affordable, 1e-9))
 
 
 def _next_utc_midnight() -> float:
@@ -568,6 +614,7 @@ def _tonapi_get(url: str, params: dict, headers: dict) -> dict:
             time.sleep(delay - waited)
 
         _tonapi_last_call = time.monotonic()
+        _count_tonapi_request()
         resp = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT_SEC)
 
         if resp.status_code == 429:
@@ -3081,9 +3128,17 @@ def main(record: bool = False, trade: bool = True):
         if HEARTBEAT_MIN > 0:
             notify_heartbeat(snaps_this_cycle)
 
-        # Держим стабильный интервал (учитываем время работы итерации).
+        # Интервал растягивается так, чтобы суточного бюджета запросов хватило
+        # до полуночи UTC. Сожжённая к обеду квота = дырявая запись рынка, а
+        # дыра обесценивает сделки в бэктесте сильнее, чем редкий шаг.
         elapsed = time.monotonic() - started
-        sleep_for = max(0, POLL_INTERVAL_SEC - elapsed)
+        interval = budget_paced_interval(len(TARGET_COLLECTIONS))
+        if interval > POLL_INTERVAL_SEC * 1.05:
+            log.info(f"{_Color.YELLOW}Бюджет TonAPI: потрачено "
+                     f"{_tonapi_used_today}/{TONAPI_DAILY_BUDGET} за сутки. "
+                     f"Интервал растянут до {interval:.0f}с, чтобы хватило "
+                     f"до полуночи UTC.{_Color.RESET}")
+        sleep_for = max(0, interval - elapsed)
         log.info(f"{_Color.GREY}Итерация заняла {elapsed:.1f}s. Сплю {sleep_for:.1f}s...{_Color.RESET}")
         time.sleep(sleep_for)
 
