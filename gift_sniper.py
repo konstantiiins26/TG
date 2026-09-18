@@ -132,7 +132,15 @@ CLAUDE_MODEL        = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
 # подарком, поставьте 0.05 — иначе расчётная прибыль будет завышена на 3%
 # от цены продажи. И у других площадок (Marketapp) ставка своя, не проверена.
 MARKETPLACE_FEE_PCT = Decimal(os.getenv("MARKETPLACE_FEE_PCT", "0.02"))   # комиссия площадки (с цены ПРОДАЖИ)
-ROYALTY_PCT         = Decimal(os.getenv("ROYALTY_PCT", "0.05"))           # роялти создателю коллекции (с цены ПРОДАЖИ)
+# Creator Fee = 0 GRAM на карточках Getgems, проверено на ТРЁХ независимых
+# лотах из разных коллекций подарков (18.09.2026): Easter Egg, Valentine Box,
+# Jester Hat. Подарки минтит Fragment, роялти создателя у них нет.
+#
+# ИСКЛЮЧЕНИЕ, замеченное там же: лот Bunny Muffin на ДРУГОЙ площадке показал
+# Creator Fee 0.45 GRAM при комиссии площадки 0. То есть на не-Getgems
+# площадках разбивка иная. Для таких лотов ноль занижает издержки — см.
+# ALLOWED_MARKETS, покупка на непроверенных площадках запрещена отдельно.
+ROYALTY_PCT         = Decimal(os.getenv("ROYALTY_PCT", "0"))              # роялти создателю коллекции (с цены ПРОДАЖИ)
 UNDERCUT_PCT        = Decimal(os.getenv("UNDERCUT_PCT", "0.03"))          # насколько встаём НИЖЕ floor, чтобы реально продать
 GAS_FEE_TON         = Decimal(os.getenv("GAS_FEE_TON", "0.15"))           # газ за круг (покупка + продажа), TON
 MIN_ROI_PCT         = Decimal(os.getenv("MIN_ROI_PCT", "5"))              # ниже этого ROI бот не покупает
@@ -289,6 +297,18 @@ CONFIRM_LIVE_TRADING = os.getenv("CONFIRM_LIVE_TRADING", "")
 # Это ДРУГАЯ величина, чем GAS_FEE_TON: та — безвозвратная стоимость круга
 # в экономике сделки, эта — сколько приложить к платежу, чтобы он прошёл.
 PURCHASE_GAS_TON    = Decimal(os.getenv("PURCHASE_GAS_TON", "0.1"))
+
+# Площадки, чей протокол покупки мы понимаем. Платёж на контракт продажи
+# работает так, как мы рассчитываем, только у Getgems — это единственная
+# площадка, чью карточку и ответ API удалось сверить.
+#
+# Почему это не перестраховка: у лота Bunny Muffin (площадка "Other") адрес
+# контракта продажи СОВПАДАЛ с адресом самого предмета, а разбивка комиссий
+# была другой. Платить туда по нашей схеме — значит отправлять деньги по
+# протоколу, которого мы не проверяли. Потерять их так можно целиком.
+ALLOWED_MARKETS = [m.strip() for m in
+                   os.getenv("ALLOWED_MARKETS", "Getgems Sales").split(",")
+                   if m.strip()]
 
 # Флаг определяется УСПЕХОМ ИМПОРТА, а не константой. Иначе бот стартовал бы
 # нормально и упал бы в момент покупки — то есть узнал бы о проблеме тогда,
@@ -1862,7 +1882,8 @@ def _parse_ai_json(raw: str) -> dict:
 # 8. БЛОКЧЕЙН — ЗАГЛУШКА ПОКУПКИ (реальная подпись НЕ выполняется)
 # =============================================================================
 
-def execute_blockchain_buy(item_id: str, price, sale_address: str = "") -> bool:
+def execute_blockchain_buy(item_id: str, price, sale_address: str = "",
+                           sale_market: str = "") -> bool:
     """
     Покупка лота. Возвращает True только если сделка ДЕЙСТВИТЕЛЬНО совершена.
 
@@ -1886,6 +1907,17 @@ def execute_blockchain_buy(item_id: str, price, sale_address: str = "") -> bool:
     if not sale_address:
         log.error(f"{_Color.RED}Адрес контракта продажи неизвестен — платить "
                   f"некуда. Сделка НЕ совершена ({_short(item_id)}).{_Color.RESET}")
+        return False
+
+    # Протокол покупки проверен только у Getgems. У другой площадки контракт
+    # продажи может работать иначе — на одном наблюдённом лоте он вообще
+    # совпадал с адресом предмета. Платить по непроверенному протоколу
+    # значит рисковать всей суммой, а не её частью.
+    if ALLOWED_MARKETS and sale_market not in ALLOWED_MARKETS:
+        log.error(f"{_Color.RED}Площадка {sale_market or 'неизвестна'} не в списке "
+                  f"проверенных ({', '.join(ALLOWED_MARKETS)}). Протокол её "
+                  f"контракта продажи не сверялся — сделка НЕ совершена."
+                  f"{_Color.RESET}")
         return False
 
     if DRY_RUN:
@@ -2126,7 +2158,8 @@ def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
         return
 
     if execute_blockchain_buy(item["address"], buy_price,
-                             item.get("sale_address", "")):
+                             item.get("sale_address", ""),
+                             item.get("sale_market", "")):
         pos_id = record_purchase(item, buy_price, floor_price)
         log.info(f"Позиция #{pos_id} записана в {DB_PATH}")
         notify(f"✅ Куплено #{pos_id}\n{_short(item['address'])}\n"

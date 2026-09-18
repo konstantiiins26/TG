@@ -69,6 +69,7 @@ _PINNED = {
     # сеть и режимы
     "TONAPI_MIN_INTERVAL": Decimal("1.1"), "TONAPI_MAX_RETRIES": 3,
     "PURCHASE_GAS_TON": Decimal("0.1"), "TRADING_NETWORK": "testnet",
+    "ALLOWED_MARKETS": ["Getgems Sales"],
     "DRY_RUN": True, "CONFIRM_LIVE_TRADING": "", "COLLECTION_WHITELIST": [],
     "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "", "HEARTBEAT_MIN": 60,
 }
@@ -716,10 +717,10 @@ check("живой режим заблокирован с пустым whitelist"
 gs.REAL_EXECUTOR_AVAILABLE = False
 gs.DRY_RUN = False
 check("нереализованная покупка возвращает False, а не ложный успех",
-      gs.execute_blockchain_buy("0:x", Decimal("1"), "0:sale") is False)
+      gs.execute_blockchain_buy("0:x", Decimal("1"), "0:sale", "Getgems Sales") is False)
 gs.DRY_RUN = True
 check("в симуляции покупка возвращает True",
-      gs.execute_blockchain_buy("0:x", Decimal("1"), "0:sale") is True)
+      gs.execute_blockchain_buy("0:x", Decimal("1"), "0:sale", "Getgems Sales") is True)
 
 (gs.DRY_RUN, gs.CONFIRM_LIVE_TRADING, gs.REAL_EXECUTOR_AVAILABLE) = (_odry, _oconf, _oexec)
 (gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.COLLECTION_WHITELIST) = (_okey, _obank, _owl)
@@ -1004,7 +1005,8 @@ try:
     check("покупка без адреса продажи отклоняется даже в DRY_RUN",
           gs.execute_blockchain_buy("0:item", Decimal("1"), "") is False)
     check("покупка с адресом продажи в DRY_RUN проходит",
-          gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale") is True)
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale",
+                                    "Getgems Sales") is True)
 finally:
     gs.DRY_RUN = _odry
 
@@ -1755,6 +1757,61 @@ finally:
     gs.requests = _oreq33
     gs.TONAPI_MIN_INTERVAL = _oint33
     gs._tonapi_quota_until = _oquota
+
+
+# =============================================================================
+print("\n[34] Покупка только на проверенных площадках")
+# =============================================================================
+
+# Карточки Getgems, снятые 18.09.2026, дали два наблюдения:
+#   * Creator Fee = 0 GRAM на трёх лотах из разных коллекций подарков,
+#     комиссия площадки 0.11/5.5, 1.48/74 и 0.09/4.89 — везде ~2%;
+#   * лот на площадке "Other": Creator Fee 0.45 GRAM, комиссия площадки 0,
+#     и адрес контракта продажи СОВПАДАЛ с адресом самого предмета.
+# Второе означает, что у другой площадки другой протокол. Платить туда по
+# нашей схеме — отправлять деньги вслепую, и потерять можно всю сумму.
+
+check("роялти по умолчанию 0 (Creator Fee на карточках Getgems = 0)",
+      source_default("ROYALTY_PCT") == "0", source_default("ROYALTY_PCT"))
+check("по умолчанию разрешена только проверенная площадка",
+      source_default("ALLOWED_MARKETS") == "Getgems Sales",
+      source_default("ALLOWED_MARKETS"))
+
+_odry34, _oexec34, _omk = gs.DRY_RUN, gs.REAL_EXECUTOR_AVAILABLE, gs.ALLOWED_MARKETS
+try:
+    gs.DRY_RUN = True
+    gs.ALLOWED_MARKETS = ["Getgems Sales"]
+
+    check("покупка на проверенной площадке проходит",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale",
+                                    "Getgems Sales") is True)
+    check("покупка на непроверенной площадке отклоняется",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale",
+                                    "Marketapp Marketplace") is False)
+    check("пустая площадка тоже отклоняется",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale", "") is False)
+
+    # Проверка стоит ДО ветки DRY_RUN: симуляция, рапортующая успех там, где
+    # живая покупка ушла бы по непроверенному протоколу, врёт о готовности.
+    gs.DRY_RUN = False
+    gs.REAL_EXECUTOR_AVAILABLE = True
+    check("в живом режиме непроверенная площадка тоже отклоняется",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale", "Other") is False)
+
+    # Список расширяем осознанно — значит он должен реально расширяться.
+    gs.DRY_RUN = True
+    gs.ALLOWED_MARKETS = ["Getgems Sales", "Marketapp Marketplace"]
+    check("добавленная в список площадка разрешается",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale",
+                                    "Marketapp Marketplace") is True)
+
+    # Пустой список = проверка отключена. Это осознанный выбор оператора,
+    # а не случайность, поэтому поведение фиксируем.
+    gs.ALLOWED_MARKETS = []
+    check("пустой список отключает проверку площадки",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale", "Что угодно") is True)
+finally:
+    gs.DRY_RUN, gs.REAL_EXECUTOR_AVAILABLE, gs.ALLOWED_MARKETS = _odry34, _oexec34, _omk
 
 
 # =============================================================================

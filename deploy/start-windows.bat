@@ -21,7 +21,7 @@ REM  sozdat proekt -> razdel TonAPI -> skopirovat API key.
 REM  Bez probelov i bez kavychek. Primer:
 REM      set TONAPI_KEY=AE7YD3K...dlinnaya_stroka...9XQ
 REM =====================================================================
-set TONAPI_KEY=AGXEDCFLFVJEXQQAAAAHD3LV6TY27UF2KI5NCRETSKOCL4YSAZKLMQ2QL7NN2TV3MX3VPWQ
+set TONAPI_KEY=
 
 REM 5 kollekciy x 15 stranic = 75 zaprosov. Pauza 1.1s mezhdu nimi
 REM zadana v kode, znachit odin cikl zanimaet ~83 sekundy.
@@ -37,7 +37,13 @@ set MARKETPLACE_FEE_PCT=0.02
 REM Royalti sozdatelya. Na kartochke Timeless Books bylo 0, no eto odna
 REM kollekciya. Proverte Creator Fee v svoih i postavte fakticheskoe:
 REM snizhenie royalti UVELICHIVAET raschetnuyu pribyl.
-set ROYALTY_PCT=0.05
+set ROYALTY_PCT=0
+
+REM --- Pokupka tolko na proverennyh ploshchadkah ---
+REM U lota na ploshchadke "Other" adres kontrakta prodazhi SOVPADAL
+REM s adresom samogo predmeta - protokol tam drugoy. Platit tuda po
+REM nashey sheme znachit otpravlyat dengi vslepuyu.
+set ALLOWED_MARKETS=Getgems Sales
 
 REM --- Bank ---
 REM Postavte fakticheskiy razmer banka v TON (posmotrite kurs sami).
