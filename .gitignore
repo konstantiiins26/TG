@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Состояние бота и записи рынка — не в репозиторий
+*.db
+*.jsonl
+
+# Состояние рантайма
+sniper_state.db
+wallet.key
