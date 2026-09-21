@@ -2193,7 +2193,12 @@ try:
     _ev40 = {"discount_pct": Decimal("20.0"), "buy_price": Decimal("1.2"),
              "net_profit": Decimal("0.12"), "roi_pct": Decimal("10"),
              "peer_floor": None, "eff_floor": Decimal("1.5"), "peer_n": 0,
-             "rarity_pct": None, "rarest_trait": None}
+             "rarity_pct": None, "rarest_trait": None,
+             "sale_price": Decimal("1.455"), "fee_amount": Decimal("0.0291"),
+             "royalty_amount": Decimal("0"), "proceeds": Decimal("1.4259"),
+             "breakeven_buy": Decimal("1.2759"),
+             "max_buy_min_roi": Decimal("1.2152"),
+             "premium_applied": False, "is_pretty": False, "is_rare": False}
 
     check("находка отправляется", gs.notify_find(_item40, _snap40, _ev40) is True)
     _txt = _sent40[-1]
@@ -2623,7 +2628,12 @@ try:
         {"discount_pct": Decimal("20.0"), "buy_price": Decimal("4"),
          "net_profit": Decimal("0.2"), "roi_pct": Decimal("5"),
          "peer_floor": None, "eff_floor": Decimal("5"), "peer_n": 0,
-         "rarity_pct": None, "rarest_trait": None})
+         "rarity_pct": None, "rarest_trait": None,
+         "sale_price": Decimal("4.85"), "fee_amount": Decimal("0.097"),
+         "royalty_amount": Decimal("0"), "proceeds": Decimal("4.753"),
+         "breakeven_buy": Decimal("4.603"),
+         "max_buy_min_roi": Decimal("4.3838"),
+         "premium_applied": False, "is_pretty": False, "is_rare": False})
     _msg = _sent[0] if _sent else ""
 finally:
     gs.notify = _onotify
@@ -2683,6 +2693,84 @@ if gs.REAL_EXECUTOR_AVAILABLE:
         royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
         public_key=LIVE_PUBKEY, royalty_percent=Decimal("0.05"))
     check("другое роялти даёт другое хранилище", _b.hash.hex() != LIVE_DATA_HASH)
+
+
+# =============================================================================
+print("\n[46] Расклад сделки: за сколько покупаю, за сколько выставлять, почему")
+# =============================================================================
+
+# Одного числа «профит» мало: по нему нельзя ни проверить расчёт, ни выставить
+# лот руками. Бот обязан называть ОБЕ цены и показывать, из чего вторая вышла.
+_it46 = {"address": "0:" + "cd" * 32, "sale_price_ton": Decimal("4.10"),
+         "mint_index": 16450, "traits": {}}
+_sn46 = {"floor": Decimal("5.00"), "floor_reliable": True,
+         "trait_index": {}, "trait_total": 0, "peer_prices": {}, "competition": 0}
+_ev46 = gs.evaluate_trade(_it46, _sn46, None)
+_txt46 = "\n".join(gs.explain_trade(_ev46, _sn46))
+
+check("расклад называет цену покупки", "ПОКУПАЮ за 4.1000 TON" in _txt46, _txt46)
+check("расклад называет цену выставления", "ВЫСТАВЛЯЮ за 4.8500 TON" in _txt46, _txt46)
+
+# Главная проверка: арифметика в тексте обязана СХОДИТЬСЯ с решением. Отчёт,
+# который печатает одни числа, а решение принимает по другим, заставил бы
+# владельца выставить лот по цене, при которой одобренная сделка убыточна.
+_sum = (_ev46["sale_price"] - _ev46["fee_amount"] - _ev46["royalty_amount"]
+        - _ev46["buy_price"] - gs.GAS_FEE_TON)
+check("разложение сходится с net_profit до нанотона",
+      abs(_sum - _ev46["net_profit"]) < Decimal("0.000000001"),
+      f"{_sum} vs {_ev46['net_profit']}")
+check("выручка на руки = цена продажи минус комиссии",
+      _ev46["proceeds"] == _ev46["sale_price"] - _ev46["fee_amount"]
+      - _ev46["royalty_amount"])
+
+# Цена выставления обязана быть НИЖЕ floor: продать ровно по floor нельзя.
+check("цена выставления ниже floor", _ev46["sale_price"] < _sn46["floor"])
+check("undercut объяснён словами", "продать РОВНО по floor нельзя" in _txt46)
+
+# Границы: выше них торговаться нельзя. Без них расклад не позволяет решать.
+check("названа граница безубыточности",
+      f"{_ev46['breakeven_buy'].quantize(Decimal('0.0001'))}" in _txt46, _txt46)
+check("названа граница по порогу ROI",
+      f"{_ev46['max_buy_min_roi'].quantize(Decimal('0.0001'))}" in _txt46, _txt46)
+check("граница по ROI строже границы безубыточности",
+      _ev46["max_buy_min_roi"] < _ev46["breakeven_buy"])
+
+# Красивый номер: бот обязан ПРИЗНАТЬСЯ, что заметил его и НЕ учёл. Молчание
+# здесь читается как «номер учтён», и владелец переоценит бота.
+_pretty46 = dict(_it46, mint_index=888)
+_evp = gs.evaluate_trade(_pretty46, _sn46, None)
+_txtp = "\n".join(gs.explain_trade(_evp, _sn46))
+check("красивый номер распознан", _evp["is_pretty"] is True)
+check("но честно сказано, что на цену он НЕ влияет",
+      "НЕ влияют" in _txtp and "PREMIUM_MULT" in _txtp, _txtp)
+check("красивый номер не изменил цену выставления",
+      _evp["sale_price"] == _ev46["sale_price"])
+
+# Оценка по сегменту: если она отличается от floor коллекции, расклад обязан
+# сказать, на что опирается, — иначе цифра выглядит взятой из воздуха.
+_sn_peer = dict(_sn46, peer_prices={"X": [3.0, 3.1, 3.2, 3.3, 3.4, 3.5]})
+_it_peer = dict(_it46, traits={gs.PEER_TRAIT: "X"})
+_evx = gs.evaluate_trade(_it_peer, _sn_peer, None)
+_txtx = "\n".join(gs.explain_trade(_evx, _sn_peer))
+check("оценка по сегменту не выше floor коллекции",
+      _evx["eff_floor"] <= _sn46["floor"], _evx["eff_floor"])
+check("основание оценки названо", "сегмент" in _txtx.lower(), _txtx)
+
+# И то же самое обязано попасть в уведомление, а не только в лог: владелец
+# смотрит в телефон, а не в консоль на VPS.
+_sent46 = []
+_ob46 = (gs.notify, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.DRY_RUN)
+try:
+    gs.notify = lambda text: _sent46.append(text) or True
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "t", "c"
+    gs.DRY_RUN = True
+    gs._find_sent_ts.clear()
+    gs.notify_find(_it46, _sn46, _ev46)
+finally:
+    (gs.notify, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.DRY_RUN) = _ob46
+_msg46 = _sent46[0] if _sent46 else ""
+check("в уведомлении есть обе цены",
+      "ПОКУПАЮ за" in _msg46 and "ВЫСТАВЛЯЮ за" in _msg46, _msg46)
 
 
 # =============================================================================

@@ -1522,6 +1522,69 @@ def max_profitable_buy(floor_price: Decimal, premium: bool = False) -> Decimal:
     return max_buy_at_roi(floor_price, Decimal("0"), premium)
 
 
+def explain_trade(ev: dict, snap: dict) -> list:
+    """
+    Расклад сделки словами: за сколько покупаю, за сколько выставлять, почему.
+
+    Зачем отдельной функцией. Раньше бот сообщал только «профит X, ROI Y» —
+    число, которое нечем проверить и по которому нельзя действовать руками.
+    Владелец, получив находку, должен знать ДВЕ цены (купить и выставить) и
+    видеть, из чего вторая получилась: продажа идёт НИЖЕ floor (иначе лот не
+    уйдёт первым), комиссия снимается с цены ПРОДАЖИ, газ за круг
+    безвозвратен. Пока эти три вещи не показаны, «профит 0.2 TON» выглядит
+    как обещание, а не как расчёт.
+
+    Вторая причина — граница. Цена покупки имеет потолок, выше которого
+    сделка убыточна ПРИ ЛЮБОМ везении, и второй потолок — по минимальному
+    ROI. Без них нельзя торговаться и нельзя понять, насколько близко лот к
+    краю.
+
+    Возвращает список строк (одинаково годится в лог и в Telegram).
+    """
+    q = lambda x: Decimal(str(x)).quantize(Decimal("0.0001"))
+    basis = ("floor коллекции" if ev["eff_floor"] == snap.get("floor")
+             else f"floor сегмента (похожих {ev.get('peer_n', 0)})")
+
+    lines = [
+        f"ПОКУПАЮ за {q(ev['buy_price'])} TON",
+        f"ВЫСТАВЛЯЮ за {q(ev['sale_price'])} TON",
+        f"  = {q(ev['eff_floor'])} ({basis}) −{float(UNDERCUT_PCT) * 100:g}% undercut",
+        f"  −{q(ev['fee_amount'])} комиссия площадки {float(MARKETPLACE_FEE_PCT) * 100:g}%",
+    ]
+    if ROYALTY_PCT > 0:
+        lines.append(f"  −{q(ev['royalty_amount'])} роялти {float(ROYALTY_PCT) * 100:g}%")
+    lines += [
+        f"  = {q(ev['proceeds'])} на руки",
+        f"  −{q(ev['buy_price'])} цена покупки",
+        f"  −{q(GAS_FEE_TON)} газ за круг",
+        f"  = {q(ev['net_profit'])} TON чистыми (ROI {ev['roi_pct']}%)",
+    ]
+
+    # ПОЧЕМУ. Undercut объясняется всегда: это единственный шаг, который
+    # выглядит как «мы теряем деньги на ровном месте», а на деле он и есть
+    # условие того, что лот вообще продастся.
+    why = [f"почему {q(ev['sale_price'])}: продать РОВНО по floor нельзя — "
+           f"чтобы уйти первым, надо встать ниже текущего минимума"]
+
+    if ev["eff_floor"] != snap.get("floor"):
+        why.append(f"оценка по сегменту {q(ev['eff_floor'])}, а не по floor "
+                   f"коллекции {q(snap.get('floor', 0))}: конкурировать лот "
+                   f"будет со своей моделью")
+
+    why.append(f"дороже {q(ev['breakeven_buy'])} покупать нельзя — уйдёт в "
+               f"минус; порог ROI {float(MIN_ROI_PCT):g}% требует не дороже "
+               f"{q(ev['max_buy_min_roi'])}")
+
+    if ev.get("premium_applied"):
+        why.append(f"к оценке применена премия ×{PREMIUM_MULT} "
+                   f"(красивый номер или редкий трейт)")
+    elif ev.get("is_pretty") or ev.get("is_rare"):
+        why.append("красивый номер/редкость замечены, но на цену НЕ влияют: "
+                   f"PREMIUM_MULT={PREMIUM_MULT}, премия не откалибрована")
+
+    return lines + why
+
+
 def affordability(floor_price: Decimal, roi_pct=None) -> dict:
     """
     Сопоставляет коллекцию с банком: что бот реально сможет в ней купить.
@@ -2078,16 +2141,13 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
     _find_sent_ts.append(now)
 
     addr = item.get("address", "")
-    lines = [
-        f"🎯 Находка: скидка {ev['discount_pct']}% от floor",
-        f"цена {ev['buy_price']} TON | floor {snap['floor']} TON",
-        f"ожидаемый профит {ev['net_profit']:.4f} TON (ROI {ev['roi_pct']}%)",
-    ]
-
-    # Оценка по сегменту важнее floor коллекции: лот с мусорной моделью ниже
-    # floor выглядит выгодным, но конкурировать будет со своим сегментом.
-    if ev.get("peer_floor") is not None and ev["eff_floor"] != snap["floor"]:
-        lines.append(f"по сегменту {ev['eff_floor']} TON (похожих {ev['peer_n']})")
+    # Две цены и разбор, а не одно число «профит». Владельцу, который получил
+    # находку в телефон, надо знать, за сколько покупать и за сколько потом
+    # выставлять — иначе уведомление сообщает о возможности, которой нельзя
+    # воспользоваться руками.
+    lines = [f"🎯 Находка: скидка {ev['discount_pct']}% от floor",
+             f"floor коллекции {snap['floor']} TON"]
+    lines += explain_trade(ev, snap)
 
     if ev.get("rarity_pct") is not None:
         lines.append(f"редкость {ev['rarity_pct']}% по «{ev['rarest_trait']}»")
@@ -2737,9 +2797,21 @@ def evaluate_trade(item: dict, snapshot: dict, recent_sales) -> dict:
     profit = compute_net_profit(eff_floor, buy_price, premium)
     roi = compute_roi_pct(profit, buy_price)
 
+    # Цена ВЫСТАВЛЕНИЯ и её разложение. Считаются здесь, а не в месте печати:
+    # иначе отчёт и решение разошлись бы, и владелец выставил бы лот по цене,
+    # при которой сделка, одобренная ботом, убыточна.
+    sale_price = target_sale_price(eff_floor, premium)
+    fee_amount = sale_price * MARKETPLACE_FEE_PCT
+    royalty_amount = sale_price * ROYALTY_PCT
+    proceeds = sale_price - fee_amount - royalty_amount
+
     verdict = {
         "allowed": False, "reason": "", "net_profit": profit, "roi_pct": roi,
         "buy_price": buy_price, "rarity_pct": rarity_pct,
+        "sale_price": sale_price, "fee_amount": fee_amount,
+        "royalty_amount": royalty_amount, "proceeds": proceeds,
+        "breakeven_buy": max_profitable_buy(eff_floor, premium),
+        "max_buy_min_roi": max_buy_at_roi(eff_floor, MIN_ROI_PCT, premium),
         "rarest_trait": rarest_trait, "is_rare": rare, "is_pretty": pretty,
         "premium_applied": premium and PREMIUM_MULT != Decimal("1"),
         "peer_floor": p_floor, "peer_n": peer_n, "eff_floor": eff_floor,
@@ -2813,6 +2885,11 @@ def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
     if not ev["allowed"]:
         log.info(f"{_Color.YELLOW}SKIP (фильтр){_Color.RESET} | {ev['reason']}")
         return
+
+    # Лот прошёл фильтр — печатаем расклад целиком. Одной строки «ROI 12%»
+    # мало: по ней нельзя ни проверить расчёт, ни выставить лот руками.
+    for _line in explain_trade(ev, snapshot):
+        log.info(f"{_Color.GREY}  {_line}{_Color.RESET}")
 
     # Находка сообщается ДО Claude: фильтр уже сказал «да», и это факт о
     # рынке. Ждать вердикта ИИ значило бы молчать о лоте, который владелец
