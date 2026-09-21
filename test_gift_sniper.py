@@ -2366,6 +2366,91 @@ check("порог осмысленной выборки не меньше 20",
 
 
 # =============================================================================
+print("\n[43] Реальный лимит TonAPI измеряется, а не угадывается")
+# =============================================================================
+
+# TONAPI_DAILY_BUDGET — это догадка. У анонимного доступа лимит один, у
+# бесплатного ключа другой, у платного третий. Занижённая догадка делает
+# наблюдение реже, чем позволено; завышенная сжигает квоту к обеду. Отказ
+# сервера — единственный ИЗМЕРЕННЫЙ факт о лимите, и выбрасывать его глупо.
+
+_ob43 = (gs.DB_PATH, gs.TONAPI_DAILY_BUDGET, gs._tonapi_used_today,
+         gs._tonapi_budget_day)
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "learn.db")
+    gs.db_init()
+    gs.TONAPI_DAILY_BUDGET = 10000
+
+    check("пока в стену не упирались — лимит не выучен",
+          gs.budget_learned_limit() is None)
+    check("бюджет равен настройке", gs.effective_daily_budget() == 10000)
+
+    # Отказ при смешном счётчике — не измерение: счётчик считает только НАШИ
+    # запросы, а квоту могли сжечь до старта или другим процессом. Выученные
+    # «20 запросов в сутки» замедлили бы бота навсегда.
+    gs.budget_learn_limit(20)
+    check("отказ при низком счётчике лимитом не считается",
+          gs.budget_learned_limit() is None)
+
+    # Сервер отказал после 3000 запросов — значит столько он и даёт.
+    gs.budget_learn_limit(3000)
+    check("лимит запомнен", gs.budget_learned_limit() == 3000)
+    check("бюджет считается по измеренному, с запасом",
+          gs.effective_daily_budget() == int(3000 * gs._LEARNED_MARGIN),
+          str(gs.effective_daily_budget()))
+    check("запас оставлен, а не потрачен весь",
+          gs.effective_daily_budget() < 3000)
+
+    # Выученный лимит должен ВЛИЯТЬ на интервал, иначе он бесполезен.
+    _real_mid = gs._next_utc_midnight
+    gs._next_utc_midnight = lambda: time.time() + 12 * 3600
+    try:
+        gs._tonapi_used_today = 0
+        _with = gs.budget_paced_interval(5)
+        with gs.db_connect() as _c:
+            _c.execute("DELETE FROM api_budget WHERE day='_learned_limit'")
+        _without = gs.budget_paced_interval(5)
+        check("меньший измеренный лимит растягивает интервал сильнее",
+              _with > _without, f"{_with:.0f} против {_without:.0f}")
+    finally:
+        gs._next_utc_midnight = _real_mid
+
+    # Оценка не должна ПАДАТЬ: лимит на сервере постоянен, а низкий счётчик
+    # бывает от потерянной истории. Берём максимум из виденного.
+    # (проверка интервала выше стёрла запись — восстанавливаем)
+    gs.budget_learn_limit(3000)
+    gs.budget_learn_limit(900)
+    check("более низкое измерение не понижает оценку",
+          gs.budget_learned_limit() == 3000, str(gs.budget_learned_limit()))
+    gs.budget_learn_limit(6000)
+    check("более высокое измерение поднимает оценку",
+          gs.budget_learned_limit() == 6000, str(gs.budget_learned_limit()))
+
+    # Мусор не запоминаем: ноль запросов лимитом быть не может.
+    with gs.db_connect() as _c:
+        _c.execute("DELETE FROM api_budget WHERE day='_learned_limit'")
+    gs.budget_learn_limit(0)
+    check("нулевой лимит не запоминается", gs.budget_learned_limit() is None)
+
+    # Выученный лимит НЕ должен путаться с расходом за сутки: обе записи
+    # лежат в одной таблице, и перепутать их значит спланировать по чужому
+    # числу.
+    _today = datetime.now(timezone.utc).date()
+    gs._tonapi_budget_day, gs._tonapi_used_today = _today, 777
+    gs.budget_flush()
+    gs.budget_learn_limit(4200)
+    gs._tonapi_used_today, gs._tonapi_budget_day = 0, None
+    gs.budget_restore()
+    check("расход суток не перепутан с выученным лимитом",
+          gs._tonapi_used_today == 777, str(gs._tonapi_used_today))
+    check("выученный лимит не перепутан с расходом",
+          gs.budget_learned_limit() == 4200, str(gs.budget_learned_limit()))
+finally:
+    (gs.DB_PATH, gs.TONAPI_DAILY_BUDGET, gs._tonapi_used_today,
+     gs._tonapi_budget_day) = _ob43
+
+
+# =============================================================================
 print("\n[30] Ставка комиссии площадки")
 # =============================================================================
 

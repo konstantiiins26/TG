@@ -11,7 +11,7 @@ REM cmd ne videl ni klyucha, ni tokena, ni banka - i bot chestno soobshchal,
 REM chto tokena net, hotya v faile on byl.
 
 REM --- Kollekcii cherez zapyatuyu, bez probelov ---
-set TARGET_COLLECTIONS=EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7,EQDc08YxzZWtlKAohSybNc3kXAkAPPtHch-jY_E6KMQ3b1mn,EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG,EQD1YFp12AGEgX6C3uiWh751EcRxPZo6GtBmHziY29jcbQzS,EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs
+set TARGET_COLLECTIONS=EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7,EQDc08YxzZWtlKAohSybNc3kXAkAPPtHch-jY_E6KMQ3b1mn,EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG,EQD1YFp12AGEgX6C3uiWh751EcRxPZo6GtBmHziY29jcbQzS,EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs,EQC2lsUy1SKxJEJBwj5ZCfVnLPvAqDqy5c26Xg8xS_pDTXGk,EQAo_snApDDqF6GKV0xe_T5oe28r842gJtgmkgPMhX0-dRkh,EQA8DCWyCWyywgOKYORerRoSVevWrUQ_FjKQgNihxY1227x7,EQB1ATaKGNYk6T5R2cA18BOF-KB_idaKKigwYI2jtjWuLg8n,EQAXHW9KVYYgDmLaUNcgzNPZ4WKGek97-ldsd0fPUHg4K7SU,EQCZ4-h65iTiWDPRPcLlS63gbcS40YBadEFLA4W-iIWUZld0,EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF,EQC8WVW9DSN4PPfFlCW2AHJkXxBUHBFsvnhXiYqSTpD7tXsp,EQD6mH9bwbn6S3M_tCRWOvqAIW8M34kRwbI01niGLRPeDPsl,EQBEngWldzev9oqzctu59Go9afX8HF8HksZ9pJ7x1bRJXsc7,EQDIruSTyxvq60gUH8j2kkj3qzoBrBaJy9WkKbeNNRasWe4j,EQBV5XozKA0e06Z5y6eL7pWrUUpEolbPhNdcNS0K4ZDk1jCs,EQAPNu648fe_uqUoeH6V_-fIDJYea_5Xu2rXn6iZFil49bMY,EQCBK_JBASAA5XVz1D17Pn--kQaMWm0b9wReVtsEdRO4Tgy9,EQC-ZdsouFU-xMa509yP8kzKceZnGV7lSQskxima1Mr3iDYB,EQDLda715GocP1sYDkCecPhO7eFNsNvARD4pumbGSan96wvZ,EQDycOgkLwcfPDokh8q-2DIUzVhPetdFuZmwrFYFP6i1nZ_u,EQCgaTxb2wA_3Bi8Ec4FFNu8CauoHo0VPpnwxdrhAgOrOXvA,EQDRrfw5pgIC4e6NafUAx52Z9Ym6q1k26xxaXR_qx0LKJJ7D,EQD9z87hRZAV7C2MV1gk39-bSg5Yfs2EdMr9HfK81IuB2Rlc,EQBAXR68f1UgRhToFR_bXY1zPJy5O6sm2St0CRTo92BTxGiH,EQBSIId7sMmlqN8oBGaMNtUeuaLeSQPUR1ByMwpnfWL3hhZq,EQAUffQWl09_yhXDTp8oN13Px8ygPm0xcyNGhHOiONV-x3om,EQDx-SqQEhP9Rzfi2cqdehTVUvQbArsUz1X7t-ul8IiKZpYb,EQA0EzRYX5wm_q46_NX8b7EYhtOkXfXgsr06ETbov1a7StZl,EQA2lHcvZWW_bN_2NMKrkEUv9xz6fx8wTE5upa8u1neZb6hJ,EQCeTSJOPXP_SSvOjILY-kui4bGHUmsa-U7TXP4DjUANTl4s
 set COLLECTION_WHITELIST=%TARGET_COLLECTIONS%
 
 REM =====================================================================
@@ -70,7 +70,15 @@ REM
 REM NE umenshayte FLOOR_SAMPLE_PAGES radi ekonomii kvoty: vyborka na sale-lotah
 REM padaet proporcionalno stranicam, a pri vyborke menshe MIN_FLOOR_SAMPLE (40)
 REM torgovlya propuskaetsya voobshche. Luchshe redkiy shag, chem sleploy floor.
-set TONAPI_DAILY_BUDGET=10000
+REM Podnyat s 10000: 32 kollekcii x 15 stranic = 480 zaprosov na cikl, i
+REM pri 10000 interval rastyanulsya by do 69 minut. Eto ne "raskrutit bota" -
+REM 10000 bylo MOEY DOGADKOY, chtoby ostanovit szhiganie anonimnoy kvoty.
+REM Realnogo limita vashego klyucha nikto ne izmeryal.
+REM
+REM Bot teper izmerit ego sam: v moment otkaza servera on zapominaet, skolko
+REM zaprosov proshlo, i dalshe planiruet po etomu chislu s zapasom 5%.
+REM Odin den slepoty - cena za edinstvennyy IZMERENNYY fakt o limite.
+set TONAPI_DAILY_BUDGET=40000
 
 REM --- Komissii ---
 REM 2%% - stavka Getgems imenno dlya Telegram-podarkov (ih spravka).

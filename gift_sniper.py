@@ -597,6 +597,18 @@ _tonapi_quota_until = 0.0
 # 10 000 транзакций SQLite в сутки; терять при падении больше одного цикла —
 # значит снова начать день с завышенным остатком бюджета.
 _BUDGET_FLUSH_EVERY = 25
+# Доля выученного лимита, которую разрешаем тратить. 5% запаса:
+# измерение приблизительное, а упереться в стену на последнем
+# запросе значит снова ослепнуть до полуночи.
+_LEARNED_MARGIN = 0.95
+# Ниже этого числа отказ сервера НЕ считается измерением лимита.
+#
+# Счётчик считает запросы ЭТОГО бота, а лимит — на стороне TonAPI. Они
+# расходятся: свежая БД теряет расход за сегодня, тем же ключом мог
+# пользоваться другой процесс, квоту могли сжечь до старта. Тогда отказ
+# приходит при смешном счётчике — и выученный лимит в 20 запросов замедлил бы
+# бота до одного цикла в сутки НАВСЕГДА.
+_MIN_LEARNABLE_LIMIT = 500
 _budget_db_broken = False
 
 
@@ -640,6 +652,77 @@ def budget_flush():
                         f"После перезапуска расход будет занижен.")
 
 
+def budget_learn_limit(used_today: int):
+    """
+    Запоминает РЕАЛЬНЫЙ суточный лимит: столько запросов сервер принял, прежде
+    чем отказать.
+
+    Зачем: `TONAPI_DAILY_BUDGET` — это наша догадка. У анонимного доступа один
+    лимит, у бесплатного ключа другой, у платного третий, и вслепую подобранное
+    число либо занижает наблюдение (шаг реже, чем позволено), либо завышает
+    (квота сгорает к обеду, и бот слепнет до полуночи).
+
+    Отказ сервера — единственный ИЗМЕРЕННЫЙ факт о лимите, который у нас
+    бывает. Он стоит одного дня слепоты, и глупо этот факт выбрасывать.
+    """
+    if used_today < _MIN_LEARNABLE_LIMIT:
+        log.warning(
+            f"{_Color.YELLOW}Отказ TonAPI при счётчике {used_today} — это НЕ "
+            f"измерение лимита: наш счётчик считает только свои запросы, а "
+            f"квоту могли сжечь до старта или другим процессом. Лимит не "
+            f"меняю.{_Color.RESET}")
+        return
+
+    # Берём МАКСИМУМ, а не последнее значение. Лимит на стороне сервера
+    # постоянен, значит лучшая его оценка — самый высокий счётчик, до
+    # которого мы доходили перед отказом. Иначе один день с потерянной
+    # историей занизил бы оценку навсегда.
+    previous = budget_learned_limit()
+    value = max(previous or 0, int(used_today))
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO api_budget (day, used) VALUES ('_learned_limit', ?) "
+                "ON CONFLICT(day) DO UPDATE SET used=excluded.used",
+                (value,))
+    except Exception as e:  # noqa: BLE001 — учёт не стоит наблюдения
+        log.warning(f"Не удалось запомнить лимит TonAPI ({e}).")
+        return
+
+    if previous == value:
+        return
+    log.warning(f"{_Color.YELLOW}Измерен суточный лимит TonAPI: {value} "
+                f"запросов (отказ пришёл на {used_today}-м). Дальше планирую "
+                f"по нему, а не по TONAPI_DAILY_BUDGET={TONAPI_DAILY_BUDGET}."
+                f"{_Color.RESET}")
+
+
+def budget_learned_limit():
+    """Выученный лимит или None. None — значит в стену ещё не упирались."""
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT used FROM api_budget WHERE day = '_learned_limit'"
+            ).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    return int(row["used"]) if row else None
+
+
+def effective_daily_budget() -> int:
+    """
+    Бюджет, по которому реально планируется интервал.
+
+    Выученный лимит бьёт настройку, но с запасом `_LEARNED_MARGIN`: упереться
+    в стену ровно на последнем запросе значит снова ослепнуть, а измерение
+    приблизительное — сервер мог считать не только наши запросы.
+    """
+    learned = budget_learned_limit()
+    if learned is None:
+        return TONAPI_DAILY_BUDGET
+    return max(1, int(learned * _LEARNED_MARGIN))
+
+
 def budget_restore():
     """
     Поднимает расход текущих суток из БД. Вызывать один раз при старте.
@@ -679,8 +762,9 @@ def budget_paced_interval(collections: int) -> float:
     if TONAPI_DAILY_BUDGET <= 0:
         return POLL_INTERVAL_SEC
 
+    budget = effective_daily_budget()
     per_cycle = max(1, collections * FLOOR_SAMPLE_PAGES)
-    left = TONAPI_DAILY_BUDGET - _tonapi_used_today
+    left = budget - _tonapi_used_today
     if left <= 0:
         return POLL_INTERVAL_SEC          # бюджет исчерпан; квота сама остановит
 
@@ -735,6 +819,8 @@ def _tonapi_get(url: str, params: dict, headers: dict) -> dict:
             body = (resp.text or "")[:300]
             if "daily" in body.lower() or "traffic is spent" in body.lower():
                 _tonapi_quota_until = _next_utc_midnight()
+                # Отказ сервера — измерение лимита. Другого у нас не будет.
+                budget_learn_limit(_tonapi_used_today)
                 left = (_tonapi_quota_until - time.time()) / 3600
                 raise RateLimited(
                     f"суточная квота анонимного доступа TonAPI исчерпана "
@@ -3654,7 +3740,8 @@ def main(record: bool = False, trade: bool = True):
         interval = budget_paced_interval(len(TARGET_COLLECTIONS))
         if interval > POLL_INTERVAL_SEC * 1.05:
             log.info(f"{_Color.YELLOW}Бюджет TonAPI: потрачено "
-                     f"{_tonapi_used_today}/{TONAPI_DAILY_BUDGET} за сутки. "
+                     f"{_tonapi_used_today}/{effective_daily_budget()} за сутки"
+                     f"{' (лимит измерен)' if budget_learned_limit() else ''}. "
                      f"Интервал растянут до {interval:.0f}с, чтобы хватило "
                      f"до полуночи UTC.{_Color.RESET}")
         sleep_for = max(0, interval - elapsed)
