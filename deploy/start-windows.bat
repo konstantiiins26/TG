@@ -99,16 +99,26 @@ REM VNIMANIE: esli pozitsiy budet mnogo, 1 TON mozhet konchitsya -
 REM togda ne na chto budet vystavit kuplennoe na prodazhu.
 set RESERVE_TON=1
 
-REM Potolok odnoy sdelki: 20%% banka = 2 TON pri banke 10.
-REM Pri 10%% potolok byl by 1 TON, i rabochiy floor upal by do ~1.3,
-REM gde gaz sedaet pochti vsyu pribyl.
-set MAX_POSITION_PCT=20
+REM Potolok odnoy sdelki: 35%% ot 18 dostupnyh = 6.30 TON.
+REM
+REM Postavleno po pryamoy prosbe vladeltsa ("potolok vyshe, gotov teryat").
+REM 35 - ne proizvolnoe chislo: eto MINIMUM, pri kotorom dostupny vse pyat
+REM tekushchih kollekciy. Pri floor 6 pribylnaya pokupka stoit do 5.55 TON,
+REM pri 30%% potolok 5.40 - i samaya dorogaya kollekciya otpadala by.
+REM
+REM CHEGO ETO STOIT, chestno: pri 6.30 na sdelku bank derzhit VSEGO 2
+REM pozicii odnovremenno. Odna oshibka - eta tret banka, dve podryad -
+REM dve treti. STOP_AFTER_LOSSES=3 (po umolchaniyu) ostanovit bota posle
+REM treh ubytkov podryad, i pri takom razmere pozicii eto pravilno.
+set MAX_POSITION_PCT=35
 
 REM --- Povyshennyy limit dlya isklyuchitelno vygodnyh sdelok ---
-REM Sdelke s ROI ot 150 procentov razresheno do 20 procentov banka
-REM vmesto obychnyh 10. Bank, rezerv i limity chasa/sutok ne otmenyayutsya.
+REM Raven obychnomu, to est mehanizm VYKLYUCHEN. Vysokiy raschetnyy ROI -
+REM eto rovno to mesto, gde model oshibaetsya chashche vsego (glubokaya
+REM skidka chashche znachit prichinu, a ne oshibku prodavtsa), poetomu
+REM povyshat stavku imenno tam nado tolko posle bektesta po svoey zapisi.
 set HIGH_ROI_PCT=150
-set MAX_POSITION_PCT_HIGH_ROI=20
+set MAX_POSITION_PCT_HIGH_ROI=35
 
 REM --- Stop-loss ---
 REM Floor upal nizhe ceny pokupki na 25 procentov - vyhodim.
