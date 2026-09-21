@@ -12,16 +12,35 @@ set TARGET_COLLECTIONS=EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7,EQDc08Yx
 set COLLECTION_WHITELIST=%TARGET_COLLECTIONS%
 
 REM =====================================================================
-REM  KLYUCH TONAPI - vpishite ego srazu posle znaka = v stroke nizhe.
-REM  Bez klyucha u anonimnogo dostupa SUTOCHNAYA kvota, i ona
-REM  konchaetsya za neskolko ciklov. Server otvechaet:
-REM  "anonymous tier daily traffic is spent, resets at UTC midnight".
-REM  Klyuch besplatnyy: tonconsole.com -> vhod cherez Telegram ->
-REM  sozdat proekt -> razdel TonAPI -> skopirovat API key.
-REM  Bez probelov i bez kavychek. Primer:
-REM      set TONAPI_KEY=AE7YD3K...dlinnaya_stroka...9XQ
+REM  KLYUCHI I TOKENY lezhat v OTDELNOM faile deploy\my-secrets.bat
+REM
+REM  Pochemu ne zdes: etot fail lezhit v git. Kogda vy vpisyvali klyuch
+REM  pryamo v nego, ocherednoy "git pull" libo otkazyvalsya obnovlyatsya,
+REM  libo zatiral vashu stroku - i klyuch tiho propadal. Imenno tak kvota
+REM  TonAPI konchilas 21.09.2026 na uzhe poluchennom klyuche.
+REM  Vtoraya prichina: token, vpisannyy v otslezhivaemyy fail, legko
+REM  sluchayno zakommitit v publichnyy repozitoriy.
+REM
+REM  my-secrets.bat v .gitignore: pull ego ne trogaet NIKOGDA.
 REM =====================================================================
-set TONAPI_KEY=
+if not exist "%~dp0my-secrets.bat" (
+    echo Sozdayu deploy\my-secrets.bat - vpishite v nego klyuchi i zapustite snova.
+    >  "%~dp0my-secrets.bat" echo @echo off
+    >> "%~dp0my-secrets.bat" echo REM Vashi klyuchi. Etot fail v .gitignore - git ego ne trogaet.
+    >> "%~dp0my-secrets.bat" echo REM Bez probelov vokrug znaka = i bez kavychek.
+    >> "%~dp0my-secrets.bat" echo REM.
+    >> "%~dp0my-secrets.bat" echo REM Klyuch TonAPI - besplatnyy: tonconsole.com -^> vhod cherez Telegram
+    >> "%~dp0my-secrets.bat" echo REM -^> sozdat proekt -^> razdel TonAPI -^> skopirovat API key.
+    >> "%~dp0my-secrets.bat" echo REM Bez nego u anonimnogo dostupa SUTOCHNAYA kvota na neskolko ciklov.
+    >> "%~dp0my-secrets.bat" echo set TONAPI_KEY=
+    >> "%~dp0my-secrets.bat" echo REM.
+    >> "%~dp0my-secrets.bat" echo REM Telegram: token u @BotFather, chat_id u @userinfobot.
+    >> "%~dp0my-secrets.bat" echo REM Bez nih nahodki nekuda otpravlyat - bot budet molchat.
+    >> "%~dp0my-secrets.bat" echo set TELEGRAM_BOT_TOKEN=
+    >> "%~dp0my-secrets.bat" echo set TELEGRAM_CHAT_ID=
+    echo.
+)
+call "%~dp0my-secrets.bat"
 
 REM 5 kollekciy x 15 stranic = 75 zaprosov. Pauza 1.1s mezhdu nimi
 REM zadana v kode, znachit odin cikl zanimaet ~83 sekundy.
@@ -86,12 +105,31 @@ set ENABLE_STOP_LOSS=1
 set STOP_LOSS_PCT=25
 set STOP_LOSS_MIN_HOURS=6
 
-REM --- Uvedomleniya v Telegram (neobyazatelno) ---
-REM Gde vzyat token i chat id - sm. SETUP.md, razdel Uvedomleniya.
+REM --- Uvedomleniya v Telegram ---
+REM Token i chat_id zadayutsya v deploy\my-secrets.bat (sm. vyshe).
 REM Bez nih bot rabotaet tak zhe, prosto molcha.
-set TELEGRAM_BOT_TOKEN=
-set TELEGRAM_CHAT_ID=
 set HEARTBEAT_MIN=60
+
+REM Skolko uvedomleniy o NAHODKAH slat maksimum za chas. 0 = ne slat.
+set FIND_NOTIFY_MAX_PER_HOUR=10
+
+REM --- Proverka klyuchey PERED startom -------------------------------
+REM Molchalivyy start s pustym klyuchom - eto poteryannyy den: kvota
+REM anonimnogo dostupa konchaetsya za neskolko ciklov, i bot slepnet
+REM do polunochi UTC. Luchshe skazat ob etom srazu.
+if "%TONAPI_KEY%"=="" (
+    echo.
+    echo [!] TONAPI_KEY PUST. Sutochnoy kvoty anonimnogo dostupa hvatit
+    echo     na neskolko ciklov, potom bot oslepnet do polunochi UTC.
+    echo     Klyuch besplatnyy: tonconsole.com
+    echo     Vpishite ego v deploy\my-secrets.bat
+    echo.
+)
+if "%TELEGRAM_BOT_TOKEN%"=="" (
+    echo [!] TELEGRAM_BOT_TOKEN pust - nahodki nekuda otpravlyat.
+    echo     Vpishite token v deploy\my-secrets.bat
+    echo.
+)
 
 echo === Zapis rynka. Ne zakryvayte eto okno. ===
 echo Zapis idet v market_history.jsonl i dopisyvaetsya posle perezapuska.
