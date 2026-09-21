@@ -432,6 +432,15 @@ ENABLE_STOP_LOSS    = os.getenv("ENABLE_STOP_LOSS", "1") == "1"
 # что написано в шапке отчёта.
 BACKTEST_MAX_SLACK_HOURS = Decimal(os.getenv("BACKTEST_MAX_SLACK_HOURS", "6"))
 
+# Сколько ЗАКРЫТЫХ сделок нужно, чтобы отчёт вообще что-то значил.
+#
+# 20 — не круглое число ради круглого: при меньшем числе доля выигрышей
+# скачет на десятки процентов от одной сделки, и «winrate 100% (1/1)»
+# неотличим от удачи. Отчёт, из которого можно сделать неверный вывод с
+# уверенным видом, опаснее отсутствующего отчёта: именно на такой строке
+# принимают решение включить живую торговлю.
+MIN_BACKTEST_TRADES = int(os.getenv("MIN_BACKTEST_TRADES", "20"))
+
 # --- Служебное ---------------------------------------------------------------
 DRY_RUN             = os.getenv("DRY_RUN", "1") == "1"   # 1 = только заглушка покупки (безопасно)
 
@@ -2816,7 +2825,7 @@ def run_backtest(path: str = None, hold_hours: int = None):
     for coll, coll_snaps in by_coll.items():
         trades.extend(_backtest_one(coll_snaps, hold_hours, bought_addrs))
 
-    return _report_backtest(trades, hold_hours)
+    return _report_backtest(trades, hold_hours, span_h, len(by_coll))
 
 
 def _backtest_one(snaps, hold_hours: int, bought_addrs: set):
@@ -2837,7 +2846,8 @@ def _backtest_one(snaps, hold_hours: int, bought_addrs: set):
 
             bought_addrs.add(item["address"])
             trade = {"address": item["address"], "buy": ev["buy_price"],
-                     "expected": ev["net_profit"], "roi": ev["roi_pct"]}
+                     "expected": ev["net_profit"], "roi": ev["roi_pct"],
+                     "entry_floor": ev["eff_floor"]}
             trade.update(_simulate_exit(snaps, snap["ts"], ev["buy_price"],
                                         hold_hours,
                                         ev["is_rare"] or ev["is_pretty"]))
@@ -2876,6 +2886,7 @@ def _simulate_exit(snaps, buy_ts: float, buy_price: Decimal, hold_hours: int,
         proceeds = sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)
         return {"status": "closed", "exit": d["action"],
                 "exit_reason": d["reason"], "held_hours": held_hours,
+                "exit_floor": snap["floor"],
                 "pnl": proceeds - buy_price - GAS_FEE_TON}
 
     return {"status": "open", "missing": "end"}
@@ -3400,7 +3411,7 @@ def _warn_if_recording_short(snaps):
                     f"выводы по выборке меньше суток ненадёжны.{_Color.RESET}")
 
 
-def _report_backtest(trades, hold_hours):
+def _report_backtest(trades, hold_hours, span_h=None, collections=None):
     """Печатает итоги бэктеста и возвращает их словарём."""
     closed = [t for t in trades if t["status"] == "closed"]
     unresolved = len(trades) - len(closed)
@@ -3449,9 +3460,52 @@ def _report_backtest(trades, hold_hours):
     worst = min(closed, key=lambda t: t["pnl"])
     log.info(f"Лучшая: {best['pnl']:+.4f} TON | Худшая: {worst['pnl']:+.4f} TON")
 
+    # --- Почему цифрам выше можно или нельзя верить -----------------------
+    # Эти предупреждения стоят ПОСЛЕ чисел намеренно: их читают последними,
+    # и именно они решают, что с числами делать.
+
+    # Частота — главное практическое число отчёта. Прибыль на сделку ничего
+    # не говорит о доходе, пока неизвестно, как часто сделка вообще бывает:
+    # +0.55 TON раз в четыре дня и та же сумма трижды в день — это разные
+    # занятия. И копить запись ради 20 сделок при такой частоте придётся
+    # месяцами, что тоже надо знать заранее, а не выяснить потом.
+    if span_h and span_h > 0 and trades:
+        per_day = len(trades) / (span_h / 24)
+        line = (f"Частота: {len(trades)} сделок за {span_h/24:.1f} суток "
+                f"= {per_day:.2f} в сутки")
+        if collections:
+            line += f" на {collections} коллекциях"
+        log.info(line)
+        if per_day > 0:
+            days_needed = MIN_BACKTEST_TRADES / per_day
+            log.info(f"При такой частоте на {MIN_BACKTEST_TRADES} сделок "
+                     f"нужно примерно {days_needed:.0f} суток записи.")
+
+    if len(closed) < MIN_BACKTEST_TRADES:
+        log.warning(
+            f"{_Color.YELLOW}ВЫБОРКА МАЛА: закрытых сделок {len(closed)}, "
+            f"для выводов нужно хотя бы {MIN_BACKTEST_TRADES}. При таком "
+            f"числе winrate скачет на десятки процентов от ОДНОЙ сделки — "
+            f"«{winrate:.0f}%» здесь означает не качество модели, а то, что "
+            f"сделок почти не было. Решать по этой строке нельзя, нужна "
+            f"запись длиннее.{_Color.RESET}")
+
+    # Нулевое расхождение выглядит как «модель точна», а означать может
+    # ровно обратное: floor не двигался, и предсказывать было нечего.
+    flat = [t for t in closed
+            if t.get("exit_floor") is not None and t.get("entry_floor") is not None
+            and t["exit_floor"] == t["entry_floor"]]
+    if flat and len(flat) == len(closed):
+        log.warning(
+            f"{_Color.YELLOW}У ВСЕХ закрытых сделок floor на выходе совпал с "
+            f"floor на входе. Значит совпадение прогноза с фактом НЕ доказывает "
+            f"точность модели — рынок просто стоял на месте. Проверить прогноз "
+            f"можно только на сделках, где floor успел сдвинуться."
+            f"{_Color.RESET}")
+
     return {"trades": len(trades), "closed": len(closed), "unresolved": unresolved,
             "gaps": gaps, "wins": len(wins), "winrate": winrate, "pnl": total_pnl,
-            "invested": invested, "expected": expected}
+            "invested": invested, "expected": expected, "flat_exits": len(flat)}
 
 
 # =============================================================================
