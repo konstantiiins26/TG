@@ -23,23 +23,31 @@ REM  sluchayno zakommitit v publichnyy repozitoriy.
 REM
 REM  my-secrets.bat v .gitignore: pull ego ne trogaet NIKOGDA.
 REM =====================================================================
-if not exist "%~dp0my-secrets.bat" (
-    echo Sozdayu deploy\my-secrets.bat - vpishite v nego klyuchi i zapustite snova.
-    >  "%~dp0my-secrets.bat" echo @echo off
-    >> "%~dp0my-secrets.bat" echo REM Vashi klyuchi. Etot fail v .gitignore - git ego ne trogaet.
-    >> "%~dp0my-secrets.bat" echo REM Bez probelov vokrug znaka = i bez kavychek.
-    >> "%~dp0my-secrets.bat" echo REM.
-    >> "%~dp0my-secrets.bat" echo REM Klyuch TonAPI - besplatnyy: tonconsole.com -^> vhod cherez Telegram
-    >> "%~dp0my-secrets.bat" echo REM -^> sozdat proekt -^> razdel TonAPI -^> skopirovat API key.
-    >> "%~dp0my-secrets.bat" echo REM Bez nego u anonimnogo dostupa SUTOCHNAYA kvota na neskolko ciklov.
-    >> "%~dp0my-secrets.bat" echo set TONAPI_KEY=
-    >> "%~dp0my-secrets.bat" echo REM.
-    >> "%~dp0my-secrets.bat" echo REM Telegram: token u @BotFather, chat_id u @userinfobot.
-    >> "%~dp0my-secrets.bat" echo REM Bez nih nahodki nekuda otpravlyat - bot budet molchat.
-    >> "%~dp0my-secrets.bat" echo set TELEGRAM_BOT_TOKEN=
-    >> "%~dp0my-secrets.bat" echo set TELEGRAM_CHAT_ID=
-    echo.
-)
+REM Bez skobok (...) namerenno: vnutri bloka cmd razbiraet perenapravleniya
+REM i simvol ^ po svoim pravilam, i sozdanie faila moglo by tiho ne srabotat.
+if exist "%~dp0my-secrets.bat" goto secrets_ready
+
+echo.
+echo === Sozdayu deploy\my-secrets.bat ===
+>  "%~dp0my-secrets.bat" echo @echo off
+>> "%~dp0my-secrets.bat" echo REM Vashi klyuchi. Fail v .gitignore - git pull ego NE trogaet.
+>> "%~dp0my-secrets.bat" echo REM Bez probelov vokrug znaka "=" i bez kavychek.
+>> "%~dp0my-secrets.bat" echo REM.
+>> "%~dp0my-secrets.bat" echo REM TONAPI_KEY - besplatnyy klyuch. Gde vzyat:
+>> "%~dp0my-secrets.bat" echo REM   tonconsole.com, vhod cherez Telegram, sozdat proekt,
+>> "%~dp0my-secrets.bat" echo REM   razdel TonAPI, skopirovat API key.
+>> "%~dp0my-secrets.bat" echo REM Bez nego rabotaet anonimnyy dostup, a u nego SUTOCHNAYA
+>> "%~dp0my-secrets.bat" echo REM kvota na neskolko ciklov - potom slepota do polunochi UTC.
+>> "%~dp0my-secrets.bat" echo set TONAPI_KEY=
+>> "%~dp0my-secrets.bat" echo REM.
+>> "%~dp0my-secrets.bat" echo REM Telegram: token u @BotFather, chat_id u @userinfobot.
+>> "%~dp0my-secrets.bat" echo REM Bez nih nahodki nekuda slat - bot budet rabotat molcha.
+>> "%~dp0my-secrets.bat" echo set TELEGRAM_BOT_TOKEN=
+>> "%~dp0my-secrets.bat" echo set TELEGRAM_CHAT_ID=
+echo Fail sozdan. Vpishite v nego klyuchi i zapustite etot bat zanovo.
+echo.
+
+:secrets_ready
 call "%~dp0my-secrets.bat"
 
 REM 5 kollekciy x 15 stranic = 75 zaprosov. Pauza 1.1s mezhdu nimi
@@ -77,8 +85,12 @@ REM nashey sheme znachit otpravlyat dengi vslepuyu.
 set ALLOWED_MARKETS=Getgems Sales
 
 REM --- Bank ---
-REM Postavte fakticheskiy razmer banka v TON (posmotrite kurs sami).
-set BANKROLL_TON=10
+REM VAZHNO: eto ne "skolko ne zhalko", a FAKTICHESKIY balans koshelka.
+REM Bot schitaet potolok sdelki ot etogo chisla, i esli ono zanizheno -
+REM on budet otklonyat sdelki, kotorye na samom dele po karmanu.
+REM Imenno tak i sluchilos 21.09.2026: v faile stoyalo 10 pri realnyh 19,
+REM i raschet dostupnosti kollekciy byl pro nesushchestvuyushchiy bank.
+set BANKROLL_TON=19
 
 REM Rezerv na gaz. 0.15 TON za operaciyu, flip = ~2 operacii,
 REM znachit 1 TON hvataet primerno na 6-7 operaciy.
