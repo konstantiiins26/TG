@@ -532,3 +532,181 @@ Network Fee   0.3 GRAM    (the rest will be returned to your wallet)
 `GAS_FEE_TON = 0.15` в экономике — это оценка безвозвратной стоимости круга.
 Измеренные 0.03 на листинге показывают, что она скорее консервативна, чем
 занижена; менять её без измерения расхода на покупке не нужно.
+
+---
+
+# ИСХОДНИК КОНТРАКТА НАЙДЕН (21.09.2026) — догадки заменены на факты
+
+Впервые в этом проекте использован интернет. Репозиторий Getgems открыт:
+`github.com/getgems-io/nft-contracts`. Взяты три файла (через
+`raw.githubusercontent.com`, ветка `main`):
+
+- `packages/contracts/sources/nft-fixprice-sale-v4r1.fc` — сам контракт;
+- `packages/contracts/nft-fixprice-sale-v4/NftFixPriceSaleV4.data.ts` — сборка
+  хранилища и сообщений;
+- `packages/contracts/sources/op-codes.fc` — коды операций.
+
+**Методика не изменилась.** Исходник из интернета — это чужое утверждение, а
+не факт о нашем блокчейне. Всё ниже принято только потому, что СОШЛОСЬ с уже
+разобранным живым листингом.
+
+## 1. Те самые 34 бита опознаны: это комиссия и роялти
+
+Было (`_FEES_UNKNOWN_A/B`): «uint16 = 1000, uint16 = 0, потом 2 нулевых бита,
+назначение неизвестно».
+
+`load_static_data()` в исходнике:
+
+```
+ds~load_msg_addr(),  ;; marketplace_fee_address
+ds~load_msg_addr(),  ;; royalty_address
+ds~load_uint(17),    ;; fee percent mul 100k
+ds~load_uint(17),    ;; royalty percent mul 100k
+ds~load_msg_addr(),  ;; nft_address
+ds~load_uint(32)     ;; created_at
+```
+
+16 + 16 + 2 = 34 = 17 + 17. Те же биты по новой раскладке:
+
+```
+0000001111101000000000000000000000
+[----- uint17 = 2000 ----][-- uint17 = 0 --]
+        2000/100000 = 2.0%      0/100000 = 0%
+```
+
+**2.0% комиссии площадки и 0% роялти.** Это ровно то, что было независимо
+измерено раньше: диалог продажи Getgems (0.1 GRAM на цене 5) и три лота из
+разных коллекций с Creator Fee 0 GRAM.
+
+Три независимых источника сошлись на одном числе. Хеш хранилища при этом не
+изменился ни на бит — проверено тестом, секция [39]. В коде вместо констант
+без смысла теперь `_percent_to_raw()` и параметры `fee_percent` /
+`royalty_percent`.
+
+## 2. Подпись есть, но она НАША — прежний блокер снят
+
+Прошлый вывод: «512 бит в теле деплоя — подпись бэкенда Getgems, значит
+листинг через деплойер кодом не собрать».
+
+Первая половина верна, вторая — нет. `NftFixPriceSaleV4.data.ts`:
+
+```ts
+async function randomKeyPair() {
+  const mnemonics = await mnemonicNew()
+  return mnemonicToPrivateKey(mnemonics)
+}
+
+export async function buildNftFixPriceSaleV4R1DeployData(opts) {
+  const keypair = await randomKeyPair()
+  const dataCell = buildNftFixPriceSaleV4R1Data({
+    ...opts.config,
+    publicKey: keypair.publicKey,
+    marketplaceAddress: opts.deployerAddress,
+  })
+  ...
+  message: nftFixPriceV4CreateDeployMessage(opts.queryId, opts.marketplaceAddress,
+                                            jettonPriceDict, keypair.secretKey)
+}
+```
+
+Пара ключей **генерируется заново на каждый лот** тем, кто выставляет.
+Открытая половина кладётся в хранилище (те самые 256 бит, которые мы
+опознали как «ключ маркетплейса»), закрытой подписывается сообщение
+`0xfb5dbf47`. Контракт сверяет одно с другим:
+
+```
+var public_key = data_tail~load_uint(256);
+var signature = in_msg_body~load_bits(512);
+var payload = slice_hash(in_msg_body);
+throw_unless(35, check_signature(payload, signature, public_key));
+```
+
+Секретного ключа Getgems здесь нет вообще. Подпись нужна по технической
+причине: сообщение задаёт цены в джеттонах, словарь цен зависит от АДРЕСА
+контракта продажи, адрес — от хранилища, хранилище — от ключа. Подпись
+разрывает эту петлю. **Для продажи за TON словарь пуст, и сообщение деплоя
+не нужно вовсе.**
+
+## 3. Раскладка хранилища подтверждена целиком
+
+Официальный билдер и наш `build_sale_contract_data()` совпадают полностью,
+включая «флаги неизвестного назначения»:
+
+```ts
+.storeBit(isComplete)
+.storeAddress(marketplaceAddress)
+.storeAddress(nftOwnerAddress)
+.storeCoins(fullTonPrice)
+.storeUint(soldAtTime, 32)
+.storeUint(soldQueryId, 64)
+.storeRef(<комиссии + предмет + created_at>)
+.storeDict(undefined)             // 1 бит = 0 -> словарь джеттонов ПУСТ
+.storeMaybeBuffer(publicKey, 32)  // 1 бит = 1, затем 256 бит ключа
+```
+
+`store_uint(0,1)` и `store_uint(1,1)` в нашем коде — это пустой словарь и
+признак «ключ есть». Ссылка в TON хранится отдельно от битов, поэтому наш
+`store_ref()` в конце даёт ту же ячейку.
+
+Важно: `marketplaceAddress` в хранилище — это **адрес деплойера**, а не
+абстрактный адрес площадки. У Getgems это совпадает, у нас туда пойдёт наш
+кошелёк.
+
+## 4. Коды операций (`op-codes.fc`) — подтверждение и находки
+
+```
+op::transfer()                    0x5fcc3d14   подтверждает разбор листинга
+op::ownership_assigned()          0x05138d91   подтверждает шаг 2
+op::fix_price_v4_deploy_jetton()  0xfb5dbf47   подтверждает тело деплоя
+op::fix_price_v4_deploy_blank()   0x664c0905   НОВОЕ
+op::fix_price_v4_change_price()   0xfd135f7b   подтверждает смену цены
+op::fix_price_v4_cancel()         0x3          НОВОЕ
+op::fix_price_v4_buy()            0x2          НОВОЕ
+```
+
+Смена цены совпала с тем, что мы собрали побайтово из живой транзакции:
+`op(32) + query_id(64) + coins(new_price) + storeDict(null)`, где пустой
+словарь — это один нулевой бит. Ровно наш `store_bit(0)`.
+
+## 5. СНЯТИЕ С ПРОДАЖИ — есть, и это ключ к стоп-лоссу
+
+```
+if (op == op::fix_price_v4_cancel()) {
+    throw_unless(457, msg_value >= min_gas_amount());        ;; 0.1 TON
+    throw_unless(458, equal_slices(sender_address, nft_owner_address)
+                    | equal_slices(sender_address, marketplace_address));
+```
+
+Отменить может ВЛАДЕЛЕЦ — предмет возвращается ему, контракт помечается
+завершённым. Тело: `op 0x3` + `query_id`, газ не меньше 0.1 TON. Есть и
+текстовый вариант: комментарий `cancel` обычным сообщением.
+
+Это закрывает пробел, который раньше считался принципиальным: выход из
+позиции возможен не только сменой цены, но и полным снятием.
+
+## 6. Покупка: требование к сумме — подтверждение нашего газа
+
+```
+if ((op == 0) | (op == op::fix_price_v4_buy())) {
+    throw_unless(450, msg_value >= full_price + min_gas_amount());
+```
+
+`min_gas_amount()` = 0.1 TON. Наш `PURCHASE_GAS_TON` = 0.3 — с запасом, и
+запас этот не выдуман: 0.3 прикладывает сам интерфейс Getgems. Ошибка вверх
+бесплатна (излишек возвращается), вниз — `throw 450`, то есть сделка не
+состоится. Нижняя граница теперь известна ТОЧНО, а не по скриншоту.
+
+Покупка пустым сообщением (`op == 0`) тоже принимается — это объясняет, почему
+перевод «просто суммы» на контракт продажи работает.
+
+## 7. Что осталось непроверенным
+
+Ровно один пункт, и он не решается чтением исходника: **покажет ли Getgems
+самостоятельно задеплоенный лот на витрине.** Индексация идёт по хешу кода,
+хеш у нас тот же, но подтвердить это может только опыт. Лот, о котором никто
+не знает, не продаётся, каким бы правильным ни был контракт.
+
+Второй, меньший: у нас `marketplace_fee_address` снят с живого листинга
+(`0:bee7a3d7…`), а в исходнике по умолчанию стоит другой
+(`EQDDuxx7sa3Dt2GE85a0sIHp4GVoa7OKbAanfo3co9H-h06d`). Берём наблюдённый —
+он с реального лота подарков, а дефолт в репозитории общий.

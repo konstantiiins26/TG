@@ -561,6 +561,30 @@ def normalize_ton_address(addr: str):
     return f"{workchain}:{decoded[2:34].hex()}"
 
 
+def friendly_ton_address(addr: str, bounceable: bool = True) -> str:
+    """
+    Обратное к `normalize_ton_address`: raw "0:hex" -> "EQ..."/"UQ...".
+
+    Нужно не для красоты. TonAPI отдаёт адреса ТОЛЬКО в raw-форме, а витрины
+    (getgems.io/nft/<адрес>) понимают user-friendly: ссылка с raw-адресом
+    открывается пустой страницей. Поймано пользователем 21.09.2026 —
+    уведомление о находке вело в никуда, и находка обесценивалась.
+
+    Непонятный адрес возвращается КАК ЕСТЬ, а не заменяется на пустую строку:
+    в уведомлении лучше нерабочая ссылка рядом с сырым адресом, чем отсутствие
+    и того, и другого.
+    """
+    norm = normalize_ton_address(addr)
+    if norm is None:
+        return addr or ""
+    wc_s, hex_s = norm.split(":", 1)
+    wc = int(wc_s)
+    tag = 0x11 if bounceable else 0x51
+    body = bytes([tag, 0xFF if wc == -1 else wc]) + bytes.fromhex(hex_s)
+    body += _crc16_xmodem(body).to_bytes(2, "big")
+    return base64.b64encode(body).decode().replace("+", "-").replace("/", "_")
+
+
 def is_collection_trusted(collection_addr: str) -> bool:
     """
     Проверяет адрес коллекции по whitelist.
@@ -2079,14 +2103,20 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
         if ev["buy_price"] > cap:
             lines.append(f"⚠️ не влезет в лимит: потолок сделки {cap} TON")
 
-    # Три способа добраться до лота вместо одного: ссылка на площадку может
-    # не открыться (форма URL не проверена, лот мог уйти с продажи), но адрес
-    # и обозреватель работают всегда.
+    # Три способа добраться до лота вместо одного. Форма ссылки на площадку
+    # сверена с getgems.io (getgems.io/nft/<user-friendly адрес>), но пустая
+    # страница всё равно возможна — если лот УЖЕ УШЁЛ С ПРОДАЖИ. Это не баг,
+    # а рынок, и обозреватель отличает одно от другого: он резолвит любой
+    # адрес всегда и показывает текущего владельца.
+    #
+    # Витрины понимают user-friendly форму, а TonAPI отдаёт raw. Подставить
+    # raw в ссылку значит отправить владельца на пустую страницу.
+    link_addr = friendly_ton_address(addr)
     if GIFT_URL_TEMPLATE:
-        lines.append(GIFT_URL_TEMPLATE.format(address=addr))
+        lines.append(GIFT_URL_TEMPLATE.format(address=link_addr))
     if EXPLORER_URL_TEMPLATE:
-        lines.append(EXPLORER_URL_TEMPLATE.format(address=addr))
-    lines.append(addr)
+        lines.append(EXPLORER_URL_TEMPLATE.format(address=link_addr))
+    lines.append(link_addr)
 
     notify("\n".join(lines))
     return True
@@ -2432,15 +2462,32 @@ GETGEMS_FEE_ADDR = "0:bee7a3d7b8c06f9552032c3880a56a74b702ad8b224f42bfb1ac1c33bd
 # 34 бита в блоке комиссий, назначение которых НЕ ОПОЗНАНО. Позиция и значение
 # сняты с живого листинга и воспроизводятся дословно. Знать, что это значит, не
 # требуется, чтобы повторить; требуется — чтобы менять. Не трогать.
-_FEES_UNKNOWN_A = 1000
-_FEES_UNKNOWN_B = 0
+# Проценты в хранилище контракта хранятся УМНОЖЕННЫМИ НА 100 000 в полях
+# uint17 (2% -> 2000, 0% -> 0). Раскладка взята из исходника Getgems
+# (packages/contracts/sources/nft-fixprice-sale-v4r1.fc, load_static_data) и
+# СОШЛАСЬ с живым листингом: те 34 бита, которые раньше читались как
+# "uint16=1000 + uint16=0 + 2 нулевых бита", это ровно uint17=2000 (2.0%) и
+# uint17=0 (0%) — то есть комиссия площадки и роялти, независимо подтверждённые
+# диалогом Getgems (0.1 на цене 5) и тремя лотами с Creator Fee 0.
+_PERCENT_SCALE = 100_000
+_PERCENT_BITS = 17
+
+
+def _percent_to_raw(pct) -> int:
+    """Доля (0.02) -> поле контракта (2000). Отрицательное и >100% отвергаются."""
+    raw = int((Decimal(str(pct)) * _PERCENT_SCALE).to_integral_value())
+    if not 0 <= raw < (1 << _PERCENT_BITS):
+        raise ValueError(f"процент вне диапазона поля uint{_PERCENT_BITS}: {pct}")
+    return raw
 
 
 def build_sale_contract_data(nft_address: str, owner_address: str,
                              price: Decimal, royalty_address: str,
                              created_at: int, public_key: int,
                              marketplace_address: str = GETGEMS_DEPLOYER,
-                             fee_address: str = GETGEMS_FEE_ADDR):
+                             fee_address: str = GETGEMS_FEE_ADDR,
+                             fee_percent=Decimal("0.02"),
+                             royalty_percent=Decimal("0")):
     """
     Хранилище контракта продажи `nft_sale_getgems_v4`.
 
@@ -2451,10 +2498,23 @@ def build_sale_contract_data(nft_address: str, owner_address: str,
     StateInit целиком, поэтому ошибка хоть в одном бите дала бы другой адрес;
     совпадение означает, что раскладка верна побитово. Есть тест, секция [39].
 
-    Зачем это нужно: листинг через деплойер Getgems требует подписи их
-    бэкенда, а контракт продажи можно задеплоить самим — код приходит в
-    сообщении дословно, адрес считается детерминированно. Подпись при этом
-    не нужна вовсе: она проверяется деплойером, которого в этом пути нет.
+    ПОДПИСЬ — НЕ ПРЕПЯТСТВИЕ (уточнено 21.09.2026 по исходнику Getgems,
+    packages/contracts/nft-fixprice-sale-v4/NftFixPriceSaleV4.data.ts). Те 512
+    бит в теле деплоя — действительно ed25519-подпись, но ключ к ней НЕ
+    принадлежит бэкенду Getgems: `buildNftFixPriceSaleV4R1DeployData()` зовёт
+    `randomKeyPair()` и генерирует одноразовую пару НА КАЖДЫЙ ЛОТ. Открытая
+    половина ложится в хранилище (те самые 256 бит), закрытой подписывается
+    сообщение `0xfb5dbf47`, и контракт сверяет одно с другим
+    (`check_signature(payload, signature, public_key)`).
+
+    Смысл подписи чисто технический: сообщение задаёт цену в джеттонах, а
+    словарь цен зависит от АДРЕСА контракта продажи, который сам зависит от
+    хранилища — подпись разрывает эту петлю. Для продажи за TON словарь пуст,
+    и сообщение деплоя не нужно вовсе.
+
+    Практический вывод: выставить лот САМИМ можно целиком — пару ключей мы
+    генерируем себе, `marketplace_address` ставим своим кошельком (в исходнике
+    туда кладётся адрес деплойера), и подпись собирается локально.
 
     ЧЕГО ЭТА ФУНКЦИЯ НЕ РЕШАЕТ: покажет ли Getgems самостоятельно
     задеплоенный лот на витрине. Лот, о котором никто не знает, не продаётся,
@@ -2470,9 +2530,8 @@ def build_sale_contract_data(nft_address: str, owner_address: str,
     fees = (_Builder()
             .store_address(_Address(fee_address))
             .store_address(_Address(royalty_address))
-            .store_uint(_FEES_UNKNOWN_A, 16)
-            .store_uint(_FEES_UNKNOWN_B, 16)
-            .store_uint(0, 2)
+            .store_uint(_percent_to_raw(fee_percent), _PERCENT_BITS)
+            .store_uint(_percent_to_raw(royalty_percent), _PERCENT_BITS)
             .store_address(_Address(nft_address))
             .store_uint(created_at, 32)
             .end_cell())
@@ -2484,9 +2543,9 @@ def build_sale_contract_data(nft_address: str, owner_address: str,
             .store_coins(nanotons)                          # full_price
             .store_uint(0, 32)                              # sold_at
             .store_uint(0, 64)                              # sold_query_id
-            .store_uint(0, 1)                               # флаг, назначение неизвестно
-            .store_uint(1, 1)                               # флаг, назначение неизвестно
-            .store_uint(public_key, 256)                    # ключ маркетплейса
+            .store_uint(0, 1)                               # jetton_price_dict: пуст
+            .store_uint(1, 1)                               # public_key присутствует
+            .store_uint(public_key, 256)                    # ключ ЭТОГО лота
             .store_ref(fees)
             .end_cell())
 

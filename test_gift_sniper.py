@@ -2199,11 +2199,12 @@ try:
     _txt = _sent40[-1]
     check("в сообщении есть цена и floor", "1.2" in _txt and "1.5" in _txt, _txt[:60])
     check("в сообщении есть ссылка на площадку", "getgems.io" in _txt)
-    # Ссылка на площадку может не открыться: её форма не проверена живьём, да
-    # и лот мог уйти с продажи. Обозреватель резолвит адрес всегда, а сам
-    # адрес можно вставить в поиск руками.
+    # Ссылка на площадку может не открыться и при верной форме — если лот уже
+    # ушёл с продажи. Обозреватель резолвит адрес всегда, а сам адрес можно
+    # вставить в поиск руками.
     check("есть ссылка на обозреватель", "tonviewer.com" in _txt)
-    check("есть сам адрес лота", _item40["address"] in _txt)
+    check("есть сам адрес лота",
+          gs.friendly_ton_address(_item40["address"]) in _txt)
     check("в симуляции честно сказано, что покупки не будет",
           "симуляц" in _txt.lower(), _txt)
 
@@ -2579,6 +2580,109 @@ finally:
     gs.REAL_EXECUTOR_AVAILABLE = _oexec2
     gs.WALLET_KEY_FILE = _okey
     gs.TRADING_NETWORK = _onet
+
+
+# =============================================================================
+print("\n[44] Адрес для ссылки: raw -> user-friendly")
+# =============================================================================
+
+# TonAPI отдаёт адреса ТОЛЬКО в raw-форме, витрины понимают user-friendly.
+# Ссылка getgems.io/nft/0:48de... открывается пустой страницей — поймано
+# пользователем 21.09.2026, уведомление о находке вело в никуда.
+_RAW = "0:48de39a63d627d30d2d62e7da41f793da94c5b3f3893864fe93c0617b36b708d"
+_FRIENDLY = "EQBI3jmmPWJ9MNLWLn2kH3k9qUxbPziThk_pPAYXs2twjaTx"
+
+check("raw-адрес превращается в EQ-форму",
+      gs.friendly_ton_address(_RAW) == _FRIENDLY, gs.friendly_ton_address(_RAW))
+
+# Круг обязан сходиться: иначе ссылка ведёт на ЧУЖОЙ предмет, а это хуже
+# пустой страницы — владелец решит, что смотрит на свою находку.
+check("обратное преобразование возвращает исходный адрес",
+      gs.normalize_ton_address(gs.friendly_ton_address(_RAW)) == _RAW)
+
+check("уже user-friendly адрес не портится",
+      gs.friendly_ton_address(_FRIENDLY) == _FRIENDLY)
+
+# Нераспознанный адрес возвращается как есть: в уведомлении лучше нерабочая
+# строка, чем пустая — по ней хотя бы видно, что бот что-то нашёл.
+check("мусор возвращается как есть, а не пустой строкой",
+      gs.friendly_ton_address("не адрес") == "не адрес")
+
+# Ссылка в уведомлении обязана собираться из FRIENDLY-формы. Проверяем через
+# само уведомление, а не через функцию: сломаться может именно подстановка.
+_sent = []
+_onotify = gs.notify
+_otok, _ochat = gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID
+try:
+    gs.notify = lambda text: _sent.append(text) or True
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "t", "c"
+    gs._find_sent_ts.clear()
+    gs.notify_find(
+        {"address": _RAW, "sale_price_ton": Decimal("4")},
+        {"floor": Decimal("5"), "floor_reliable": True},
+        {"discount_pct": Decimal("20.0"), "buy_price": Decimal("4"),
+         "net_profit": Decimal("0.2"), "roi_pct": Decimal("5"),
+         "peer_floor": None, "eff_floor": Decimal("5"), "peer_n": 0,
+         "rarity_pct": None, "rarest_trait": None})
+    _msg = _sent[0] if _sent else ""
+finally:
+    gs.notify = _onotify
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = _otok, _ochat
+
+check("в уведомлении ссылка на площадку с user-friendly адресом",
+      f"getgems.io/nft/{_FRIENDLY}" in _msg, _msg[-200:])
+check("raw-адрес в ссылку не попадает",
+      "/nft/0:" not in _msg and "tonviewer.com/0:" not in _msg)
+
+
+# =============================================================================
+print("\n[45] Проценты в контракте продажи: 34 бита опознаны")
+# =============================================================================
+
+# Раньше это были "_FEES_UNKNOWN_A = 1000" и "_FEES_UNKNOWN_B = 0" — значения,
+# снятые с живого листинга и воспроизводимые дословно, но без смысла.
+# Исходник Getgems (nft-fixprice-sale-v4r1.fc, load_static_data) говорит:
+# два поля uint17, процент умноженный на 100 000.
+#
+# СХОДИМОСТЬ: те же 34 бита, прочитанные по новой раскладке, дают 2.0% и 0% —
+# ровно то, что независимо подтверждено диалогом Getgems (0.1 на цене 5) и
+# тремя лотами с Creator Fee 0. Совпадение трёх независимых источников и есть
+# доказательство; хеш хранилища в секции [39] проверяет это побитово.
+check("2% превращается в поле контракта 2000", gs._percent_to_raw(Decimal("0.02")) == 2000)
+check("0% превращается в 0", gs._percent_to_raw(Decimal("0")) == 0)
+check("100% -- верхняя граница поля", gs._percent_to_raw(Decimal("1")) == 100000)
+
+# Диапазон проверяется, потому что переполнение uint17 не упало бы, а ТИХО
+# записало бы чужой процент: контракт отдал бы выручку не туда.
+_bad = 0
+for _v in ("-0.01", "1.5", "2"):
+    try:
+        gs._percent_to_raw(Decimal(_v))
+    except ValueError:
+        _bad += 1
+check("процент вне диапазона отвергается", _bad == 3, _bad)
+
+# Значение по умолчанию обязано совпадать с проверенной ставкой площадки.
+# Ошибка здесь тихо поменяет экономику задеплоенного лота, и заметить её
+# можно будет только по недополученной выручке.
+check("по умолчанию комиссия в контракте продажи -- 2%",
+      "fee_percent=Decimal(\"0.02\")" in open("gift_sniper.py", encoding="utf-8").read())
+check("по умолчанию роялти в контракте продажи -- 0",
+      "royalty_percent=Decimal(\"0\")" in open("gift_sniper.py", encoding="utf-8").read())
+
+if gs.REAL_EXECUTOR_AVAILABLE:
+    # Проценты обязаны ВЛИЯТЬ на хранилище: если поле пишется мимо, хеш
+    # не изменится, и мы этого не заметим.
+    _a = gs.build_sale_contract_data(
+        nft_address=LIVE_NFT, owner_address=LIVE_OWNER, price=LIVE_PRICE,
+        royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
+        public_key=LIVE_PUBKEY, fee_percent=Decimal("0.05"))
+    check("другая комиссия даёт другое хранилище", _a.hash.hex() != LIVE_DATA_HASH)
+    _b = gs.build_sale_contract_data(
+        nft_address=LIVE_NFT, owner_address=LIVE_OWNER, price=LIVE_PRICE,
+        royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
+        public_key=LIVE_PUBKEY, royalty_percent=Decimal("0.05"))
+    check("другое роялти даёт другое хранилище", _b.hash.hex() != LIVE_DATA_HASH)
 
 
 # =============================================================================
