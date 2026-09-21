@@ -2166,6 +2166,87 @@ check("адрес деплойера Getgems зафиксирован в код�
 
 
 # =============================================================================
+print("\n[40] Уведомления о находках")
+# =============================================================================
+
+# Пока бот в DRY_RUN — а он в нём надолго, живой режим закрыт воротами —
+# покупок не существует. Без уведомления о находке владелец не видит работы
+# бота вообще: смотреть лог на VPS с телефона никто не станет.
+
+_sent40 = []
+_ob40 = (gs.notify, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+         gs.FIND_NOTIFY_MAX_PER_HOUR, gs.DRY_RUN)
+try:
+    gs.notify = lambda text: _sent40.append(text)
+    gs.TELEGRAM_BOT_TOKEN = "тест"
+    gs.TELEGRAM_CHAT_ID = "42"
+    gs.FIND_NOTIFY_MAX_PER_HOUR = 3
+    gs.DRY_RUN = True
+    gs._find_sent_ts.clear()
+    gs._finds_suppressed = 0
+
+    _item40 = {"address": "0:" + "ab" * 32, "sale_price_ton": Decimal("1.2")}
+    _snap40 = {"floor": Decimal("1.5"), "floor_reliable": True}
+    _ev40 = {"discount_pct": Decimal("20.0"), "buy_price": Decimal("1.2"),
+             "net_profit": Decimal("0.12"), "roi_pct": Decimal("10"),
+             "peer_floor": None, "eff_floor": Decimal("1.5"), "peer_n": 0,
+             "rarity_pct": None, "rarest_trait": None}
+
+    check("находка отправляется", gs.notify_find(_item40, _snap40, _ev40) is True)
+    _txt = _sent40[-1]
+    check("в сообщении есть цена и floor", "1.2" in _txt and "1.5" in _txt, _txt[:60])
+    check("в сообщении есть ссылка на лот", "getgems.io/nft/" in _txt)
+    check("в симуляции честно сказано, что покупки не будет",
+          "симуляц" in _txt.lower(), _txt)
+
+    # Потолок частоты. Телефон, звонящий десять раз подряд, выключают — и
+    # тогда пропускают ту находку, ради которой всё затевалось.
+    _sent40.clear()
+    gs._find_sent_ts.clear()
+    gs._finds_suppressed = 0
+    _ok = [gs.notify_find(_item40, _snap40, _ev40) for _ in range(5)]
+    check("сверх лимита за час не шлём", _ok == [True, True, True, False, False],
+          str(_ok))
+    check("подавленные посчитаны", gs._finds_suppressed == 2,
+          str(gs._finds_suppressed))
+
+    # Подавленные обязаны всплыть в сводке: «тихо не отправили» и «находок не
+    # было» — разные вещи, и перепутать их значит решить, что рынок мёртв.
+    _sent40.clear()
+    gs.notify_heartbeat([], force=True)
+    check("сводка называет число подавленных находок",
+          any("подавлен" in t.lower() or "не отправлено" in t.lower() for t in _sent40),
+          str(_sent40))
+    check("счётчик подавленных сбрасывается после сводки",
+          gs._finds_suppressed == 0)
+
+    # Нулевой лимит = механизм выключен целиком.
+    gs.FIND_NOTIFY_MAX_PER_HOUR = 0
+    gs._find_sent_ts.clear()
+    check("нулевой лимит отключает уведомления о находках",
+          gs.notify_find(_item40, _snap40, _ev40) is False)
+
+    # Без токена Telegram — молча ничего, а не падение торгового цикла.
+    gs.FIND_NOTIFY_MAX_PER_HOUR = 10
+    gs.TELEGRAM_BOT_TOKEN = ""
+    check("без токена находка не шлётся и не падает",
+          gs.notify_find(_item40, _snap40, _ev40) is False)
+finally:
+    (gs.notify, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+     gs.FIND_NOTIFY_MAX_PER_HOUR, gs.DRY_RUN) = _ob40
+    gs._find_sent_ts.clear()
+    gs._finds_suppressed = 0
+
+# scan_finds() обязана молчать при недостоверном floor: находка, посчитанная
+# от floor по тонкой выборке, — это приглашение купить по завышенной оценке.
+check("при недостоверном floor находок нет",
+      gs.scan_finds({"floor": Decimal("1.5"), "floor_reliable": False,
+                     "candidates": [{"address": "0:" + "cd" * 32,
+                                     "sale_price_ton": Decimal("0.1")}]},
+                    None) == 0)
+
+
+# =============================================================================
 print("\n[30] Ставка комиссии площадки")
 # =============================================================================
 

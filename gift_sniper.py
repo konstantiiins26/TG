@@ -392,6 +392,16 @@ TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
 # блокировка лимитом, падение источника данных).
 HEARTBEAT_MIN       = int(os.getenv("HEARTBEAT_MIN", "60"))
 
+# Сколько уведомлений о НАХОДКАХ слать максимум за час. 0 = не слать вовсе.
+#
+# Потолок нужен по той же причине, что и HEARTBEAT_MIN: на тонком рынке одна
+# просадка floor делает кандидатами десяток лотов сразу, и телефон, который
+# звонит десять раз подряд, выключают. Выключенный телефон пропустит и ту
+# находку, ради которой всё затевалось.
+#
+# Подавленные находки НЕ теряются молча: их число попадает в сводку.
+FIND_NOTIFY_MAX_PER_HOUR = int(os.getenv("FIND_NOTIFY_MAX_PER_HOUR", "10"))
+
 # --- Запись рынка и бэктест (Ярус 3) -----------------------------------------
 # Исторического API у нас нет, поэтому бэктест гоняется по СОБСТВЕННОЙ записи
 # рынка: сначала --record несколько дней, потом --backtest по этому файлу.
@@ -1820,8 +1830,113 @@ def notify_heartbeat(snapshots: list, force: bool = False):
     if BANKROLL_TON > 0:
         lines.append(f"Банк: {available_bankroll()} TON свободно, "
                      f"позиций {open_positions_count()}")
+
+    global _finds_suppressed
+    if _finds_suppressed:
+        lines.append(f"Находок не отправлено из-за лимита: {_finds_suppressed}")
+        _finds_suppressed = 0
+
     notify("\n".join(lines))
     return True
+
+
+# Метки времени отправленных находок за последний час и счётчик подавленных.
+# Подавленные обязаны быть видимы: «тихо не отправили» и «находок не было» —
+# это разные вещи, и перепутать их значит решить, что рынок мёртв.
+_find_sent_ts: list = []
+_finds_suppressed = 0
+
+
+def notify_find(item: dict, snap: dict, ev: dict) -> bool:
+    """
+    Сообщает о ЛОТЕ, прошедшем детерминированный фильтр. True, если отправлено.
+
+    Зачем отдельно от уведомления о покупке: пока бот в DRY_RUN (а он в нём
+    будет долго — живой режим закрыт воротами), покупок не существует, и без
+    этого сообщения владелец не видит РАБОТЫ бота вообще. Смотреть в лог на
+    VPS с телефона никто не станет.
+
+    Шлётся ДО обращения к Claude и независимо от него: фильтр уже сказал «да»,
+    и это факт о рынке, а не мнение. Находка при этом ещё не покупка — её
+    может отклонить ИИ или срезать риск-лимит, и в сообщении это честно
+    названо ожиданием, а не результатом.
+    """
+    global _finds_suppressed
+    if FIND_NOTIFY_MAX_PER_HOUR <= 0:
+        return False
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
+    now = time.time()
+    _find_sent_ts[:] = [t for t in _find_sent_ts if now - t < 3600]
+    if len(_find_sent_ts) >= FIND_NOTIFY_MAX_PER_HOUR:
+        _finds_suppressed += 1
+        log.info(f"{_Color.GREY}Находка не отправлена: за час уже "
+                 f"{FIND_NOTIFY_MAX_PER_HOUR} уведомлений.{_Color.RESET}")
+        return False
+    _find_sent_ts.append(now)
+
+    addr = item.get("address", "")
+    lines = [
+        f"🎯 Находка: скидка {ev['discount_pct']}% от floor",
+        f"цена {ev['buy_price']} TON | floor {snap['floor']} TON",
+        f"ожидаемый профит {ev['net_profit']:.4f} TON (ROI {ev['roi_pct']}%)",
+    ]
+
+    # Оценка по сегменту важнее floor коллекции: лот с мусорной моделью ниже
+    # floor выглядит выгодным, но конкурировать будет со своим сегментом.
+    if ev.get("peer_floor") is not None and ev["eff_floor"] != snap["floor"]:
+        lines.append(f"по сегменту {ev['eff_floor']} TON (похожих {ev['peer_n']})")
+
+    if ev.get("rarity_pct") is not None:
+        lines.append(f"редкость {ev['rarity_pct']}% по «{ev['rarest_trait']}»")
+
+    # Почему находка может не стать покупкой — говорим сразу, иначе владелец
+    # ждёт сделки, которой не будет, и считает бота сломанным.
+    if DRY_RUN:
+        lines.append("режим симуляции — покупки НЕ будет")
+    elif not SELLING_IMPLEMENTED:
+        lines.append("продажи нет как кода — живой режим закрыт")
+    else:
+        cap = max_position_size(ev["roi_pct"])
+        if ev["buy_price"] > cap:
+            lines.append(f"⚠️ не влезет в лимит: потолок сделки {cap} TON")
+
+    lines.append(f"https://getgems.io/nft/{addr}")
+    notify("\n".join(lines))
+    return True
+
+
+def scan_finds(snap: dict, recent_sales) -> int:
+    """
+    Прогоняет кандидатов через фильтр БЕЗ покупки и ИИ. Возвращает число находок.
+
+    Нужна для режима записи: там `process_item()` не вызывается вовсе, то есть
+    бот копил бы рынок месяц и ни разу не сказал, что на нём вообще бывают
+    подходящие лоты. А это главное, что хочется знать до первой сделки —
+    годится ли выбранная коллекция под банк.
+
+    Бесплатна по определению: `evaluate_trade()` не ходит в сеть и не трогает
+    Claude. Дедупликация та же, что в торговле, иначе один и тот же лот
+    приходил бы в телефон каждый цикл.
+    """
+    if not snap.get("floor_reliable"):
+        return 0
+
+    found = 0
+    for item in snap.get("candidates", []):
+        if not is_collection_trusted(item.get("collection_address", "")):
+            continue
+        if already_analyzed(item, snap["floor"]):
+            continue
+        ev = evaluate_trade(item, snap, recent_sales)
+        if not ev["allowed"]:
+            continue
+        found += 1
+        log.info(f"{_Color.GREEN}НАХОДКА{_Color.RESET} {_short(item['address'])} | "
+                 f"{ev['reason']}")
+        notify_find(item, snap, ev)
+    return found
 
 
 def notify_startup(collections):
@@ -2454,6 +2569,11 @@ def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
     if not ev["allowed"]:
         log.info(f"{_Color.YELLOW}SKIP (фильтр){_Color.RESET} | {ev['reason']}")
         return
+
+    # Находка сообщается ДО Claude: фильтр уже сказал «да», и это факт о
+    # рынке. Ждать вердикта ИИ значило бы молчать о лоте, который владелец
+    # мог бы посмотреть сам, пока бот ещё только думает.
+    notify_find(item, snapshot, ev)
 
     # --- ИИ как ВТОРОЕ мнение по прошедшим фильтр лотам --------------------
     verdict = ai_analyze(client, item, floor_price, snapshot["floor_reliable"],
@@ -3445,6 +3565,13 @@ def _process_collection(client, collection: str, record: bool, trade: bool):
             if snap["sample_size"] > 0:
                 log.info(f"Записано: floor {snap['floor']} TON | "
                          f"выборка {snap['sample_size']} | кандидатов {len(candidates)}")
+                # Записи мало: владелец должен видеть, БЫВАЮТ ли на этой
+                # коллекции подходящие лоты, не дожидаясь конца наблюдений.
+                # Фильтр бесплатен, покупок в этом режиме нет.
+                found = scan_finds(snap, fetch_recent_sales_count(collection))
+                if found:
+                    log.info(f"{_Color.GREEN}Находок в этом цикле: {found}"
+                             f"{_Color.RESET}")
             else:
                 log.warning("Данных с рынка нет — снапшот НЕ записан.")
         elif not candidates:
