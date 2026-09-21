@@ -347,6 +347,7 @@ try:
     from tonutils.contracts import WalletV4R2 as _WalletV4R2
     from ton_core import to_nano as _to_nano
     from ton_core import Builder as _Builder
+    from ton_core import Address as _Address
 
     REAL_EXECUTOR_AVAILABLE = True
     _EXECUTOR_IMPORT_ERROR = ""
@@ -357,7 +358,7 @@ except ImportError as _exc:                # noqa: BLE001 — отсутстви
     # к ним даёт NameError — ошибку, которая выглядит как поломка кода, а не
     # как «библиотека не установлена», и уводит диагностику не туда.
     _TonapiClient = _NetworkGlobalID = _WalletV4R2 = _to_nano = None
-    _Builder = None
+    _Builder = _Address = None
 
 # ПРОДАЖИ НЕТ КАК КОДА. Флаг существует затем, чтобы это было ВОРОТАМИ, а не
 # примечанием в документации.
@@ -2119,6 +2120,74 @@ def build_set_price_body(new_price: Decimal, query_id: int = 0):
             .store_uint(query_id, 64)
             .store_coins(nanotons)
             .store_bit(0)
+            .end_cell())
+
+
+# Getgems-специфичные адреса, снятые с живого листинга (см. SELLING.md).
+# Это НЕ настройки: подставить сюда своё значение значит задеплоить контракт,
+# который площадка не узнает или который платит выручку не туда.
+GETGEMS_DEPLOYER = "0:39d63083e48f46452ff8a04cd0d3733a90c8be299aa5951b62741759b2c17e0e"
+GETGEMS_FEE_ADDR = "0:bee7a3d7b8c06f9552032c3880a56a74b702ad8b224f42bfb1ac1c33bd719080"
+
+# 34 бита в блоке комиссий, назначение которых НЕ ОПОЗНАНО. Позиция и значение
+# сняты с живого листинга и воспроизводятся дословно. Знать, что это значит, не
+# требуется, чтобы повторить; требуется — чтобы менять. Не трогать.
+_FEES_UNKNOWN_A = 1000
+_FEES_UNKNOWN_B = 0
+
+
+def build_sale_contract_data(nft_address: str, owner_address: str,
+                             price: Decimal, royalty_address: str,
+                             created_at: int, public_key: int,
+                             marketplace_address: str = GETGEMS_DEPLOYER,
+                             fee_address: str = GETGEMS_FEE_ADDR):
+    """
+    Хранилище контракта продажи `nft_sale_getgems_v4`.
+
+    Раскладка ДОКАЗАНА, а не предположена: собранная этой функцией ячейка при
+    полях живого листинга даёт хеш `7b2f33f8...bca042eb` — ровно тот, что у
+    задеплоенного контракта. Вместе с дословной ячейкой кода она даёт адрес
+    `EQCcWUC7...kSKKFSO1`, который существует в блокчейне. Адрес — это хеш
+    StateInit целиком, поэтому ошибка хоть в одном бите дала бы другой адрес;
+    совпадение означает, что раскладка верна побитово. Есть тест, секция [39].
+
+    Зачем это нужно: листинг через деплойер Getgems требует подписи их
+    бэкенда, а контракт продажи можно задеплоить самим — код приходит в
+    сообщении дословно, адрес считается детерминированно. Подпись при этом
+    не нужна вовсе: она проверяется деплойером, которого в этом пути нет.
+
+    ЧЕГО ЭТА ФУНКЦИЯ НЕ РЕШАЕТ: покажет ли Getgems самостоятельно
+    задеплоенный лот на витрине. Лот, о котором никто не знает, не продаётся,
+    и проверить это можно только опытом.
+    """
+    if _Builder is None or _Address is None:
+        raise RuntimeError(
+            f"tonutils не установлен ({_EXECUTOR_IMPORT_ERROR}). "
+            f"Для сборки контракта продажи: pip install tonutils ton-core")
+
+    nanotons = int((Decimal(str(price)) * NANO_PER_TON).to_integral_value())
+
+    fees = (_Builder()
+            .store_address(_Address(fee_address))
+            .store_address(_Address(royalty_address))
+            .store_uint(_FEES_UNKNOWN_A, 16)
+            .store_uint(_FEES_UNKNOWN_B, 16)
+            .store_uint(0, 2)
+            .store_address(_Address(nft_address))
+            .store_uint(created_at, 32)
+            .end_cell())
+
+    return (_Builder()
+            .store_bit(0)                                   # is_complete
+            .store_address(_Address(marketplace_address))
+            .store_address(_Address(owner_address))         # продавец
+            .store_coins(nanotons)                          # full_price
+            .store_uint(0, 32)                              # sold_at
+            .store_uint(0, 64)                              # sold_query_id
+            .store_uint(0, 1)                               # флаг, назначение неизвестно
+            .store_uint(1, 1)                               # флаг, назначение неизвестно
+            .store_uint(public_key, 256)                    # ключ маркетплейса
+            .store_ref(fees)
             .end_cell())
 
 

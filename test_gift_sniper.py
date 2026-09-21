@@ -2102,6 +2102,70 @@ check("газ смены цены задан отдельно от газа по
 
 
 # =============================================================================
+print("\n[39] Хранилище контракта продажи: сверка с задеплоенным контрактом")
+# =============================================================================
+
+# Раскладка v4 нигде не документирована, поэтому проверяется СХОДИМОСТЬЮ:
+# собранная из полей живого листинга ячейка обязана дать хеш того хранилища,
+# которое реально лежит в блокчейне. Хеш data входит в хеш StateInit, а тот
+# И ЕСТЬ адрес контракта — ошибка хоть в одном бите дала бы другой адрес.
+#
+# Поля сняты с листинга Xmas Stocking #91332 (18.09.2026), контракт
+# EQCcWUC7KPl_MXXsDHGt5GxJyP9Eo_54C88xBK89kSKKFSO1.
+LIVE_NFT      = "0:48de39a63d627d30d2d62e7da41f793da94c5b3f3893864fe93c0617b36b708d"
+LIVE_OWNER    = "0:05ea962de15b8115bdbd5eda1be44986d1eaa9d8527dbc6fcd249fd2a08651e3"
+LIVE_ROYALTY  = "0:68f3a076d3451a18fd41e05c71b4c020545d46b2757064e65825ded0c49bf02c"
+LIVE_PUBKEY   = 0xb1b12b8f4eaa103fa8b05b17bb5fd96362fda6dd43a258c4f656976a5391f388
+LIVE_CREATED  = 1789755986
+LIVE_PRICE    = Decimal("5")
+LIVE_DATA_HASH = "7b2f33f8de550b5639ea9494ba3ee282e6b5ea760bc05b7a0aff2f35bca042eb"
+
+if gs.REAL_EXECUTOR_AVAILABLE:
+    _data = gs.build_sale_contract_data(
+        nft_address=LIVE_NFT, owner_address=LIVE_OWNER, price=LIVE_PRICE,
+        royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
+        public_key=LIVE_PUBKEY)
+    check("хранилище контракта совпадает с задеплоенным побитово",
+          _data.hash.hex() == LIVE_DATA_HASH, _data.hash.hex())
+
+    # Цена обязана влиять на хранилище: одинаковая ячейка при разных ценах
+    # означала бы контракт, продающий не за то, что мы просили.
+    _cheap = gs.build_sale_contract_data(
+        nft_address=LIVE_NFT, owner_address=LIVE_OWNER, price=Decimal("3.33"),
+        royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
+        public_key=LIVE_PUBKEY)
+    check("другая цена даёт другое хранилище",
+          _cheap.hash.hex() != LIVE_DATA_HASH)
+
+    # И адрес продавца тоже: контракт с чужим адресом выручки заплатит не нам.
+    _other_owner = gs.build_sale_contract_data(
+        nft_address=LIVE_NFT, owner_address=LIVE_ROYALTY, price=LIVE_PRICE,
+        royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
+        public_key=LIVE_PUBKEY)
+    check("другой продавец даёт другое хранилище",
+          _other_owner.hash.hex() != LIVE_DATA_HASH)
+else:
+    print("  --   tonutils не установлен: сверка хранилища пропущена")
+    try:
+        gs.build_sale_contract_data(LIVE_NFT, LIVE_OWNER, LIVE_PRICE,
+                                    LIVE_ROYALTY, LIVE_CREATED, LIVE_PUBKEY)
+        _clear39 = False
+    except RuntimeError as e:
+        _clear39 = "tonutils" in str(e) and "pip install" in str(e)
+    except NameError:
+        _clear39 = False
+    check("без библиотеки сборка даёт понятную ошибку, а не NameError", _clear39)
+
+# Адреса Getgems — не настройки. Подставить туда своё значение значит
+# задеплоить контракт, который площадка не узнает или который платит не туда.
+check("адрес деплойера Getgems зафиксирован в коде, а не читается из окружения",
+      "GETGEMS_DEPLOYER" not in open("gift_sniper.py", encoding="utf-8").read()
+      .split("GETGEMS_DEPLOYER =")[1].split("\n")[0] and
+      "getenv" not in open("gift_sniper.py", encoding="utf-8").read()
+      .split("GETGEMS_DEPLOYER =")[1].split("\n")[0])
+
+
+# =============================================================================
 print("\n[30] Ставка комиссии площадки")
 # =============================================================================
 
