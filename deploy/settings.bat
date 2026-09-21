@@ -146,4 +146,12 @@ set HEARTBEAT_MIN=60
 REM Skolko uvedomleniy o NAHODKAH slat maksimum za chas. 0 = ne slat.
 set FIND_NOTIFY_MAX_PER_HOUR=10
 
+REM --- Ssylka na lot v uvedomlenii ---
+REM Forma URL u Getgems NE PROVERENA: iz sredy razrabotki net seti k
+REM getgems.io, a pervaya versiya otkryvalas pustoy. Esli pravilnaya forma
+REM okazhetsya drugoy - pomenyayte stroku nizhe, kod trogat ne nado.
+REM Ryadom bot vsegda daet ssylku na obozrevatel i sam adres lota.
+set GIFT_URL_TEMPLATE=https://getgems.io/nft/{address}
+set EXPLORER_URL_TEMPLATE=https://tonviewer.com/{address}
+
 REM Konec nastroek. Zapusk - v run.bat ili start-windows.bat.

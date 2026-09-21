@@ -402,6 +402,22 @@ HEARTBEAT_MIN       = int(os.getenv("HEARTBEAT_MIN", "60"))
 # Подавленные находки НЕ теряются молча: их число попадает в сводку.
 FIND_NOTIFY_MAX_PER_HOUR = int(os.getenv("FIND_NOTIFY_MAX_PER_HOUR", "10"))
 
+# Шаблон ссылки на лот в уведомлении. {address} подставляется.
+#
+# Форма URL у Getgems НЕ ПРОВЕРЕНА мной живьём — из среды разработки нет сети
+# к getgems.io, а первая версия («/nft/<адрес>») у пользователя открывалась
+# пустой. Поэтому это НАСТРОЙКА, а не константа: если площадка сменит форму
+# или угадано неверно, чинится строкой в settings.bat, а не правкой кода.
+#
+# Рядом со ссылкой на площадку сообщение всегда даёт ссылку на ОБОЗРЕВАТЕЛЬ и
+# сам адрес: обозреватель резолвит любой адрес всегда и показывает, кому
+# предмет принадлежит сейчас, а адрес можно вставить в поиск площадки руками.
+# Ссылка, ведущая в пустоту, обесценивает всё уведомление целиком.
+GIFT_URL_TEMPLATE = os.getenv(
+    "GIFT_URL_TEMPLATE", "https://getgems.io/nft/{address}")
+EXPLORER_URL_TEMPLATE = os.getenv(
+    "EXPLORER_URL_TEMPLATE", "https://tonviewer.com/{address}")
+
 # --- Запись рынка и бэктест (Ярус 3) -----------------------------------------
 # Исторического API у нас нет, поэтому бэктест гоняется по СОБСТВЕННОЙ записи
 # рынка: сначала --record несколько дней, потом --backtest по этому файлу.
@@ -2063,7 +2079,15 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
         if ev["buy_price"] > cap:
             lines.append(f"⚠️ не влезет в лимит: потолок сделки {cap} TON")
 
-    lines.append(f"https://getgems.io/nft/{addr}")
+    # Три способа добраться до лота вместо одного: ссылка на площадку может
+    # не открыться (форма URL не проверена, лот мог уйти с продажи), но адрес
+    # и обозреватель работают всегда.
+    if GIFT_URL_TEMPLATE:
+        lines.append(GIFT_URL_TEMPLATE.format(address=addr))
+    if EXPLORER_URL_TEMPLATE:
+        lines.append(EXPLORER_URL_TEMPLATE.format(address=addr))
+    lines.append(addr)
+
     notify("\n".join(lines))
     return True
 
