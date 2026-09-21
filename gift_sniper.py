@@ -1780,20 +1780,86 @@ def check_risk_limits(buy_price: Decimal, roi_pct=None):
     return True, "лимиты в норме"
 
 
-def notify(text: str):
+def notify(text: str) -> bool:
     """
-    Шлёт уведомление в Telegram. Полностью необязательно: без токена — тихо
-    ничего не делает. Никогда не роняет торговый цикл и не логирует токен.
+    Шлёт уведомление в Telegram. True — Telegram подтвердил доставку.
+
+    Необязательно: без токена тихо ничего не делает. Никогда не роняет
+    торговый цикл и НИКОГДА не логирует токен (он лежит прямо в URL, поэтому
+    в сообщения об ошибке попадает только описание от Telegram, не адрес).
+
+    ПРОВЕРКА ОТВЕТА ОБЯЗАТЕЛЬНА, и вот почему. `requests.post` бросает
+    исключение только на сетевой ошибке. На неверный токен Telegram отвечает
+    401, на неизвестный chat_id — 400, и оба раза это ОБЫЧНЫЙ ответ: код без
+    проверки статуса считал их успехом. Владелец видел ровный зелёный лог и
+    пустой чат, а в логе не было ни строчки о причине. Именно так и вышло
+    21.09.2026.
+
+    Telegram в теле ответа присылает человеческое объяснение
+    (`description`) — его и показываем: «chat not found» и «Unauthorized»
+    лечатся по-разному, и догадываться, какое из них случилось, незачем.
     """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        return False
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
             timeout=HTTP_TIMEOUT_SEC)
     except Exception as e:  # noqa: BLE001 — уведомление не стоит торговли
         log.warning(f"Не удалось отправить уведомление в Telegram: {type(e).__name__}")
+        return False
+
+    if r.ok:
+        return True
+
+    # Описание от Telegram — единственное, что стоит показать. Ни URL, ни
+    # заголовков: в URL лежит токен.
+    try:
+        why = r.json().get("description", "")
+    except Exception:  # noqa: BLE001 — тело может быть не JSON
+        why = ""
+
+    hint = ""
+    low = why.lower()
+    if "chat not found" in low:
+        hint = (" — проверьте TELEGRAM_CHAT_ID и НАПИШИТЕ своему боту /start: "
+                "бот не может начать переписку первым")
+    elif "unauthorized" in low:
+        hint = " — TELEGRAM_BOT_TOKEN неверный или отозван (@BotFather)"
+    elif "bot was blocked" in low:
+        hint = " — вы заблокировали бота, разблокируйте его в Telegram"
+
+    log.warning(f"{_Color.YELLOW}Telegram отклонил сообщение (HTTP {r.status_code}): "
+                f"{why or 'без объяснения'}{hint}{_Color.RESET}")
+    return False
+
+
+def test_telegram() -> bool:
+    """
+    Проверка связи с Telegram одной командой. Печатает, что именно не так.
+
+    Нужна, потому что иначе владелец узнаёт о молчании бота только по
+    отсутствию сообщений — а отсутствие сообщения выглядит одинаково при
+    «ничего не нашлось», «токен неверный» и «бот заблокирован».
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        log.error(f"{_Color.RED}TELEGRAM_BOT_TOKEN не задан. Токен берут у "
+                  f"@BotFather, вписывают в deploy/my-secrets.bat{_Color.RESET}")
+        return False
+    if not TELEGRAM_CHAT_ID:
+        log.error(f"{_Color.RED}TELEGRAM_CHAT_ID не задан. Свой id узнают у "
+                  f"@userinfobot, вписывают в deploy/my-secrets.bat{_Color.RESET}")
+        return False
+
+    log.info(f"Отправляю тестовое сообщение в чат {TELEGRAM_CHAT_ID}...")
+    if notify("✅ Проверка связи. Снайпер сможет сюда писать."):
+        log.info(f"{_Color.GREEN}Доставлено. Посмотрите в Telegram."
+                 f"{_Color.RESET}")
+        return True
+
+    log.error(f"{_Color.RED}Не доставлено — причина строкой выше.{_Color.RESET}")
+    return False
 
 
 # Тихий счётчик: сводка шлётся раз в HEARTBEAT_MIN минут, а не каждый цикл.
@@ -3633,6 +3699,8 @@ def parse_args(argv=None):
     parser.add_argument("--set-price", nargs=2, metavar=("SALE_ADDRESS", "PRICE"),
                         help="сменить цену выставленного лота одной транзакцией "
                              "на контракт продажи (DRY_RUN=1 только печатает)")
+    parser.add_argument("--test-telegram", action="store_true",
+                        help="отправить тестовое сообщение в Telegram и выйти")
     parser.add_argument("--probe", metavar="ADDRESS",
                         help="проверить адрес (кошелёк или коллекцию) и показать, "
                              "что парсер извлёк из живого ответа API")
@@ -3647,6 +3715,9 @@ if __name__ == "__main__":
         if args.probe:
             # Только чтение API: ни покупок, ни записи.
             sys.exit(0 if probe(args.probe) else 1)
+        if args.test_telegram:
+            # Ни сети к TonAPI, ни покупок: только проверка канала связи.
+            sys.exit(0 if test_telegram() else 1)
         if args.set_price:
             # Единственный режим, который ТРАТИТ деньги напрямую, поэтому
             # он же единственный, где DRY_RUN проверяется внутри функции.

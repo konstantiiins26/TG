@@ -952,6 +952,9 @@ class _FakeResponse:
         self.status_code = status_code
         self.headers = {}
         self.text = ""
+        # `ok` нужен notify(): он проверяет статус ответа, потому что
+        # requests.post на HTTP-ошибку исключения не бросает.
+        self.ok = 200 <= status_code < 300
 
     def raise_for_status(self):
         return None
@@ -2244,6 +2247,67 @@ check("при недостоверном floor находок нет",
                      "candidates": [{"address": "0:" + "cd" * 32,
                                      "sale_price_ton": Decimal("0.1")}]},
                     None) == 0)
+
+
+# =============================================================================
+print("\n[41] Telegram: отказ сервера НЕ выглядит успехом")
+# =============================================================================
+
+# requests.post бросает исключение только на СЕТЕВОЙ ошибке. Неверный токен
+# это HTTP 401, неизвестный chat_id — 400, и оба раза ответ обычный. Код без
+# проверки статуса считал их успехом: владелец видел ровный зелёный лог и
+# пустой чат, а причины в логе не было вовсе. Поймано живым прогоном 21.09.2026.
+
+class _Resp41:
+    def __init__(self, ok, code=200, body=None):
+        self.ok, self.status_code, self._body = ok, code, (body or {})
+
+    def json(self):
+        return self._body
+
+
+_ob41 = (gs.requests.post, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID)
+_logged41 = []
+_olog41 = gs.log.warning
+try:
+    gs.TELEGRAM_BOT_TOKEN = "123:FAKE"
+    gs.TELEGRAM_CHAT_ID = "42"
+    gs.log.warning = lambda m, *a, **k: _logged41.append(str(m))
+
+    gs.requests.post = lambda *a, **k: _Resp41(True)
+    check("успешная отправка = True", gs.notify("привет") is True)
+
+    _logged41.clear()
+    gs.requests.post = lambda *a, **k: _Resp41(
+        False, 401, {"description": "Unauthorized"})
+    check("неверный токен = False, а не тихий успех", gs.notify("привет") is False)
+    check("в логе назван токен как причина",
+          any("TELEGRAM_BOT_TOKEN" in m for m in _logged41), str(_logged41))
+
+    _logged41.clear()
+    gs.requests.post = lambda *a, **k: _Resp41(
+        False, 400, {"description": "Bad Request: chat not found"})
+    check("неизвестный chat_id = False", gs.notify("привет") is False)
+    check("в логе совет написать боту /start",
+          any("/start" in m for m in _logged41), str(_logged41))
+
+    # Токен лежит прямо в URL, поэтому в лог он попасть не должен НИКОГДА.
+    check("токен не утёк в лог",
+          not any("FAKE" in m for m in _logged41), str(_logged41))
+
+    # Сетевая ошибка — тоже не успех.
+    _logged41.clear()
+    def _boom(*a, **k):
+        raise ConnectionError("сеть упала")
+    gs.requests.post = _boom
+    check("сетевая ошибка = False", gs.notify("привет") is False)
+
+    # Без токена — тихо и False, торговый цикл не страдает.
+    gs.TELEGRAM_BOT_TOKEN = ""
+    check("без токена = False без падения", gs.notify("привет") is False)
+finally:
+    (gs.requests.post, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID) = _ob41
+    gs.log.warning = _olog41
 
 
 # =============================================================================
