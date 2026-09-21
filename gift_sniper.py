@@ -315,6 +315,16 @@ CONFIRM_LIVE_TRADING = os.getenv("CONFIRM_LIVE_TRADING", "")
 # поэтому ошибка в большую сторону ничего не стоит, а в меньшую — стоит сделки.
 PURCHASE_GAS_TON    = Decimal(os.getenv("PURCHASE_GAS_TON", "0.3"))
 
+# Газ на смену цены. В ОТЛИЧИЕ от PURCHASE_GAS_TON эта величина НЕ ИЗМЕРЕНА:
+# диалога Getgems со смены цены у нас нет, а из наблюдённой транзакции видно
+# только тело сообщения, не приложенную сумму. 0.05 — с запасом над типичной
+# стоимостью обработки сообщения в TON (сотые доли).
+#
+# Ошибиться вверх дёшево: остаток оседает на балансе контракта продажи, то
+# есть у продавца, и возвращается при снятии лота или продаже. Ошибиться вниз
+# значит не доисполнить сообщение — цена не сменится, а газ всё равно уйдёт.
+SET_PRICE_GAS_TON   = Decimal(os.getenv("SET_PRICE_GAS_TON", "0.05"))
+
 # Площадки, чей протокол покупки мы понимаем. Платёж на контракт продажи
 # работает так, как мы рассчитываем, только у Getgems — это единственная
 # площадка, чью карточку и ответ API удалось сверить.
@@ -336,6 +346,7 @@ try:
     from tonutils.clients.base import NetworkGlobalID as _NetworkGlobalID
     from tonutils.contracts import WalletV4R2 as _WalletV4R2
     from ton_core import to_nano as _to_nano
+    from ton_core import Builder as _Builder
 
     REAL_EXECUTOR_AVAILABLE = True
     _EXECUTOR_IMPORT_ERROR = ""
@@ -346,6 +357,7 @@ except ImportError as _exc:                # noqa: BLE001 — отсутстви
     # к ним даёт NameError — ошибку, которая выглядит как поломка кода, а не
     # как «библиотека не установлена», и уводит диагностику не туда.
     _TonapiClient = _NetworkGlobalID = _WalletV4R2 = _to_nano = None
+    _Builder = None
 
 # ПРОДАЖИ НЕТ КАК КОДА. Флаг существует затем, чтобы это было ВОРОТАМИ, а не
 # примечанием в документации.
@@ -2084,6 +2096,111 @@ def execute_blockchain_buy(item_id: str, price, sale_address: str = "",
         return False
 
 
+def build_set_price_body(new_price: Decimal, query_id: int = 0):
+    """
+    Тело сообщения «сменить цену» для контракта продажи Getgems v4.
+
+    Раскладка: op 0xfd135f7b (32) + query_id (64) + new_price (coins) + 1 нулевой
+    бит, без ссылок.
+
+    Это НЕ реконструкция по документации, которой у контракта нет. Раскладка
+    проверена побайтово: собранная этой функцией ячейка при цене 77 TON и
+    query_id 8549106351564267300 даёт ровно тот BOC, который ушёл в живой
+    операции смены цены (см. SELLING.md). Есть тест, он сверяет с дословной
+    строкой — так что случайная правка раскладки не пройдёт молча.
+    """
+    if _Builder is None:
+        raise RuntimeError(
+            f"tonutils не установлен ({_EXECUTOR_IMPORT_ERROR}). "
+            f"Для работы с контрактом продажи: pip install tonutils ton-core")
+    nanotons = int((Decimal(str(new_price)) * NANO_PER_TON).to_integral_value())
+    return (_Builder()
+            .store_uint(0xfd135f7b, 32)
+            .store_uint(query_id, 64)
+            .store_coins(nanotons)
+            .store_bit(0)
+            .end_cell())
+
+
+def execute_set_price(sale_address: str, new_price, query_id: int = 0) -> bool:
+    """
+    Меняет цену уже выставленного лота. True только если транзакция ушла.
+
+    Зачем отдельно от листинга: перевыставить лот дешевле можно ОДНОЙ короткой
+    транзакцией на контракт продажи — не забирая предмет, не деплоя контракт
+    заново и не собирая payload на 2148 байт. Из этого состоит стоп-лосс и
+    подстройка под уехавший floor.
+
+    Сообщение уходит на КОНТРАКТ ПРОДАЖИ. Контракт исполнит его только от
+    владельца лота, поэтому чужой лот так не подвинешь; но адрес всё равно
+    проверяется на разбираемость — отправка в никуда сожгла бы газ молча.
+    """
+    if not sale_address or normalize_ton_address(sale_address) is None:
+        log.error(f"{_Color.RED}Адрес контракта продажи не распознан: "
+                  f"{sale_address!r}. Цена НЕ изменена.{_Color.RESET}")
+        return False
+
+    price = Decimal(str(new_price))
+    if price <= 0:
+        log.error(f"{_Color.RED}Цена должна быть положительной, получено "
+                  f"{new_price!r}. Цена НЕ изменена.{_Color.RESET}")
+        return False
+
+    if DRY_RUN:
+        log.info(f"{_Color.GREEN}[SUCCESS] (СИМУЛЯЦИЯ) Цена лота на контракте "
+                 f"{_short(sale_address)} -> {price} TON{_Color.RESET}")
+        return True
+
+    if not REAL_EXECUTOR_AVAILABLE:
+        log.error(f"{_Color.RED}Исполнитель недоступен ({_EXECUTOR_IMPORT_ERROR}). "
+                  f"Цена НЕ изменена. См. SETUP.md.{_Color.RESET}")
+        return False
+
+    try:
+        return asyncio.run(_send_set_price(sale_address, price, query_id))
+    except Exception as e:  # noqa: BLE001 — падение здесь НЕ должно выглядеть успехом
+        log.error(f"{_Color.RED}Смена цены не удалась ({type(e).__name__}: {e}). "
+                  f"Цена НЕ изменена.{_Color.RESET}")
+        return False
+
+
+async def _send_set_price(sale_address: str, price: Decimal, query_id: int) -> bool:
+    """
+    Отправляет сообщение смены цены на контракт продажи.
+
+    bounce=True намеренно: если контракта по адресу нет или он отверг
+    сообщение, деньги вернутся, а не осядут на несуществующем адресе.
+    """
+    mnemonic, err = load_wallet_key()
+    if err:
+        log.error(f"{_Color.RED}Кошелёк недоступен: {err}{_Color.RESET}")
+        return False
+
+    client = _TonapiClient(_trading_network(), api_key=TONAPI_KEY or None)
+    wallet, _pub, _priv, _words = _WalletV4R2.from_mnemonic(client, mnemonic)
+    await wallet.refresh()
+
+    balance_ton = Decimal(wallet.balance) / NANO_PER_TON
+    if balance_ton < SET_PRICE_GAS_TON:
+        log.error(f"{_Color.RED}На кошельке {balance_ton:.4f} TON, на газ нужно "
+                  f"{SET_PRICE_GAS_TON}. Цена НЕ изменена.{_Color.RESET}")
+        return False
+
+    log.warning(f"{_Color.YELLOW}ОТПРАВКА РЕАЛЬНОЙ ТРАНЗАКЦИИ: смена цены на "
+                f"{price} TON, контракт {_short(sale_address)} "
+                f"({TRADING_NETWORK}){_Color.RESET}")
+
+    msg = await wallet.transfer(destination=sale_address,
+                                amount=_to_nano(float(SET_PRICE_GAS_TON)),
+                                body=build_set_price_body(price, query_id),
+                                bounce=True)
+
+    log.info(f"{_Color.GREEN}[SUCCESS] Транзакция отправлена. Новая цена "
+             f"{price} TON{_Color.RESET}")
+    log.info(f"Кошелёк: {wallet.address.to_str()} | сеть: {TRADING_NETWORK}")
+    return msg is not None
+
+
 def _trading_network():
     """
     NetworkGlobalID под TRADING_NETWORK. По умолчанию — testnet.
@@ -3317,6 +3434,9 @@ def parse_args(argv=None):
     parser.add_argument("--markets", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="сравнить площадки по записи: где дешевле и есть ли "
                              "арбитраж между ними")
+    parser.add_argument("--set-price", nargs=2, metavar=("SALE_ADDRESS", "PRICE"),
+                        help="сменить цену выставленного лота одной транзакцией "
+                             "на контракт продажи (DRY_RUN=1 только печатает)")
     parser.add_argument("--probe", metavar="ADDRESS",
                         help="проверить адрес (кошелёк или коллекцию) и показать, "
                              "что парсер извлёк из живого ответа API")
@@ -3331,6 +3451,11 @@ if __name__ == "__main__":
         if args.probe:
             # Только чтение API: ни покупок, ни записи.
             sys.exit(0 if probe(args.probe) else 1)
+        if args.set_price:
+            # Единственный режим, который ТРАТИТ деньги напрямую, поэтому
+            # он же единственный, где DRY_RUN проверяется внутри функции.
+            _addr, _price = args.set_price
+            sys.exit(0 if execute_set_price(_addr, _price) else 1)
         if args.afford:
             # Чистая арифметика: ни сети, ни записи, ни покупок.
             sys.exit(0 if show_affordability() else 1)

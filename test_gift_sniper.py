@@ -2033,6 +2033,75 @@ finally:
 
 
 # =============================================================================
+print("\n[38] Смена цены: сверка с живой транзакцией")
+# =============================================================================
+
+# Раскладка сообщения не реконструируется по документации — её у контракта
+# нет. Она проверяется СХОДИМОСТЬЮ: собранная ячейка обязана совпасть байт в
+# байт с телом операции, которая реально прошла в блокчейне (владелец
+# поставил 77 TON). Тот же критерий, из-за которого op 0xfd135f7b сначала
+# опознали неверно как «снятие с продажи».
+#
+# Дословное тело, снятое кнопкой «Copy Raw body» (18.09.2026):
+LIVE_SET_PRICE_BOC = "b5ee9c72010101010014000023fd135f7b76a486ee80061f24511ed8ec2004"
+LIVE_QUERY_ID = 8549106351564267300
+LIVE_PRICE = Decimal("77")
+
+if gs.REAL_EXECUTOR_AVAILABLE:
+    _cell = gs.build_set_price_body(LIVE_PRICE, LIVE_QUERY_ID)
+    check("сборка цены совпадает с живой транзакцией побайтово",
+          _cell.to_boc().hex() == LIVE_SET_PRICE_BOC,
+          _cell.to_boc().hex())
+
+    # Цена обязана попадать в тело: ячейка, одинаковая при разных ценах,
+    # означала бы, что цена никуда не записалась.
+    _other = gs.build_set_price_body(Decimal("5"), LIVE_QUERY_ID)
+    check("другая цена даёт другое тело",
+          _other.to_boc().hex() != LIVE_SET_PRICE_BOC)
+else:
+    print("  --   tonutils не установлен: сверка байтов пропущена")
+    try:
+        gs.build_set_price_body(Decimal("5"))
+        _clear38 = False
+    except RuntimeError as e:
+        _clear38 = "tonutils" in str(e) and "pip install" in str(e)
+    except NameError:
+        _clear38 = False
+    check("без библиотеки сборка даёт понятную ошибку, а не NameError", _clear38)
+
+# Отказы. Смена цены тратит газ, поэтому «успех» без отправки так же вреден,
+# как и у покупки: он сказал бы, что лот перевыставлен, когда он не тронут.
+_ob38 = (gs.DRY_RUN, gs.REAL_EXECUTOR_AVAILABLE)
+try:
+    gs.DRY_RUN = True          # даже в симуляции мусорный адрес — не успех
+    check("нераспознанный адрес контракта = False",
+          gs.execute_set_price("не-адрес", "5") is False)
+    check("пустой адрес контракта = False",
+          gs.execute_set_price("", "5") is False)
+    check("нулевая цена = False",
+          gs.execute_set_price(_GOOD_ADDR38 := "EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7",
+                               "0") is False)
+    check("отрицательная цена = False",
+          gs.execute_set_price(_GOOD_ADDR38, "-5") is False)
+    check("в симуляции корректный вызов проходит",
+          gs.execute_set_price(_GOOD_ADDR38, "5") is True)
+
+    # Без библиотеки подписи живой режим обязан отказать, а не притвориться.
+    gs.DRY_RUN = False
+    gs.REAL_EXECUTOR_AVAILABLE = False
+    check("без исполнителя живая смена цены = False",
+          gs.execute_set_price(_GOOD_ADDR38, "5") is False)
+finally:
+    (gs.DRY_RUN, gs.REAL_EXECUTOR_AVAILABLE) = _ob38
+
+# Газ на смену цены — величина, отличная от газа покупки, и НЕ измеренная.
+# Тест фиксирует, что её не приравняли к покупочной «чтобы было единообразно».
+check("газ смены цены задан отдельно от газа покупки",
+      source_default("SET_PRICE_GAS_TON") != source_default("PURCHASE_GAS_TON"),
+      f'{source_default("SET_PRICE_GAS_TON")} / {source_default("PURCHASE_GAS_TON")}')
+
+
+# =============================================================================
 print("\n[30] Ставка комиссии площадки")
 # =============================================================================
 
