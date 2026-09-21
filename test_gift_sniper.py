@@ -98,6 +98,22 @@ def source_default(var_name):
     return m.group(1)
 
 
+def source_default_const(name):
+    """
+    То же для КОНСТАНТЫ в исходнике (`NAME = value`), а не переменной окружения.
+
+    Нужно для флагов, которые настройкой быть не должны: «продажа
+    реализована» — утверждение о коде, и возможность выставить его через
+    окружение превратила бы ворота в формальность.
+    """
+    import re as _re
+    src = open("gift_sniper.py", encoding="utf-8").read()
+    m = _re.search(rf'^{_re.escape(name)}\s*=\s*(\S+)', src, _re.M)
+    if m is None:
+        raise AssertionError(f"не нашёл константу {name} в исходнике")
+    return m.group(1)
+
+
 def check(name, condition, detail=""):
     """Мини-ассерт: копит провалы вместо остановки на первом."""
     if condition:
@@ -1954,6 +1970,66 @@ try:
 finally:
     (gs.DB_PATH, gs._tonapi_used_today, gs._tonapi_budget_day,
      gs.TONAPI_DAILY_BUDGET) = _ob36
+
+
+# =============================================================================
+print("\n[37] Живой режим закрыт, пока нет продажи")
+# =============================================================================
+
+# Покупка открывает позицию в БД, а закрыть её некому: decide_exit() вызывает
+# только бэктест, close_position() не вызывает никто. Пущенный вживую бот
+# скупал бы лоты и не продал бы ни одного — деньги в одну сторону.
+#
+# Остальные ворота смотрят на ключ, сеть и подтверждение риска, то есть на
+# способность ПОТРАТИТЬ. Ни одни из них не спрашивают, сможем ли мы вернуть
+# потраченное, поэтому проверка нужна отдельная.
+
+check("по умолчанию продажа НЕ считается реализованной",
+      source_default_const("SELLING_IMPLEMENTED") == "False",
+      source_default_const("SELLING_IMPLEMENTED"))
+
+_ob37 = (gs.DRY_RUN, gs.SELLING_IMPLEMENTED, gs.CONFIRM_LIVE_TRADING,
+         gs.REAL_EXECUTOR_AVAILABLE, gs.COLLECTION_WHITELIST, gs.TARGET_COLLECTIONS,
+         gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.RESERVE_TON, gs.TRADING_NETWORK,
+         gs.ANTHROPIC_AVAILABLE, gs.ANTHROPIC_API_KEY)
+try:
+    # Всё остальное намеренно приводим в «готовое к бою» состояние, чтобы
+    # единственной причиной отказа осталась именно продажа.
+    _good = "EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7"
+    gs.DRY_RUN = False
+    gs.CONFIRM_LIVE_TRADING = "I_UNDERSTAND_THE_RISK"
+    gs.REAL_EXECUTOR_AVAILABLE = True
+    gs.TARGET_COLLECTIONS = [_good]
+    gs.COLLECTION_WHITELIST = [_good]
+    gs.BANKROLL_TON = Decimal("10")
+    gs.RESERVE_TON = Decimal("1")
+    gs.TRADING_NETWORK = "testnet"
+    gs.ANTHROPIC_AVAILABLE = True
+    gs.ANTHROPIC_API_KEY = "sk-test-not-a-real-key"
+
+    _keyfile = os.path.join(_tmpdir, "wallet37.key")
+    with open(_keyfile, "w", encoding="utf-8") as fh:
+        fh.write("word " * 24)
+    if os.name != "nt":
+        os.chmod(_keyfile, 0o600)
+    gs.WALLET_KEY_FILE = _keyfile
+
+    # Сначала убеждаемся, что причина отказа — ИМЕННО продажа: с ней всё
+    # проходит. Иначе тест доказывал бы лишь то, что preflight всегда против.
+    gs.SELLING_IMPLEMENTED = True
+    _passes_with_selling = gs.preflight_checks(require_ai=True)
+
+    gs.SELLING_IMPLEMENTED = False
+    check("без продажи живой режим НЕ стартует",
+          gs.preflight_checks(require_ai=True) is False)
+
+    check("с реализованной продажей те же настройки проходят",
+          _passes_with_selling is True, str(_passes_with_selling))
+finally:
+    (gs.DRY_RUN, gs.SELLING_IMPLEMENTED, gs.CONFIRM_LIVE_TRADING,
+     gs.REAL_EXECUTOR_AVAILABLE, gs.COLLECTION_WHITELIST, gs.TARGET_COLLECTIONS,
+     gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.RESERVE_TON, gs.TRADING_NETWORK,
+     gs.ANTHROPIC_AVAILABLE, gs.ANTHROPIC_API_KEY) = _ob37
 
 
 # =============================================================================
