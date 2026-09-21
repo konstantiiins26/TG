@@ -2756,6 +2756,43 @@ check("оценка по сегменту не выше floor коллекции
       _evx["eff_floor"] <= _sn46["floor"], _evx["eff_floor"])
 check("основание оценки названо", "сегмент" in _txtx.lower(), _txtx)
 
+# ПЛОЩАДКИ: где покупать и где выставлять. Без названия площадки владелец не
+# найдёт лот руками; без второй площадки не увидит, что продавать выгоднее в
+# другом месте.
+_sn_mk = dict(_sn46, market_floors={
+    "Getgems Sales": {"floor": Decimal("5.30"), "n": 40},
+    "Marketapp Marketplace": {"floor": Decimal("4.80"), "n": 12}})
+_it_mk = dict(_it46, sale_market="Marketapp Marketplace")
+_ev_mk = gs.evaluate_trade(_it_mk, _sn_mk, None)
+_txt_mk = "\n".join(gs.explain_trade(_ev_mk, _sn_mk, _it_mk))
+
+check("названа площадка покупки",
+      "на «Marketapp Marketplace»" in _txt_mk.split("ВЫСТАВЛЯЮ")[0], _txt_mk)
+check("названа площадка продажи -- самая дорогая",
+      "ВЫСТАВЛЯЮ" in _txt_mk and "на «Getgems Sales»" in _txt_mk, _txt_mk)
+check("_best_sell_market берёт максимум floor",
+      gs._best_sell_market(_sn_mk) == ("Getgems Sales", Decimal("5.30")))
+check("без market_floors функция не падает, а возвращает пусто",
+      gs._best_sell_market({}) == (None, None))
+
+# Разница площадок названа числом, но с оговоркой: комиссии у них разные и
+# проверены только у Getgems. Голая цифра читалась бы как гарантия профита.
+check("разница между площадками посчитана", "разница 10.4%" in _txt_mk, _txt_mk)
+check("оговорка про непроверенные комиссии стоит рядом",
+      "комиссии площадок РАЗНЫЕ" in _txt_mk, _txt_mk)
+
+# И главное: бот обязан сказать, что САМ купить там не может. Иначе владелец
+# ждёт автоматической сделки, которой ворота ALLOWED_MARKETS не допустят.
+check("сказано, что покупка ботом на этой площадке запрещена",
+      "ЗАПРЕЩЕНА" in _txt_mk and "руками" in _txt_mk, _txt_mk)
+
+# На разрешённой площадке этого предупреждения быть не должно -- иначе оно
+# станет фоном и его перестанут читать.
+_it_ok = dict(_it46, sale_market="Getgems Sales")
+_txt_ok = "\n".join(gs.explain_trade(gs.evaluate_trade(_it_ok, _sn_mk, None),
+                                     _sn_mk, _it_ok))
+check("на разрешённой площадке предупреждения нет", "ЗАПРЕЩЕНА" not in _txt_ok)
+
 # И то же самое обязано попасть в уведомление, а не только в лог: владелец
 # смотрит в телефон, а не в консоль на VPS.
 _sent46 = []

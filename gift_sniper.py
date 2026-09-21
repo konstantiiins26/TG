@@ -1522,7 +1522,32 @@ def max_profitable_buy(floor_price: Decimal, premium: bool = False) -> Decimal:
     return max_buy_at_roi(floor_price, Decimal("0"), premium)
 
 
-def explain_trade(ev: dict, snap: dict) -> list:
+def _best_sell_market(snap: dict):
+    """
+    Площадка с самым высоким floor в этом снапшоте: (имя, floor) или (None, None).
+
+    Продавать выгоднее там, где дороже стоят такие же лоты. Разница между
+    площадками реальна — в одной коллекции встречались «Getgems Sales» и
+    «Marketapp Marketplace» с разными ценами, и общий floor эту разницу
+    усредняет.
+
+    ЧЕСТНОЕ ОГРАНИЧЕНИЕ, которое обязано быть сказано рядом с цифрой:
+    комиссии у площадок РАЗНЫЕ, а проверены только ставки Getgems (2% и 0
+    роялти). Более высокий floor на чужой площадке не означает больше денег
+    на руки — там может быть своя комиссия и своя ликвидность.
+    """
+    best, best_floor = None, None
+    for market, info in (snap.get("market_floors") or {}).items():
+        floor = info.get("floor")
+        if floor is None:
+            continue
+        floor = Decimal(str(floor))
+        if best_floor is None or floor > best_floor:
+            best, best_floor = market, floor
+    return best, best_floor
+
+
+def explain_trade(ev: dict, snap: dict, item: dict = None) -> list:
     """
     Расклад сделки словами: за сколько покупаю, за сколько выставлять, почему.
 
@@ -1541,13 +1566,22 @@ def explain_trade(ev: dict, snap: dict) -> list:
 
     Возвращает список строк (одинаково годится в лог и в Telegram).
     """
+    item = item or {}
     q = lambda x: Decimal(str(x)).quantize(Decimal("0.0001"))
     basis = ("floor коллекции" if ev["eff_floor"] == snap.get("floor")
              else f"floor сегмента (похожих {ev.get('peer_n', 0)})")
 
+    # ГДЕ покупать и ГДЕ выставлять. Лоты разных площадок приходят вперемешку
+    # (TonAPI читает блокчейн, а не базу одного маркетплейса), и цена у них
+    # разная. Без названия площадки владелец не найдёт лот руками, а без
+    # второй площадки не увидит, что продавать выгоднее в другом месте.
+    buy_market = item.get("sale_market") or "площадка неизвестна"
+    sell_market, sell_floor = _best_sell_market(snap)
+
     lines = [
-        f"ПОКУПАЮ за {q(ev['buy_price'])} TON",
-        f"ВЫСТАВЛЯЮ за {q(ev['sale_price'])} TON",
+        f"ПОКУПАЮ за {q(ev['buy_price'])} TON на «{buy_market}»",
+        f"ВЫСТАВЛЯЮ за {q(ev['sale_price'])} TON"
+        + (f" на «{sell_market}»" if sell_market else ""),
         f"  = {q(ev['eff_floor'])} ({basis}) −{float(UNDERCUT_PCT) * 100:g}% undercut",
         f"  −{q(ev['fee_amount'])} комиссия площадки {float(MARKETPLACE_FEE_PCT) * 100:g}%",
     ]
@@ -1574,6 +1608,24 @@ def explain_trade(ev: dict, snap: dict) -> list:
     why.append(f"дороже {q(ev['breakeven_buy'])} покупать нельзя — уйдёт в "
                f"минус; порог ROI {float(MIN_ROI_PCT):g}% требует не дороже "
                f"{q(ev['max_buy_min_roi'])}")
+
+    # Арбитраж между площадками — но только как НАБЛЮДЕНИЕ. Разница floor
+    # может означать разные комиссии, разный состав лотов или тонкий рынок на
+    # одной из них; отличить можно только по записи за несколько дней.
+    if sell_market and sell_market != buy_market and sell_floor is not None:
+        buy_side = (snap.get("market_floors") or {}).get(buy_market) or {}
+        bf = buy_side.get("floor")
+        if bf is not None and Decimal(str(bf)) > 0:
+            diff = (sell_floor - Decimal(str(bf))) / Decimal(str(bf)) * 100
+            why.append(f"на «{sell_market}» floor {q(sell_floor)} против "
+                       f"{q(bf)} на «{buy_market}» — разница {diff:.1f}%; "
+                       f"комиссии площадок РАЗНЫЕ и проверены только у Getgems, "
+                       f"так что это наблюдение, а не гарантия")
+
+    if ALLOWED_MARKETS and buy_market not in ALLOWED_MARKETS:
+        why.append(f"покупка ботом на «{buy_market}» ЗАПРЕЩЕНА "
+                   f"(разрешено: {', '.join(ALLOWED_MARKETS)}) — протокол её "
+                   f"контракта продажи не сверялся; купить можно только руками")
 
     if ev.get("premium_applied"):
         why.append(f"к оценке применена премия ×{PREMIUM_MULT} "
@@ -2147,7 +2199,7 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
     # воспользоваться руками.
     lines = [f"🎯 Находка: скидка {ev['discount_pct']}% от floor",
              f"floor коллекции {snap['floor']} TON"]
-    lines += explain_trade(ev, snap)
+    lines += explain_trade(ev, snap, item)
 
     if ev.get("rarity_pct") is not None:
         lines.append(f"редкость {ev['rarity_pct']}% по «{ev['rarest_trait']}»")
@@ -2888,7 +2940,7 @@ def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
 
     # Лот прошёл фильтр — печатаем расклад целиком. Одной строки «ROI 12%»
     # мало: по ней нельзя ни проверить расчёт, ни выставить лот руками.
-    for _line in explain_trade(ev, snapshot):
+    for _line in explain_trade(ev, snapshot, item):
         log.info(f"{_Color.GREY}  {_line}{_Color.RESET}")
 
     # Находка сообщается ДО Claude: фильтр уже сказал «да», и это факт о
