@@ -34,9 +34,7 @@ set TARGET_COLLECTIONS=EQDLda715GocP1sYDkCecPhO7eFNsNvARD4pumbGSan96wvZ,EQCZ4-h6
 REM --- ZAPASNOY: vse 32 (ubrat REM zdes i postavit na stroku vyshe) ---
 REM set TARGET_COLLECTIONS=EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7,EQDc08YxzZWtlKAohSybNc3kXAkAPPtHch-jY_E6KMQ3b1mn,EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG,EQD1YFp12AGEgX6C3uiWh751EcRxPZo6GtBmHziY29jcbQzS,EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs,EQC2lsUy1SKxJEJBwj5ZCfVnLPvAqDqy5c26Xg8xS_pDTXGk,EQAo_snApDDqF6GKV0xe_T5oe28r842gJtgmkgPMhX0-dRkh,EQA8DCWyCWyywgOKYORerRoSVevWrUQ_FjKQgNihxY1227x7,EQB1ATaKGNYk6T5R2cA18BOF-KB_idaKKigwYI2jtjWuLg8n,EQAXHW9KVYYgDmLaUNcgzNPZ4WKGek97-ldsd0fPUHg4K7SU,EQCZ4-h65iTiWDPRPcLlS63gbcS40YBadEFLA4W-iIWUZld0,EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF,EQC8WVW9DSN4PPfFlCW2AHJkXxBUHBFsvnhXiYqSTpD7tXsp,EQD6mH9bwbn6S3M_tCRWOvqAIW8M34kRwbI01niGLRPeDPsl,EQBEngWldzev9oqzctu59Go9afX8HF8HksZ9pJ7x1bRJXsc7,EQDIruSTyxvq60gUH8j2kkj3qzoBrBaJy9WkKbeNNRasWe4j,EQBV5XozKA0e06Z5y6eL7pWrUUpEolbPhNdcNS0K4ZDk1jCs,EQAPNu648fe_uqUoeH6V_-fIDJYea_5Xu2rXn6iZFil49bMY,EQCBK_JBASAA5XVz1D17Pn--kQaMWm0b9wReVtsEdRO4Tgy9,EQC-ZdsouFU-xMa509yP8kzKceZnGV7lSQskxima1Mr3iDYB,EQDLda715GocP1sYDkCecPhO7eFNsNvARD4pumbGSan96wvZ,EQDycOgkLwcfPDokh8q-2DIUzVhPetdFuZmwrFYFP6i1nZ_u,EQCgaTxb2wA_3Bi8Ec4FFNu8CauoHo0VPpnwxdrhAgOrOXvA,EQDRrfw5pgIC4e6NafUAx52Z9Ym6q1k26xxaXR_qx0LKJJ7D,EQD9z87hRZAV7C2MV1gk39-bSg5Yfs2EdMr9HfK81IuB2Rlc,EQBAXR68f1UgRhToFR_bXY1zPJy5O6sm2St0CRTo92BTxGiH,EQBSIId7sMmlqN8oBGaMNtUeuaLeSQPUR1ByMwpnfWL3hhZq,EQAUffQWl09_yhXDTp8oN13Px8ygPm0xcyNGhHOiONV-x3om,EQDx-SqQEhP9Rzfi2cqdehTVUvQbArsUz1X7t-ul8IiKZpYb,EQA0EzRYX5wm_q46_NX8b7EYhtOkXfXgsr06ETbov1a7StZl,EQA2lHcvZWW_bN_2NMKrkEUv9xz6fx8wTE5upa8u1neZb6hJ,EQCeTSJOPXP_SSvOjILY-kui4bGHUmsa-U7TXP4DjUANTl4s
 
-REM Whitelist raskryvaetsya SRAZU, poetomu stoit POSLE vybora spiska.
-REM Esli postavit ego vyshe, on ostanetsya ot starogo znacheniya.
-set COLLECTION_WHITELIST=%TARGET_COLLECTIONS%
+REM Whitelist vyvoditsya v KONCE faila - sm. tam, prichina vazhnaya.
 
 
 
@@ -174,11 +172,64 @@ REM Skolko uvedomleniy o NAHODKAH slat maksimum za chas. 0 = ne slat.
 set FIND_NOTIFY_MAX_PER_HOUR=10
 
 REM --- Ssylka na lot v uvedomlenii ---
-REM Forma URL u Getgems NE PROVERENA: iz sredy razrabotki net seti k
-REM getgems.io, a pervaya versiya otkryvalas pustoy. Esli pravilnaya forma
-REM okazhetsya drugoy - pomenyayte stroku nizhe, kod trogat ne nado.
+REM Forma URL svercena s getgems.io i verna. Pervaya versiya otkryvalas
+REM pustoy iz-za formy ADRESA: TonAPI otdaet raw (0:48de...), a vitriny
+REM ponimayut EQ... Ispravleno v kode (friendly_ton_address).
+REM Pustaya stranica vozmozhna i pri vernoy ssylke - esli lot UZHE USHEL
+REM s prodazhi. Eto ne bag, a rynok, i obozrevatel ih razlichaet.
 REM Ryadom bot vsegda daet ssylku na obozrevatel i sam adres lota.
 set GIFT_URL_TEMPLATE=https://getgems.io/nft/{address}
 set EXPLORER_URL_TEMPLATE=https://tonviewer.com/{address}
+
+REM =====================================================================
+REM  PEREOPREDELENIYA DLYA ETOY KONKRETNOY MASHINY: deploy\my-local.bat
+REM
+REM  Nuzhno, kogda bot rabotaet na DVUH kompyuterah srazu. Fail v .gitignore,
+REM  poetomu u PK i u noutbuka on svoy i git pull ego ne trogaet.
+REM
+REM  GLAVNOE PRAVILO DVUH MASHIN: kvota zhivet na KLYUCHE, a schetchik
+REM  byudzheta - v baze kazhdoy mashiny. Dve mashiny na ODNOM klyuche obe
+REM  schitayut byudzhet polnym i vmeste tratyat vdvoe bolshe realnoy kvoty.
+REM  Lechitsya odnim iz dvuh sposobov, i tretego net:
+REM    a) dva raznyh TONAPI_KEY (po odnomu na mashinu) - togda kazhdaya
+REM       nablyudaet svoi 6 kollekciy raz v ~3.2 min. Eto VDVOE bystree,
+REM       chem odna mashina na 12 kollekciyah (6.5 min);
+REM    b) odin klyuch na oboih, no TONAPI_DAILY_BUDGET=20000 na KAZHDOY.
+REM       Skorost ostanetsya 6.5 min - vyigrysha net, kvota ta zhe.
+REM
+REM  Kollekcii mezhdu mashinami nado RAZDELIT, a ne dublirovat. Dve mashiny,
+REM  smotryashchie odnu vitrinu, dayut ne dvoynuyu chastotu, a dvoynoy rashod:
+REM  vyborki u nih chut raznye, i pri obedinenii zapisey --merge otbrosit
+REM  peresechenie (inache oborot poschitaetsya s fantomnymi prodazhami).
+REM =====================================================================
+
+if exist "%~dp0my-local.bat" goto local_ready
+
+echo.
+echo === Sozdayu deploy\my-local.bat (pereopredeleniya dlya etoy mashiny) ===
+>  "%~dp0my-local.bat" echo @echo off
+>> "%~dp0my-local.bat" echo REM Nastroyki TOLKO etoy mashiny. Fail v .gitignore.
+>> "%~dp0my-local.bat" echo REM Po umolchaniyu pusto - bot beret vse 12 kollekciy.
+>> "%~dp0my-local.bat" echo REM.
+>> "%~dp0my-local.bat" echo REM --- Rabota na DVUH mashinah: razdelite kollekcii ---
+>> "%~dp0my-local.bat" echo REM Na PERVOY mashine ostavit stroku A, na VTOROY - stroku B,
+>> "%~dp0my-local.bat" echo REM ubrav "REM A:" / "REM B:" v nachale nuzhnoy stroki.
+>> "%~dp0my-local.bat" echo REM.
+>> "%~dp0my-local.bat" echo REM A: set TARGET_COLLECTIONS=EQDLda715GocP1sYDkCecPhO7eFNsNvARD4pumbGSan96wvZ,EQCZ4-h65iTiWDPRPcLlS63gbcS40YBadEFLA4W-iIWUZld0,EQD9z87hRZAV7C2MV1gk39-bSg5Yfs2EdMr9HfK81IuB2Rlc,EQCBK_JBASAA5XVz1D17Pn--kQaMWm0b9wReVtsEdRO4Tgy9,EQBEngWldzev9oqzctu59Go9afX8HF8HksZ9pJ7x1bRJXsc7,EQA0EzRYX5wm_q46_NX8b7EYhtOkXfXgsr06ETbov1a7StZl
+>> "%~dp0my-local.bat" echo REM B: set TARGET_COLLECTIONS=EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF,EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs,EQDc08YxzZWtlKAohSybNc3kXAkAPPtHch-jY_E6KMQ3b1mn,EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7,EQD1YFp12AGEgX6C3uiWh751EcRxPZo6GtBmHziY29jcbQzS,EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG
+>> "%~dp0my-local.bat" echo REM.
+>> "%~dp0my-local.bat" echo REM Esli klyuch TonAPI na oboih mashinah ODIN - raskommentiruyte:
+>> "%~dp0my-local.bat" echo REM set TONAPI_DAILY_BUDGET=20000
+echo Fail sozdan. Po umolchaniyu nichego ne menyaet.
+echo.
+
+:local_ready
+call "%~dp0my-local.bat"
+
+REM --- Whitelist: TOLKO zdes, posle vseh pereopredeleniy ---
+REM cmd raskryvaet %%TARGET_COLLECTIONS%% SRAZU. Esli postavit etu stroku
+REM vyshe, ona zapomnit staryy spisok, i posle smeny spiska bot stal by
+REM otvergat sobstvennye kollekcii kak nedoverennye.
+set COLLECTION_WHITELIST=%TARGET_COLLECTIONS%
 
 REM Konec nastroek. Zapusk - v run.bat ili start-windows.bat.
