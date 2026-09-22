@@ -1790,8 +1790,76 @@ def db_init():
                 used  INTEGER NOT NULL
             )
         """)
+        # Кнопки «Купил / Продал» в Telegram. Нажатие приходит как
+        # callback_query, где помещается максимум 64 байта — сырой адрес TON
+        # это 66 символов, то есть НЕ влезает. Поэтому в кнопку кладётся id
+        # строки отсюда, а адрес и цены лежат в таблице.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS tg_actions (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                address        TEXT NOT NULL,
+                collection     TEXT,
+                buy_price_ton  TEXT NOT NULL,
+                sale_price_ton TEXT NOT NULL,
+                floor_ton      TEXT,
+                message_id     INTEGER,
+                position_id    INTEGER,
+                status         TEXT NOT NULL DEFAULT 'new',  -- new|bought|sold
+                created_ts     REAL NOT NULL
+            )
+        """)
+        # Смещение getUpdates обязано пережить перезапуск: иначе бот заново
+        # проглотит старые нажатия и откроет позиции повторно.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_buy_ts ON positions(buy_ts)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON positions(status)")
+
+
+def meta_get(key: str, default=None):
+    """Небольшое key-value в БД: смещение getUpdates и подобное."""
+    with db_connect() as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def meta_set(key: str, value):
+    with db_connect() as conn:
+        conn.execute("INSERT INTO meta (key, value) VALUES (?, ?) "
+                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                     (key, str(value)))
+
+
+def tg_action_create(item: dict, ev: dict) -> int:
+    """Запоминает находку, чтобы нажатие кнопки знало, о каком лоте речь."""
+    with db_connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO tg_actions (address, collection, buy_price_ton, "
+            "sale_price_ton, floor_ton, status, created_ts) "
+            "VALUES (?, ?, ?, ?, ?, 'new', ?)",
+            (item.get("address", ""), item.get("collection_address", ""),
+             str(ev["buy_price"]), str(ev["sale_price"]),
+             str(ev.get("eff_floor", "")), time.time()))
+        return cur.lastrowid
+
+
+def tg_action_get(action_id: int):
+    with db_connect() as conn:
+        return conn.execute("SELECT * FROM tg_actions WHERE id = ?",
+                            (action_id,)).fetchone()
+
+
+def tg_action_update(action_id: int, **fields):
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    with db_connect() as conn:
+        conn.execute(f"UPDATE tg_actions SET {cols} WHERE id = ?",
+                     (*fields.values(), action_id))
 
 
 def record_purchase(item: dict, buy_price: Decimal, floor: Decimal) -> int:
@@ -2063,48 +2131,37 @@ def check_risk_limits(buy_price: Decimal, roi_pct=None):
     return True, "лимиты в норме"
 
 
-def notify(text: str) -> bool:
+def _tg_call(method: str, payload: dict):
     """
-    Шлёт уведомление в Telegram. True — Telegram подтвердил доставку.
+    Один запрос к Telegram. Возвращает тело ответа (dict) либо None.
 
-    Необязательно: без токена тихо ничего не делает. Никогда не роняет
-    торговый цикл и НИКОГДА не логирует токен (он лежит прямо в URL, поэтому
-    в сообщения об ошибке попадает только описание от Telegram, не адрес).
-
-    ПРОВЕРКА ОТВЕТА ОБЯЗАТЕЛЬНА, и вот почему. `requests.post` бросает
-    исключение только на сетевой ошибке. На неверный токен Telegram отвечает
-    401, на неизвестный chat_id — 400, и оба раза это ОБЫЧНЫЙ ответ: код без
-    проверки статуса считал их успехом. Владелец видел ровный зелёный лог и
-    пустой чат, а в логе не было ни строчки о причине. Именно так и вышло
-    21.09.2026.
-
-    Telegram в теле ответа присылает человеческое объяснение
-    (`description`) — его и показываем: «chat not found» и «Unauthorized»
-    лечатся по-разному, и догадываться, какое из них случилось, незачем.
+    Причина выносить это отдельно — та же, по которой `notify()` проверяет
+    ответ: `requests.post` бросает исключение только на СЕТЕВОЙ ошибке, а
+    неверный токен это обычный HTTP 401. В лог попадает ТОЛЬКО описание от
+    Telegram: токен лежит прямо в URL, и адрес логировать нельзя.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
+    if not TELEGRAM_BOT_TOKEN:
+        return None
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=HTTP_TIMEOUT_SEC)
-    except Exception as e:  # noqa: BLE001 — уведомление не стоит торговли
-        log.warning(f"Не удалось отправить уведомление в Telegram: {type(e).__name__}")
-        return False
-
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
+                          json=payload, timeout=HTTP_TIMEOUT_SEC)
+    except Exception as e:  # noqa: BLE001 — Telegram не стоит торгового цикла
+        log.warning(f"Telegram {method}: сеть недоступна ({type(e).__name__})")
+        return None
+    try:
+        body = r.json()
+    except Exception:  # noqa: BLE001 — тело может быть не JSON
+        body = {}
     if r.ok:
-        return True
+        return body
 
     # Описание от Telegram — единственное, что стоит показать. Ни URL, ни
-    # заголовков: в URL лежит токен.
-    try:
-        why = r.json().get("description", "")
-    except Exception:  # noqa: BLE001 — тело может быть не JSON
-        why = ""
-
-    hint = ""
+    # заголовков: в URL лежит токен. Подсказки живут ЗДЕСЬ, а не в notify(),
+    # чтобы отказ любого вызова (правка клавиатуры, ответ на нажатие) тоже
+    # объяснял себя, а не отдавал голое описание.
+    why = body.get("description", "") if isinstance(body, dict) else ""
     low = why.lower()
+    hint = ""
     if "chat not found" in low:
         hint = (" — проверьте TELEGRAM_CHAT_ID и НАПИШИТЕ своему боту /start: "
                 "бот не может начать переписку первым")
@@ -2112,10 +2169,48 @@ def notify(text: str) -> bool:
         hint = " — TELEGRAM_BOT_TOKEN неверный или отозван (@BotFather)"
     elif "bot was blocked" in low:
         hint = " — вы заблокировали бота, разблокируйте его в Telegram"
+    log.warning(f"Telegram {method} отказал: {why}{hint}")
+    return None
 
-    log.warning(f"{_Color.YELLOW}Telegram отклонил сообщение (HTTP {r.status_code}): "
-                f"{why or 'без объяснения'}{hint}{_Color.RESET}")
-    return False
+
+def _find_buttons(action_id: int, bought: bool = False, sold: bool = False):
+    """
+    Клавиатура «Купил / Продал» с галочками у нажатого.
+
+    Галочка не украшение: одно и то же уведомление владелец видит и до, и
+    после действия, и без отметки невозможно вспомнить, нажимал ли он уже.
+    Повторное «Купил» открыло бы вторую позицию на тот же лот.
+
+    В `callback_data` помещается 64 байта, а сырой адрес TON — 66 символов.
+    Поэтому туда идёт id строки `tg_actions`, а не адрес.
+    """
+    return {"inline_keyboard": [[
+        {"text": ("✅ Куплено" if bought else "Купил"),
+         "callback_data": f"b:{action_id}"},
+        {"text": ("✅ Продано" if sold else "Продал"),
+         "callback_data": f"s:{action_id}"},
+    ]]}
+
+
+def notify(text: str) -> bool:
+    """
+    Шлёт уведомление в Telegram. True — Telegram подтвердил доставку.
+
+    Необязательно: без токена тихо ничего не делает и НИКОГДА не роняет
+    торговый цикл. Весь разбор ответа и подсказки («chat not found» лечится
+    командой /start, «unauthorized» — новым токеном) живут в `_tg_call`,
+    потому что отказать может любой вызов, а не только этот.
+
+    ПОЧЕМУ ПРОВЕРКА ОТВЕТА ОБЯЗАТЕЛЬНА: `requests.post` бросает исключение
+    только на СЕТЕВОЙ ошибке. Неверный токен — это обычный HTTP 401,
+    неизвестный chat_id — 400, и код без проверки статуса считал их успехом.
+    Владелец видел ровный зелёный лог и пустой чат. Поймано 21.09.2026.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    return _tg_call("sendMessage",
+                    {"chat_id": TELEGRAM_CHAT_ID, "text": text}) is not None
+
 
 
 def test_telegram() -> bool:
@@ -2263,8 +2358,136 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
         lines.append(EXPLORER_URL_TEMPLATE.format(address=link_addr))
     lines.append(link_addr)
 
-    notify("\n".join(lines))
+    # Кнопки нужны потому, что режим сейчас РУЧНОЙ: бот находит, а покупает и
+    # выставляет владелец. Без отметки «купил» позиция не попадает в БД, и ни
+    # PnL, ни риск-лимиты про неё не знают — учёт становится фикцией.
+    action_id = tg_action_create(item, ev)
+    body = _tg_call("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": "\n".join(lines),
+        "reply_markup": _find_buttons(action_id),
+    })
+    if body is None:
+        return False
+    tg_action_update(action_id,
+                     message_id=(body.get("result") or {}).get("message_id"))
     return True
+
+
+def poll_telegram_callbacks() -> int:
+    """
+    Забирает нажатия кнопок «Купил / Продал» и применяет их. Возвращает число
+    обработанных.
+
+    Почему это отдельный шаг, а не «кнопки просто работают». Telegram не
+    доставляет нажатие сам: бот обязан ИЛИ держать вебхук, ИЛИ спрашивать
+    `getUpdates`. Вебхук требует публичного адреса, которого у домашнего ПК
+    нет, поэтому спрашиваем — раз в цикл, без ожидания (`timeout=0`), чтобы
+    не растягивать наблюдение.
+
+    Смещение (`tg_offset`) хранится В БД. Без этого бот, перезапущенный
+    после нажатия, проглотил бы его заново и открыл вторую позицию на тот же
+    лот — тот же принцип, по которому в БД лежат риск-лимиты и расход квоты.
+
+    ЧУЖИЕ НАЖАТИЯ ИГНОРИРУЮТСЯ. Бота может найти кто угодно, и callback
+    приходит с id того, кто нажал: всё, что не из `TELEGRAM_CHAT_ID`,
+    отбрасывается. Иначе посторонний открывал бы позиции в чужом учёте.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return 0
+
+    offset = meta_get("tg_offset")
+    payload = {"timeout": 0, "allowed_updates": ["callback_query"]}
+    if offset is not None:
+        payload["offset"] = int(offset)
+    body = _tg_call("getUpdates", payload)
+    if body is None:
+        return 0
+
+    handled = 0
+    for upd in body.get("result") or []:
+        meta_set("tg_offset", int(upd["update_id"]) + 1)
+        cb = upd.get("callback_query")
+        if not cb:
+            continue
+        who = str((cb.get("from") or {}).get("id", ""))
+        if who != str(TELEGRAM_CHAT_ID):
+            log.warning(f"Нажатие кнопки от постороннего ({who}) — игнорирую.")
+            _tg_call("answerCallbackQuery",
+                     {"callback_query_id": cb["id"], "text": "Не ваш бот."})
+            continue
+        try:
+            handled += _apply_callback(cb)
+        except Exception as e:  # noqa: BLE001 — кнопка не стоит торгового цикла
+            log.error(f"Не удалось применить нажатие: {type(e).__name__}: {e}")
+    return handled
+
+
+def _apply_callback(cb: dict) -> int:
+    """Применяет одно нажатие. Возвращает 1, если что-то изменилось."""
+    data = str(cb.get("data") or "")
+    kind, _, raw_id = data.partition(":")
+    if kind not in ("b", "s") or not raw_id.isdigit():
+        return 0
+    row = tg_action_get(int(raw_id))
+    if row is None:
+        _tg_call("answerCallbackQuery",
+                 {"callback_query_id": cb["id"], "text": "Лот не найден в базе."})
+        return 0
+
+    action_id = int(raw_id)
+    chat_id = ((cb.get("message") or {}).get("chat") or {}).get("id", TELEGRAM_CHAT_ID)
+    message_id = (cb.get("message") or {}).get("message_id") or row["message_id"]
+
+    if kind == "b":
+        # Повторное нажатие НЕ открывает вторую позицию: в учёте появился бы
+        # лот, которого нет, и PnL стал бы фикцией — то же правило, что и
+        # для execute_blockchain_buy().
+        if row["status"] != "new":
+            _tg_call("answerCallbackQuery",
+                     {"callback_query_id": cb["id"],
+                      "text": f"Уже отмечено: {row['status']}"})
+            return 0
+        pos_id = record_purchase(
+            {"address": row["address"], "collection_address": row["collection"]},
+            Decimal(row["buy_price_ton"]),
+            Decimal(row["floor_ton"] or "0"))
+        tg_action_update(action_id, status="bought", position_id=pos_id)
+        note = (f"✅ Куплено — позиция #{pos_id} в учёте\n"
+                f"выставлять за {Decimal(row['sale_price_ton']):.4f} TON")
+        answer = f"Позиция #{pos_id} записана"
+    else:
+        if row["status"] != "bought":
+            _tg_call("answerCallbackQuery",
+                     {"callback_query_id": cb["id"],
+                      "text": "Сначала отметьте «Купил»."})
+            return 0
+        sale = Decimal(row["sale_price_ton"])
+        close_position(int(row["position_id"]), sale)
+        tg_action_update(action_id, status="sold")
+        # Цена продажи берётся ПЛАНОВАЯ — другой у бота нет. Если продано за
+        # другую, учёт врёт, поэтому об этом сказано прямо и назван способ
+        # поправить. Молча подставить плановую и промолчать значило бы
+        # выдумать сделку.
+        note = (f"✅ Продано по ПЛАНОВОЙ цене {sale:.4f} TON\n"
+                f"Если цена была другая: run.bat --close "
+                f"{row['position_id']} <цена>")
+        answer = "Позиция закрыта"
+
+    _tg_call("answerCallbackQuery", {"callback_query_id": cb["id"], "text": answer})
+    if message_id:
+        _tg_call("editMessageReplyMarkup", {
+            "chat_id": chat_id, "message_id": message_id,
+            "reply_markup": _find_buttons(action_id,
+                                          bought=(kind == "b" or row["status"] == "bought"),
+                                          sold=(kind == "s")),
+        })
+    # Через _tg_call, а не notify(): транспорт один и тот же, и подменить
+    # его в тесте можно в одном месте.
+    _tg_call("sendMessage", {"chat_id": chat_id, "text": note})
+    log.info(f"{_Color.GREEN}Кнопка Telegram: {row['address'][:12]}… → "
+             f"{'куплено' if kind == 'b' else 'продано'}{_Color.RESET}")
+    return 1
 
 
 def scan_finds(snap: dict, recent_sales) -> int:
@@ -4253,6 +4476,10 @@ def main(record: bool = False, trade: bool = True):
             except Exception as e:  # noqa: BLE001 — одна коллекция не роняет цикл
                 log.error(f"Коллекция {_short(coll)}: ошибка ({e})")
 
+        # Нажатия кнопок «Купил / Продал». Telegram не доставляет их сам,
+        # поэтому спрашиваем раз в цикл. Без ожидания — наблюдение важнее.
+        poll_telegram_callbacks()
+
         # Сводка в Telegram: молчащий бот неотличим от упавшего.
         if HEARTBEAT_MIN > 0:
             notify_heartbeat(snaps_this_cycle)
@@ -4359,6 +4586,9 @@ def parse_args(argv=None):
     parser.add_argument("--discover", nargs="?", const=30, type=int, metavar="N",
                         help="найти коллекции под банк через API и выйти "
                              "(эндпоинт НЕ проверен на живых данных)")
+    parser.add_argument("--close", nargs=2, metavar=("POSITION_ID", "PRICE"),
+                        help="закрыть позицию по ФАКТИЧЕСКОЙ цене продажи "
+                             "(кнопка «Продал» ставит плановую)")
     parser.add_argument("--merge", metavar="FILE",
                         help="объединить запись рынка с другой (например, "
                              "перенесённой с другого компьютера)")
@@ -4410,6 +4640,16 @@ if __name__ == "__main__":
         if args.premium:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if trait_premium_report(args.premium) else 1)
+        if args.close:
+            db_init()
+            _pid, _price = args.close
+            _res = close_position(int(_pid), Decimal(_price))
+            if _res is None:
+                log.error(f"Позиции #{_pid} нет в {DB_PATH}")
+                sys.exit(1)
+            log.info(f"{_Color.GREEN}Позиция #{_pid} закрыта по {_price} TON"
+                     f"{_Color.RESET}")
+            sys.exit(0)
         if args.merge:
             # Пишет в ОТДЕЛЬНЫЙ файл: существующую запись не трогает.
             sys.exit(0 if merge_recordings(args.merge) else 1)

@@ -2180,10 +2180,17 @@ print("\n[40] Уведомления о находках")
 # бота вообще: смотреть лог на VPS с телефона никто не станет.
 
 _sent40 = []
-_ob40 = (gs.notify, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
-         gs.FIND_NOTIFY_MAX_PER_HOUR, gs.DRY_RUN)
+_ob40 = (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+         gs.FIND_NOTIFY_MAX_PER_HOUR, gs.DRY_RUN, gs.DB_PATH)
+_db40 = tempfile.mktemp(suffix=".db")
 try:
-    gs.notify = lambda text: _sent40.append(text)
+    # Находка теперь уходит через _tg_call (нужны кнопки и message_id),
+    # поэтому подменяем транспорт, а не notify().
+    gs.DB_PATH = _db40
+    gs.db_init()
+    gs._tg_call = (lambda method, payload:
+                   (_sent40.append(payload.get("text", "")),
+                    {"ok": True, "result": {"message_id": 1}})[1])
     gs.TELEGRAM_BOT_TOKEN = "тест"
     gs.TELEGRAM_CHAT_ID = "42"
     gs.FIND_NOTIFY_MAX_PER_HOUR = 3
@@ -2249,8 +2256,10 @@ try:
     check("без токена находка не шлётся и не падает",
           gs.notify_find(_item40, _snap40, _ev40) is False)
 finally:
-    (gs.notify, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
-     gs.FIND_NOTIFY_MAX_PER_HOUR, gs.DRY_RUN) = _ob40
+    (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+     gs.FIND_NOTIFY_MAX_PER_HOUR, gs.DRY_RUN, gs.DB_PATH) = _ob40
+    if os.path.exists(_db40):
+        os.unlink(_db40)
     gs._find_sent_ts.clear()
     gs._finds_suppressed = 0
 
@@ -2619,10 +2628,12 @@ check("мусор возвращается как есть, а не пустой
 # Ссылка в уведомлении обязана собираться из FRIENDLY-формы. Проверяем через
 # само уведомление, а не через функцию: сломаться может именно подстановка.
 _sent = []
-_onotify = gs.notify
+_onotify = gs._tg_call
 _otok, _ochat = gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID
 try:
-    gs.notify = lambda text: _sent.append(text) or True
+    gs._tg_call = (lambda method, payload:
+                   (_sent.append(payload.get("text", "")),
+                    {"ok": True, "result": {"message_id": 1}})[1])
     gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "t", "c"
     gs._find_sent_ts.clear()
     gs.notify_find(
@@ -2639,7 +2650,7 @@ try:
          "premium_applied": False, "is_pretty": False, "is_rare": False})
     _msg = _sent[0] if _sent else ""
 finally:
-    gs.notify = _onotify
+    gs._tg_call = _onotify
     gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = _otok, _ochat
 
 check("в уведомлении ссылка на площадку с user-friendly адресом",
@@ -2799,15 +2810,17 @@ check("на разрешённой площадке предупреждения
 # И то же самое обязано попасть в уведомление, а не только в лог: владелец
 # смотрит в телефон, а не в консоль на VPS.
 _sent46 = []
-_ob46 = (gs.notify, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.DRY_RUN)
+_ob46 = (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.DRY_RUN)
 try:
-    gs.notify = lambda text: _sent46.append(text) or True
+    gs._tg_call = (lambda method, payload:
+                   (_sent46.append(payload.get("text", "")),
+                    {"ok": True, "result": {"message_id": 1}})[1])
     gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "t", "c"
     gs.DRY_RUN = True
     gs._find_sent_ts.clear()
     gs.notify_find(_it46, _sn46, _ev46)
 finally:
-    (gs.notify, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.DRY_RUN) = _ob46
+    (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.DRY_RUN) = _ob46
 _msg46 = _sent46[0] if _sent46 else ""
 check("в уведомлении есть обе цены",
       "ПОКУПАЮ за" in _msg46 and "ВЫСТАВЛЯЮ за" in _msg46, _msg46)
@@ -2987,6 +3000,122 @@ check("отсутствующий исходник даёт отказ, а не 
 _src48 = open("gift_sniper.py", encoding="utf-8").read()
 check("про разрывы в объединённой записи предупреждается",
       "Объединение их НЕ" in _src48 and "лечит" in _src48)
+
+
+# =============================================================================
+print("\n[49] Кнопки «Купил / Продал» в Telegram")
+# =============================================================================
+
+# Режим сейчас РУЧНОЙ: бот находит, покупает и выставляет владелец. Без
+# отметки «купил» позиция не попадает в БД, и ни PnL, ни риск-лимиты про неё
+# не знают — учёт становится фикцией.
+
+_db49 = tempfile.mktemp(suffix=".db")
+_ob49 = (gs.DB_PATH, gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.DRY_RUN)
+_sent49 = []
+
+def _fake_tg(method, payload):
+    _sent49.append((method, payload))
+    return {"ok": True,
+            "result": ({"message_id": 777} if method == "sendMessage"
+                       else _fake_tg.updates)}
+_fake_tg.updates = []
+
+def _press(data, who="4242"):
+    _fake_tg.updates = [{"update_id": _press.n, "callback_query": {
+        "id": "q", "data": data, "from": {"id": who},
+        "message": {"message_id": 777, "chat": {"id": 4242}}}}]
+    _press.n += 1
+    return gs.poll_telegram_callbacks()
+_press.n = 1
+
+try:
+    gs.DB_PATH = _db49
+    gs.db_init()
+    gs._tg_call = _fake_tg
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "tok", "4242"
+    gs.DRY_RUN = True
+    gs._find_sent_ts.clear()
+
+    _it49 = {"address": "0:" + "ab" * 32, "sale_price_ton": Decimal("4.0"),
+             "collection_address": "0:cc"}
+    _sn49 = {"floor": Decimal("5"), "floor_reliable": True, "trait_index": {},
+             "trait_total": 0, "peer_prices": {}, "competition": 0,
+             "market_floors": {}}
+    _ev49 = gs.evaluate_trade(_it49, _sn49, None)
+    check("находка с кнопками отправлена", gs.notify_find(_it49, _sn49, _ev49) is True)
+
+    _kb = _sent49[0][1]["reply_markup"]["inline_keyboard"][0]
+    check("две кнопки", [b["text"] for b in _kb] == ["Купил", "Продал"], _kb)
+
+    # 64 байта — жёсткий предел Telegram, а сырой адрес TON это 66 символов.
+    # Положить туда адрес значит получить молча неработающую кнопку.
+    check("callback_data влезает в лимит Telegram",
+          all(len(b["callback_data"].encode()) <= 64 for b in _kb))
+    check("в callback_data НЕ адрес, а короткий id",
+          all(len(b["callback_data"]) < 20 for b in _kb), _kb)
+
+    # Посторонний не должен вести учёт владельца.
+    check("нажатие от чужого id игнорируется", _press("b:1", who="9999") == 0)
+
+    check("«Купил» открывает позицию", _press("b:1") == 1)
+    with gs.db_connect() as _c:
+        _pos = _c.execute("SELECT * FROM positions").fetchall()
+    check("позиция ровно одна", len(_pos) == 1, len(_pos))
+    check("позиция открыта по цене покупки",
+          Decimal(_pos[0]["buy_price_ton"]) == _ev49["buy_price"])
+
+    # Повторное нажатие НЕ открывает вторую позицию: в учёте появился бы лот,
+    # которого нет. Тот же принцип, что и у execute_blockchain_buy().
+    check("повторное «Купил» вторую позицию НЕ открывает", _press("b:1") == 0)
+    with gs.db_connect() as _c:
+        check("позиций по-прежнему одна",
+              _c.execute("SELECT COUNT(*) n FROM positions").fetchone()["n"] == 1)
+
+    check("«Продал» закрывает позицию", _press("s:1") == 1)
+    with gs.db_connect() as _c:
+        _row = _c.execute("SELECT * FROM positions").fetchone()
+    check("позиция закрыта", _row["status"] == "closed", _row["status"])
+    check("PnL посчитан по той же экономике, что и прогноз",
+          abs(Decimal(_row["pnl_ton"]) - _ev49["net_profit"]) < Decimal("0.000000001"),
+          f"{_row['pnl_ton']} vs {_ev49['net_profit']}")
+
+    # Галочки: одно и то же уведомление владелец видит и до, и после
+    # действия, и без отметки не вспомнить, нажимал ли он уже.
+    _kbs = [p["reply_markup"]["inline_keyboard"][0]
+            for m, p in _sent49 if m == "editMessageReplyMarkup"]
+    check("после «Купил» галочка у первой кнопки",
+          [b["text"] for b in _kbs[0]] == ["✅ Куплено", "Продал"], _kbs[0])
+    check("после «Продал» галочки у обеих",
+          [b["text"] for b in _kbs[1]] == ["✅ Куплено", "✅ Продано"], _kbs[1])
+
+    # Цена продажи у бота только ПЛАНОВАЯ. Подставить её молча значило бы
+    # выдумать сделку, поэтому это названо прямо и дан способ поправить.
+    _confirm = [p["text"] for m, p in _sent49 if m == "sendMessage"][-1]
+    check("сказано, что цена ПЛАНОВАЯ", "ПЛАНОВОЙ" in _confirm, _confirm)
+    check("назван способ поправить фактическую цену",
+          "--close" in _confirm, _confirm)
+
+    # --close правит цену на фактическую.
+    _pnl = gs.close_position(int(_row["id"]), Decimal("6.0"))
+    with gs.db_connect() as _c:
+        _row2 = _c.execute("SELECT * FROM positions").fetchone()
+    check("--close переписывает цену продажи",
+          Decimal(_row2["sell_price_ton"]) == Decimal("6.0"))
+
+    # Смещение getUpdates обязано пережить перезапуск: иначе бот проглотит
+    # старое нажатие заново и откроет позицию повторно.
+    check("смещение getUpdates сохранено в БД",
+          gs.meta_get("tg_offset") is not None, gs.meta_get("tg_offset"))
+
+    # Нажатие на несуществующий лот не роняет цикл и ничего не открывает.
+    check("нажатие по неизвестному id безопасно", _press("b:999") == 0)
+    check("мусор в callback_data безопасен", _press("мусор") == 0)
+finally:
+    (gs.DB_PATH, gs._tg_call, gs.TELEGRAM_BOT_TOKEN,
+     gs.TELEGRAM_CHAT_ID, gs.DRY_RUN) = _ob49
+    if os.path.exists(_db49):
+        os.unlink(_db49)
 
 
 # =============================================================================
