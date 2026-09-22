@@ -18,7 +18,10 @@
 """
 
 import base64
+import json
+import os
 import sys
+import tempfile
 import time
 from decimal import Decimal
 
@@ -2808,6 +2811,99 @@ finally:
 _msg46 = _sent46[0] if _sent46 else ""
 check("в уведомлении есть обе цены",
       "ПОКУПАЮ за" in _msg46 and "ВЫСТАВЛЯЮ за" in _msg46, _msg46)
+
+
+# =============================================================================
+print("\n[47] Премия за редкие трейты: цены ПРОДАВЦОВ, а не сделок")
+# =============================================================================
+
+# build_trait_prices() появилась потому, что peer_prices пишет ТОЛЬКО
+# PEER_TRAIT ("model"), а главный тезис владельца — про ФОНЫ. Запись без
+# фонов не даёт проверить его в принципе, и дни наблюдения копили бы данные
+# не про то. Поймано 22.09.2026 при подходе к калибровке PREMIUM_MULT.
+_items47 = ([{"sale_price_ton": Decimal("5.0"),
+              "traits": {"model": "Common", "backdrop": "Sky Blue"}}] * 40
+            + [{"sale_price_ton": Decimal("20.0"),
+                "traits": {"model": "Rare", "backdrop": "Onyx Black"}}] * 6)
+_tp = gs.build_trait_prices(_items47)
+
+check("цены пишутся по КАЖДОМУ трейту, а не только по PEER_TRAIT",
+      set(_tp) == {"model", "backdrop"}, sorted(_tp))
+check("фоны попали в запись", "Onyx Black" in _tp["backdrop"])
+check("цены сегмента отсортированы",
+      _tp["backdrop"]["Onyx Black"] == sorted(_tp["backdrop"]["Onyx Black"]))
+check("лот без трейтов не роняет сборку",
+      gs.build_trait_prices([{"sale_price_ton": Decimal("1"), "traits": {}}]) == {})
+
+# Снапшот обязан нести новое поле: иначе запись снова окажется не про то.
+check("build_trait_prices вызывается при сборке снапшота",
+      '"trait_prices": build_trait_prices(on_sale)' in
+      open("gift_sniper.py", encoding="utf-8").read())
+check("trait_prices сохраняется в запись",
+      '"trait_prices": {name: {val: [str(p) for p in prices]' in
+      open("gift_sniper.py", encoding="utf-8").read())
+
+# --- сам отчёт ---
+def _snap47(tp, idx, total, floor="5.00"):
+    return {"ts": time.time(), "collection": "0:" + "ab" * 32, "floor": floor,
+            "sample_size": total, "competition": 0, "floor_reliable": True,
+            "trait_index": idx, "trait_total": total, "peer_prices": {},
+            "market_floors": {}, "candidates": [],
+            "trait_prices": {n: {v: [str(p) for p in pr] for v, pr in vals.items()}
+                             for n, vals in tp.items()}}
+
+def _run47(row):
+    fh = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False,
+                                     encoding="utf-8")
+    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    fh.close()
+    try:
+        return gs.trait_premium_report(fh.name)
+    finally:
+        os.unlink(fh.name)
+
+# Редкость 13% ВЫШЕ порога RARE_TRAIT_THRESHOLD_PCT (5%) — в сводку такой
+# сегмент попасть не должен, иначе «редкая» премия считалась бы по обычным.
+_idx47, _tot47 = gs.build_trait_index(_items47)
+check("сегмент выше порога редкости в сводку не идёт",
+      _run47(_snap47(_tp, _idx47, _tot47)) is None)
+
+# А теперь действительно редкий: 3 из 100 = 3%.
+_rare = ([{"sale_price_ton": Decimal("5.0"),
+           "traits": {"backdrop": "Sky Blue"}}] * 97
+         + [{"sale_price_ton": Decimal("20.0"),
+             "traits": {"backdrop": "Onyx Black"}}] * 4)
+_tpr = gs.build_trait_prices(_rare)
+_idxr, _totr = gs.build_trait_index(_rare)
+_res = _run47(_snap47(_tpr, _idxr, _totr))
+check("редкий сегмент измерен", _res is not None and len(_res) == 1, _res)
+check("премия посчитана как отношение к floor",
+      _res is not None and Decimal("3.9") < _res[0] < Decimal("4.1"), _res)
+
+# Сегмент с выборкой меньше MIN_PEER_SAMPLE не измеряется: отношение по
+# одному лоту -- это не премия, а цена одного продавца.
+_thin = ([{"sale_price_ton": Decimal("5.0"),
+           "traits": {"backdrop": "Sky Blue"}}] * 99
+         + [{"sale_price_ton": Decimal("99.0"),
+             "traits": {"backdrop": "Unique"}}])
+check("сегмент из одного лота премией не считается",
+      _run47(_snap47(gs.build_trait_prices(_thin),
+                     *gs.build_trait_index(_thin))) is None)
+
+# Старая запись (без trait_prices) обязана дать ВНЯТНЫЙ отказ, а не пустой
+# отчёт: пустой читается как «премии нет» и закрыл бы вопрос неверно.
+_old47 = _snap47({}, {}, 10)
+del _old47["trait_prices"]
+check("запись без trait_prices даёт отказ, а не пустой отчёт",
+      _run47(_old47) is None)
+
+# И главное: отчёт обязан НАЗВАТЬ это ценами продавцов. Без оговорки число
+# 4.05x прочитается как «можно смело ставить PREMIUM_MULT=4».
+_src47 = open("gift_sniper.py", encoding="utf-8").read()
+check("отчёт называет, что это цены продавцов, а не сделок",
+      "ЦЕНЫ ПРОДАВЦОВ, А НЕ ЦЕНЫ СДЕЛОК" in _src47)
+check("сказано, что вписывать напрямую в PREMIUM_MULT нельзя",
+      "PREMIUM_MULT напрямую" in _src47)
 
 
 # =============================================================================

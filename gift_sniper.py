@@ -1165,6 +1165,36 @@ def build_peer_prices(on_sale_items):
     return peers
 
 
+def build_trait_prices(on_sale_items):
+    """
+    Цены выставленных лотов по КАЖДОМУ трейту, а не только по `PEER_TRAIT`:
+        {"model": {"Cookbook": [1.2, 1.5]}, "backdrop": {"Onyx Black": [9.0]}}
+
+    Зачем отдельно от `build_peer_prices()`. Та пишет только `PEER_TRAIT`
+    ("model"), потому что по нему считается `eff_floor` при оценке сделки.
+    Но главный тезис владельца — про ФОНЫ и УЗОРЫ: редкий фон по цене пола.
+    Проверить его по записи, где фонов нет, невозможно в принципе, и каждый
+    день наблюдения копил бы данные не про то.
+
+    Поймано 22.09.2026, когда дошло до калибровки `PREMIUM_MULT`.
+
+    ВАЖНО, что это ЦЕНЫ ПРОДАВЦОВ, а не цены сделок. Премия, посчитанная по
+    ним, отвечает на вопрос «сколько ПРОСЯТ за редкий трейт», а не «сколько
+    за него ПЛАТЯТ». Ставить такую премию в `PREMIUM_MULT` напрямую нельзя:
+    именно у неликвида цена спроса и цена предложения расходятся сильнее
+    всего. Отчёт обязан говорить это вслух.
+    """
+    out = {}
+    for it in on_sale_items:
+        price = Decimal(str(it["sale_price_ton"]))
+        for name, value in (it.get("traits") or {}).items():
+            out.setdefault(str(name), {}).setdefault(str(value), []).append(price)
+    for name in out:
+        for value in out[name]:
+            out[name][value].sort()
+    return out
+
+
 def peer_floor(item: dict, peer_prices: dict):
     """
     Floor среди лотов с тем же ключевым трейтом: (floor | None, размер выборки).
@@ -1406,6 +1436,9 @@ def get_market_snapshot(collection: str) -> dict:
         # Цены по сегментам: без них лот сравнивать не с чем, и бэктест
         # повторил бы ровно ту ошибку, от которой мы защищаемся.
         "peer_prices": build_peer_prices(on_sale),
+        # Цены по ВСЕМ трейтам: peer_prices покрывает только PEER_TRAIT, а
+        # премия за редкий ФОН по нему не считается вовсе.
+        "trait_prices": build_trait_prices(on_sale),
         # Floor по площадкам: разница между ними и есть арбитраж.
         "market_floors": build_market_floors(on_sale),
         # Без этого поля снапшоты разных коллекций в записи неразличимы,
@@ -3016,6 +3049,9 @@ def record_snapshot(snap: dict, path: str = None):
         # Decimal не сериализуется в JSON — храним строками, как и floor.
         "peer_prices": {k: [str(p) for p in v]
                         for k, v in (snap.get("peer_prices") or {}).items()},
+        "trait_prices": {name: {val: [str(p) for p in prices]
+                                for val, prices in vals.items()}
+                         for name, vals in (snap.get("trait_prices") or {}).items()},
         "market_floors": {k: {"n": v["n"],
                               "floor": (str(v["floor"]) if v["floor"] is not None else None)}
                           for k, v in (snap.get("market_floors") or {}).items()},
@@ -3578,6 +3614,136 @@ def market_report(path: str = None):
     return results
 
 
+def trait_premium_report(path: str = None):
+    """
+    Во сколько раз дороже floor стоят лоты с редким значением трейта.
+
+    Это шаг калибровки `PREMIUM_MULT`, которого до сих пор не было: премия
+    стояла равной 1.0 «пока не измерим», и измерить её было нечем.
+
+    ЧТО ЭТО ЗА ЧИСЛО И ЧТО ИМ НЕЛЬЗЯ ДЕЛАТЬ. Считается по ЦЕНАМ ПРОДАВЦОВ —
+    другого в записи нет, историю сделок TonAPI не отдаёт. Значит отношение
+    отвечает на вопрос «сколько ПРОСЯТ за редкий трейт», а не «сколько за
+    него ПЛАТЯТ». Разница между этими вопросами и есть неликвид, и у редких
+    вещей она максимальна: редкий фон можно выставить за 10 floor и простоять
+    с ним год.
+
+    Поэтому число отсюда нельзя просто вписать в `PREMIUM_MULT`. Оно говорит
+    другое: СУЩЕСТВУЕТ ли премия в ценах вообще и какого она порядка. Если
+    её нет даже в запросах продавцов — тезис «за редкий фон переплачивают»
+    неверен, и дальше копать незачем. Если есть — остаётся вопрос
+    реализуемости, который решается только историей сделок.
+
+    Берётся ПОСЛЕДНИЙ снапшот каждой коллекции: это срез витрины на один
+    момент. Усреднять по времени нельзя — в разные моменты на витрине разные
+    лоты, и среднее смешало бы их в несуществующий рынок.
+    """
+    path = path or RECORD_PATH
+    try:
+        snaps = _load_recording(path)
+    except FileNotFoundError:
+        log.error(f"Записи рынка нет: {path}. Сначала соберите её: "
+                  f"python gift_sniper.py --record")
+        return None
+    if not snaps:
+        log.error(f"{path} пуст — нечего анализировать.")
+        return None
+
+    latest = {}
+    for snap in snaps:
+        coll = snap.get("collection", "")
+        if coll not in latest or snap["ts"] > latest[coll]["ts"]:
+            latest[coll] = snap
+
+    log.info(f"{_Color.BOLD}=== ПРЕМИЯ ЗА РЕДКИЕ ТРЕЙТЫ ==={_Color.RESET}")
+    log.info(f"Запись: {path} | снапшотов {len(snaps)} | коллекций {len(latest)}")
+
+    # Старая запись не содержит trait_prices: поле добавлено 22.09.2026.
+    # Сказать об этом прямо, иначе пустой отчёт читается как «премии нет».
+    with_traits = [s for s in latest.values() if s.get("trait_prices")]
+    if not with_traits:
+        log.warning(f"{_Color.YELLOW}В записи нет поля trait_prices — она "
+                    f"собрана до 22.09.2026, когда писался только трейт "
+                    f"'{PEER_TRAIT}'. Премию за ФОН по ней посчитать НЕЛЬЗЯ. "
+                    f"Обновите бота и накопите запись заново — сутки уже "
+                    f"дадут срез витрины.{_Color.RESET}")
+        return None
+
+    rare_ratios = []
+    for coll, snap in sorted(latest.items()):
+        floor = snap["floor"]
+        tprices = snap.get("trait_prices") or {}
+        index = snap.get("trait_index") or {}
+        total = snap.get("trait_total") or 0
+        if floor <= 0 or not tprices or total <= 0:
+            continue
+
+        log.info("")
+        log.info(f"{_Color.BOLD}{_short(coll)}{_Color.RESET} | "
+                 f"floor {floor} TON | выборка {total} предметов")
+
+        for trait_name in sorted(tprices):
+            rows = []
+            for value, prices in tprices[trait_name].items():
+                prices = [Decimal(str(x)) for x in prices]
+                if len(prices) < MIN_PEER_SAMPLE:
+                    continue
+                seg = _percentile(sorted(prices), FLOOR_PERCENTILE)
+                have = (index.get(trait_name) or {}).get(value)
+                rarity = (Decimal(have) / Decimal(total) * 100) if have else None
+                ratio = seg / floor
+                rows.append((rarity, value, len(prices), seg, ratio))
+                if rarity is not None and rarity <= RARE_TRAIT_THRESHOLD_PCT:
+                    rare_ratios.append(ratio)
+
+            if not rows:
+                continue
+            # Самые редкие сверху: именно там тезис проверяется.
+            rows.sort(key=lambda r: (r[0] is None, r[0]))
+            log.info(f"  трейт «{trait_name}»")
+            log.info(f"    {'значение':<24}{'редкость':>9}{'лотов':>7}"
+                     f"{'floor сегм.':>13}{'x floor':>9}")
+            for rarity, value, n, seg, ratio in rows[:12]:
+                rs = f"{rarity:.1f}%" if rarity is not None else "н/д"
+                colour = (_Color.GREEN if ratio >= Decimal("1.5")
+                          else _Color.GREY if ratio < Decimal("1.1") else "")
+                log.info(f"    {str(value)[:24]:<24}{rs:>9}{n:>7}"
+                         f"{seg:>13.2f}{colour}{ratio:>9.2f}{_Color.RESET}")
+
+    log.info("")
+    if not rare_ratios:
+        log.warning(f"{_Color.YELLOW}Ни одного редкого значения с выборкой "
+                    f">= {MIN_PEER_SAMPLE} лотов. Премию измерить не на чем: "
+                    f"редкие трейты потому и редкие, что их мало выставляют. "
+                    f"Нужна запись длиннее или коллекции крупнее.{_Color.RESET}")
+        return None
+
+    rare_ratios.sort()
+    median = rare_ratios[len(rare_ratios) // 2]
+    log.info(f"Редких сегментов (<= {RARE_TRAIT_THRESHOLD_PCT}% носителей) "
+             f"с достаточной выборкой: {len(rare_ratios)}")
+    log.info(f"{_Color.BOLD}Медианное отношение к floor: {median:.2f}x"
+             f"{_Color.RESET} (разброс {rare_ratios[0]:.2f}–{rare_ratios[-1]:.2f})")
+
+    log.info("")
+    log.warning(f"{_Color.YELLOW}ЭТО ЦЕНЫ ПРОДАВЦОВ, А НЕ ЦЕНЫ СДЕЛОК. Число "
+                f"выше говорит, сколько ПРОСЯТ за редкий трейт, а не сколько "
+                f"платят. Вписать его в PREMIUM_MULT напрямую значит поверить, "
+                f"что редкий лот уйдёт по запрошенной цене — а именно у "
+                f"редких вещей запрос и спрос расходятся сильнее всего."
+                f"{_Color.RESET}")
+    if len(rare_ratios) < MIN_PEER_SAMPLE * 2:
+        log.warning(f"{_Color.YELLOW}И выборка мала: {len(rare_ratios)} "
+                    f"сегментов. Медиана по такой выборке гуляет от одного "
+                    f"лота.{_Color.RESET}")
+    log.info(f"{_Color.GREY}Что с этим делать: если премии нет даже в ценах "
+             f"продавцов (около 1.00x) — тезис «за редкий трейт "
+             f"переплачивают» не подтверждается, и PREMIUM_MULT надо оставить "
+             f"равным 1.0. Если премия видна — она ВЕРХНЯЯ граница, и ставить "
+             f"надо заметно ниже.{_Color.RESET}")
+    return rare_ratios
+
+
 def rank_collections(path: str = None):
     """
     Ранжирует коллекции из записи рынка по РЕАЛЬНОЙ активности.
@@ -4046,6 +4212,9 @@ def parse_args(argv=None):
     parser.add_argument("--discover", nargs="?", const=30, type=int, metavar="N",
                         help="найти коллекции под банк через API и выйти "
                              "(эндпоинт НЕ проверен на живых данных)")
+    parser.add_argument("--premium", nargs="?", const=RECORD_PATH, metavar="FILE",
+                        help="во сколько раз дороже floor просят за редкие "
+                             "трейты (калибровка PREMIUM_MULT)")
     parser.add_argument("--markets", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="сравнить площадки по записи: где дешевле и есть ли "
                              "арбитраж между ними")
@@ -4088,6 +4257,9 @@ if __name__ == "__main__":
         if args.markets:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if market_report(args.markets) else 1)
+        if args.premium:
+            # Только чтение записи: ни сети, ни покупок.
+            sys.exit(0 if trait_premium_report(args.premium) else 1)
         if args.backtest:
             # Бэктест ничего не покупает и не ходит в сеть — только считает.
             sys.exit(0 if run_backtest(args.backtest, args.hold_hours) else 1)
