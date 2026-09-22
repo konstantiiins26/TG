@@ -79,9 +79,10 @@ echo.
 :secrets_ready
 call "%~dp0my-secrets.bat"
 
-REM 5 kollekciy x 15 stranic = 75 zaprosov. Pauza 1.1s mezhdu nimi
-REM zadana v kode, znachit odin cikl zanimaet ~83 sekundy.
-REM Interval 60s byl by KOROCHE cikla - cikly nalezali by drug na druga.
+REM 12 kollekciy x 15 stranic = 180 zaprosov. Pauza 1.1s mezhdu nimi
+REM zadana v kode, znachit sam cikl zanimaet ne menshe ~3.3 minut.
+REM POLL_INTERVAL_SEC nizhe etogo prosto ne sobludaetsya - cikl dlinnee.
+REM Fakticheskiy shag pri byudzhete 40000: ~6.5 min (schitaet sam bot).
 set FLOOR_SAMPLE_PAGES=15
 set POLL_INTERVAL_SEC=120
 set DRY_RUN=1
