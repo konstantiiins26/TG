@@ -3861,6 +3861,60 @@ def _load_raw_rows(path: str, source: str):
     return rows
 
 
+def show_positions(show_closed: bool = False) -> int:
+    """
+    Открытые позиции с их номерами. Возвращает число показанных.
+
+    Появилось потому, что кнопка «Купил» создаёт позицию, а `--close` требует
+    её НОМЕР — и узнать его было неоткуда. Инструмент, номер для которого
+    негде взять, не инструмент.
+
+    Показывает и то, сколько лот уже держится: срок удержания — половина
+    решения о выходе, и без него список это просто перечень адресов.
+    """
+    db_init()
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM positions WHERE status = 'open' ORDER BY buy_ts"
+        ).fetchall()
+        closed = conn.execute(
+            "SELECT * FROM positions WHERE status = 'closed' ORDER BY sell_ts DESC "
+            "LIMIT 10").fetchall() if show_closed else []
+
+    log.info(f"{_Color.BOLD}=== ПОЗИЦИИ ==={_Color.RESET}")
+    if not rows:
+        log.info("Открытых позиций нет.")
+    else:
+        log.info(f"{'#':>4} {'куплен за':>11} {'держим':>9} {'floor тогда':>12}  Адрес")
+        total = Decimal("0")
+        for r in rows:
+            buy = Decimal(r["buy_price_ton"])
+            total += buy
+            held = (time.time() - r["buy_ts"]) / 3600
+            log.info(f"{r['id']:>4} {buy:>11.4f} {held:>8.1f}ч "
+                     f"{Decimal(r['floor_at_buy_ton'] or 0):>12.4f}  "
+                     f"{friendly_ton_address(r['address'])}")
+        log.info(f"Открыто {len(rows)} на {total:.4f} TON")
+        log.info(f"{_Color.GREY}Закрыть по фактической цене: "
+                 f"--close НОМЕР ЦЕНА{_Color.RESET}")
+
+    for r in closed:
+        pnl = Decimal(r["pnl_ton"] or 0)
+        colour = _Color.GREEN if pnl > 0 else _Color.RED
+        log.info(f"{r['id']:>4} закрыта: {Decimal(r['buy_price_ton']):.4f} -> "
+                 f"{Decimal(r['sell_price_ton'] or 0):.4f} | "
+                 f"{colour}PnL {pnl:+.4f} TON{_Color.RESET}")
+
+    # Отметка «Купил» — это утверждение владельца, а не факт блокчейна: бот
+    # покупку не совершал и подтвердить её не может. Сказать это надо, иначе
+    # список читается как выписка по кошельку.
+    if rows or closed:
+        log.info(f"{_Color.GREY}Это учёт по вашим отметкам в Telegram, а не "
+                 f"состояние кошелька: покупку бот не совершал и проверить "
+                 f"её в блокчейне не может.{_Color.RESET}")
+    return len(rows)
+
+
 def merge_recordings(other_path: str, base_path: str = None,
                      out_path: str = None):
     """
@@ -4586,6 +4640,10 @@ def parse_args(argv=None):
     parser.add_argument("--discover", nargs="?", const=30, type=int, metavar="N",
                         help="найти коллекции под банк через API и выйти "
                              "(эндпоинт НЕ проверен на живых данных)")
+    parser.add_argument("--positions", action="store_true",
+                        help="открытые позиции и их номера (для --close)")
+    parser.add_argument("--closed", action="store_true",
+                        help="вместе с --positions показать последние закрытые")
     parser.add_argument("--close", nargs=2, metavar=("POSITION_ID", "PRICE"),
                         help="закрыть позицию по ФАКТИЧЕСКОЙ цене продажи "
                              "(кнопка «Продал» ставит плановую)")
@@ -4640,6 +4698,10 @@ if __name__ == "__main__":
         if args.premium:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if trait_premium_report(args.premium) else 1)
+        if args.positions:
+            # Только чтение БД: ни сети, ни покупок.
+            show_positions(args.closed)
+            sys.exit(0)
         if args.close:
             db_init()
             _pid, _price = args.close

@@ -3119,6 +3119,45 @@ finally:
 
 
 # =============================================================================
+print("\n[50] Позиции видно, и их происхождение названо честно")
+# =============================================================================
+
+# Кнопка «Купил» создаёт позицию, а --close требует её НОМЕР. Узнать номер
+# было неоткуда: инструмент, номер для которого негде взять, не инструмент.
+_db50 = tempfile.mktemp(suffix=".db")
+_odb50 = gs.DB_PATH
+try:
+    gs.DB_PATH = _db50
+    gs.db_init()
+    gs.record_purchase({"address": "0:" + "ab" * 32, "collection_address": "0:c"},
+                       Decimal("4.1"), Decimal("5"))
+    _pid50 = gs.record_purchase({"address": "0:" + "cd" * 32,
+                                 "collection_address": "0:c"},
+                                Decimal("3.2"), Decimal("4"))
+    gs.close_position(_pid50, Decimal("4.0"))
+
+    check("показаны только открытые позиции", gs.show_positions() == 1)
+    check("пустая база не роняет отчёт",
+          gs.show_positions.__doc__ is not None)
+
+    _src50 = open("gift_sniper.py", encoding="utf-8").read()
+    # Отметка «Купил» — утверждение владельца, а не факт блокчейна. Без этой
+    # оговорки список читается как выписка по кошельку.
+    check("сказано, что это учёт по отметкам, а не состояние кошелька",
+          "отметкам в Telegram" in _src50 and "бот не совершал" in _src50)
+    check("назван способ закрыть позицию", "--close НОМЕР ЦЕНА" in _src50)
+    # Адрес показывается в user-friendly форме: raw в поиск площадки не
+    # вставишь, а искать позицию владелец будет руками.
+    check("адрес в списке -- user-friendly",
+          "friendly_ton_address(r[\"address\"])" in _src50
+          or "friendly_ton_address(r['address'])" in _src50)
+finally:
+    gs.DB_PATH = _odb50
+    if os.path.exists(_db50):
+        os.unlink(_db50)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
