@@ -2907,6 +2907,89 @@ check("сказано, что вписывать напрямую в PREMIUM_MUL
 
 
 # =============================================================================
+print("\n[48] Объединение записей: склейка врёт про оборот, --merge нет")
+# =============================================================================
+
+# Две машины (ПК и ноутбук) дают две записи. Просто склеить их нельзя:
+# оборот в --rank считается как разница множеств самых дешёвых лотов между
+# СОСЕДНИМИ снапшотами, а снапшоты двух машин в одно время встанут
+# вперемешку. Выборки у них чуть разные, и эта разница засчитается как
+# продажи, которых не было. Именно по обороту отбирались живые коллекции.
+
+_C48 = "0:" + "ab" * 32
+
+def _row48(ts, cands):
+    return json.dumps({"ts": ts, "collection": _C48, "floor": "5.00",
+                       "sample_size": 50, "competition": 0,
+                       "floor_reliable": True, "trait_index": {},
+                       "trait_total": 0, "peer_prices": {}, "market_floors": {},
+                       "trait_prices": {},
+                       "candidates": [{"address": a} for a in cands]},
+                      ensure_ascii=False)
+
+_d48 = tempfile.mkdtemp()
+_A48 = os.path.join(_d48, "a.jsonl")
+_B48 = os.path.join(_d48, "b.jsonl")
+
+# Обе машины видят ОДНУ И ТУ ЖЕ неподвижную витрину, только B выхватывает
+# чуть другой пятый лот. Настоящий оборот здесь НУЛЕВОЙ.
+with open(_A48, "w", encoding="utf-8") as _f:
+    _f.write("\n".join(_row48(t, ["x1", "x2", "x3"])
+                       for t in (0, 1200, 2400, 3600)) + "\n")
+with open(_B48, "w", encoding="utf-8") as _f:
+    _f.write("\n".join(_row48(t + 60, ["x1", "x2", "y9"])
+                       for t in (0, 1200, 2400, 3600)) + "\n")
+
+# --- наивная склейка ---
+_naive = os.path.join(_d48, "naive.jsonl")
+with open(_naive, "w", encoding="utf-8") as _f:
+    _f.write(open(_A48, encoding="utf-8").read())
+    _f.write(open(_B48, encoding="utf-8").read())
+_st_naive = gs._collection_stats(_C48, gs._load_recording(_naive))
+
+# --- честное объединение ---
+_merged = gs.merge_recordings(_B48, base_path=_A48,
+                              out_path=os.path.join(_d48, "m.jsonl"))
+_st_merged = gs._collection_stats(_C48, gs._load_recording(_merged))
+
+check("склейка ВЫДУМЫВАЕТ оборот на неподвижной витрине",
+      _st_naive["turnover_per_hour"] > 0, _st_naive["turnover_per_hour"])
+check("после --merge оборот честно нулевой",
+      _st_merged["turnover_per_hour"] == 0, _st_merged["turnover_per_hour"])
+
+# Строки обязаны переписываться ДОСЛОВНО: пересборка через json.dumps
+# прогнала бы цены через float, а они лежат строками именно поэтому.
+_orig = set(open(_A48, encoding="utf-8").read().splitlines())
+_out = set(open(_merged, encoding="utf-8").read().splitlines())
+check("строки переписаны дословно, без пересборки JSON",
+      _out.issubset(_orig | set(open(_B48, encoding="utf-8").read().splitlines())))
+
+# Непересекающиеся записи объединяются ЦЕЛИКОМ: выбрасывать там нечего.
+_A2 = os.path.join(_d48, "a2.jsonl")
+_B2 = os.path.join(_d48, "b2.jsonl")
+with open(_A2, "w", encoding="utf-8") as _f:
+    _f.write("\n".join(_row48(t, ["x1"]) for t in (0, 1200)) + "\n")
+with open(_B2, "w", encoding="utf-8") as _f:
+    _f.write("\n".join(_row48(t, ["x1"]) for t in (9000, 10200)) + "\n")
+_m2 = gs.merge_recordings(_B2, base_path=_A2, out_path=os.path.join(_d48, "m2.jsonl"))
+check("непересекающиеся записи сохраняются целиком",
+      sum(1 for _ in open(_m2, encoding="utf-8")) == 4)
+
+# Ничего не перезаписываем: запись рынка невосстановима.
+check("существующий файл результата НЕ перезаписывается",
+      gs.merge_recordings(_B2, base_path=_A2, out_path=_m2) is None)
+check("отсутствующий исходник даёт отказ, а не пустой результат",
+      gs.merge_recordings(os.path.join(_d48, "нет.jsonl"), base_path=_A2,
+                          out_path=os.path.join(_d48, "m3.jsonl")) is None)
+
+# Дыра между записями объединением НЕ лечится, и это надо сказать вслух:
+# иначе бэктест молча недосчитает половину сделок.
+_src48 = open("gift_sniper.py", encoding="utf-8").read()
+check("про разрывы в объединённой записи предупреждается",
+      "Объединение их НЕ" in _src48 and "лечит" in _src48)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

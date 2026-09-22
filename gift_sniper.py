@@ -3614,6 +3614,153 @@ def market_report(path: str = None):
     return results
 
 
+def _load_raw_rows(path: str, source: str):
+    """
+    Читает запись как СЫРЫЕ строки, разбирая только ts и коллекцию.
+
+    Именно сырые: при объединении строки переписываются дословно. Пересборка
+    через json.dumps прогнала бы числа через float и незаметно испортила бы
+    цены — а они в записи лежат строками именно чтобы этого не случилось.
+    """
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if not line.strip():
+                continue
+            try:
+                head = json.loads(line)
+                rows.append({"ts": float(head["ts"]),
+                             "collection": head.get("collection", ""),
+                             "line": line, "source": source})
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                log.warning(f"{path}:{lineno} — строка повреждена, пропускаю")
+    return rows
+
+
+def merge_recordings(other_path: str, base_path: str = None,
+                     out_path: str = None):
+    """
+    Объединяет две записи рынка в одну — например, с ПК и с ноутбука.
+
+    Зачем отдельная команда, если файлы можно просто склеить. Потому что у
+    склейки есть тихий сбой. Оборот в `--rank` считается как разница множеств
+    самых дешёвых лотов между СОСЕДНИМИ снапшотами. Если обе машины снимали
+    витрину в одно и то же время, их снапшоты в объединённой записи встанут
+    вперемешку — а выборки у них чуть разные (страницы приходят не в том же
+    порядке). Разница между «почти одинаковыми» выборками засчитается как
+    исчезнувшие лоты, то есть как ПРОДАЖИ, которых не было.
+
+    Метрика оборота — та самая, по которой отбирались живые коллекции, и
+    испортить её значит выбрать не те коллекции, ничего не заметив.
+
+    Поэтому: если периоды пересекаются, внутри пересечения остаётся ОДИН
+    источник — тот, у кого там снапшотов больше. Это не «выбросить данные»:
+    два наблюдателя одной витрины в один момент дают одно наблюдение, а не
+    два.
+
+    Ничего не перезаписывает: результат кладётся в отдельный файл, и что с
+    ним делать, решает владелец.
+    """
+    base_path = base_path or RECORD_PATH
+    out_path = out_path or (base_path + ".merged")
+
+    if os.path.exists(out_path):
+        log.error(f"{out_path} уже существует — не перезаписываю. "
+                  f"Переименуйте или удалите его сами.")
+        return None
+    for src in (base_path, other_path):
+        if not os.path.exists(src):
+            log.error(f"Записи нет: {src}")
+            return None
+
+    rows = (_load_raw_rows(base_path, "A") + _load_raw_rows(other_path, "B"))
+    if not rows:
+        log.error("Обе записи пусты — объединять нечего.")
+        return None
+
+    log.info(f"{_Color.BOLD}=== ОБЪЕДИНЕНИЕ ЗАПИСЕЙ ==={_Color.RESET}")
+    log.info(f"A: {base_path} — строк {sum(1 for r in rows if r['source'] == 'A')}")
+    log.info(f"B: {other_path} — строк {sum(1 for r in rows if r['source'] == 'B')}")
+
+    by_coll = {}
+    for r in rows:
+        by_coll.setdefault(r["collection"], []).append(r)
+
+    kept, dropped = [], 0
+    for coll, items in sorted(by_coll.items()):
+        a = [r for r in items if r["source"] == "A"]
+        b = [r for r in items if r["source"] == "B"]
+        if not a or not b:
+            kept.extend(items)
+            continue
+
+        lo = max(min(r["ts"] for r in a), min(r["ts"] for r in b))
+        hi = min(max(r["ts"] for r in a), max(r["ts"] for r in b))
+        if lo >= hi:
+            kept.extend(items)          # периоды не пересекаются — всё ценно
+            continue
+
+        in_a = [r for r in a if lo <= r["ts"] <= hi]
+        in_b = [r for r in b if lo <= r["ts"] <= hi]
+        winner = "A" if len(in_a) >= len(in_b) else "B"
+        loser_n = len(in_b) if winner == "A" else len(in_a)
+        dropped += loser_n
+        log.warning(f"{_Color.YELLOW}{_short(coll)}: периоды пересекаются на "
+                    f"{(hi - lo) / 3600:.1f} ч. Оставляю источник {winner} "
+                    f"({max(len(in_a), len(in_b))} снапшотов), отбрасываю "
+                    f"{loser_n} из другого — иначе оборот посчитается с "
+                    f"фантомными продажами.{_Color.RESET}")
+        survivors = [r for r in items
+                     if not (lo <= r["ts"] <= hi and r["source"] != winner)]
+
+        # Одинокий снапшот проигравшего источника за краем пересечения даёт
+        # не наблюдение, а ШОВ: выборки двух машин чуть разные, и переход
+        # между ними засчитается как исчезнувшие лоты. Одна точка не
+        # добавляет истории, ради которой стоило бы это терпеть.
+        # Поймано собственным тестом: после «честного» объединения оборот
+        # неподвижной витрины оказался 0.98/ч вместо нуля.
+        loser = "B" if winner == "A" else "A"
+        leftovers = [r for r in survivors if r["source"] == loser]
+        if len(leftovers) < 2:
+            dropped += len(leftovers)
+            survivors = [r for r in survivors if r["source"] == winner]
+        kept.extend(survivors)
+
+    kept.sort(key=lambda r: r["ts"])
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            for r in kept:
+                f.write(r["line"] + "\n")
+    except OSError as e:
+        log.error(f"Не удалось записать {out_path}: {e}")
+        return None
+
+    span_h = (kept[-1]["ts"] - kept[0]["ts"]) / 3600 if len(kept) > 1 else 0
+    log.info("")
+    log.info(f"{_Color.GREEN}Готово: {out_path}{_Color.RESET}")
+    log.info(f"Строк {len(kept)} (отброшено дублей {dropped}) | "
+             f"коллекций {len(by_coll)} | период {span_h:.1f} ч")
+
+    # Дыра между записями никуда не девается от объединения. Бэктест на ней
+    # не закроет позиции, и надо, чтобы владелец узнал это ЗДЕСЬ, а не из
+    # отчёта, в котором сделок окажется вдвое меньше ожидаемого.
+    gaps = [(kept[i + 1]["ts"] - kept[i]["ts"]) / 3600
+            for i in range(len(kept) - 1)]
+    big = [g for g in gaps if g > float(BACKTEST_MAX_SLACK_HOURS)]
+    if big:
+        log.warning(f"{_Color.YELLOW}В объединённой записи {len(big)} "
+                    f"разрыв(ов) больше {BACKTEST_MAX_SLACK_HOURS} ч "
+                    f"(самый большой {max(big):.1f} ч). Объединение их НЕ "
+                    f"лечит: позиции через разрыв бэктест не засчитает "
+                    f"закрытыми.{_Color.RESET}")
+
+    log.info(f"{_Color.GREY}Проверьте отчётом, потом замените основную "
+             f"запись:{_Color.RESET}")
+    log.info(f"{_Color.GREY}  python gift_sniper.py --rank {out_path}{_Color.RESET}")
+    return out_path
+
+
 def trait_premium_report(path: str = None):
     """
     Во сколько раз дороже floor стоят лоты с редким значением трейта.
@@ -4212,6 +4359,9 @@ def parse_args(argv=None):
     parser.add_argument("--discover", nargs="?", const=30, type=int, metavar="N",
                         help="найти коллекции под банк через API и выйти "
                              "(эндпоинт НЕ проверен на живых данных)")
+    parser.add_argument("--merge", metavar="FILE",
+                        help="объединить запись рынка с другой (например, "
+                             "перенесённой с другого компьютера)")
     parser.add_argument("--premium", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="во сколько раз дороже floor просят за редкие "
                              "трейты (калибровка PREMIUM_MULT)")
@@ -4260,6 +4410,9 @@ if __name__ == "__main__":
         if args.premium:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if trait_premium_report(args.premium) else 1)
+        if args.merge:
+            # Пишет в ОТДЕЛЬНЫЙ файл: существующую запись не трогает.
+            sys.exit(0 if merge_recordings(args.merge) else 1)
         if args.backtest:
             # Бэктест ничего не покупает и не ходит в сеть — только считает.
             sys.exit(0 if run_backtest(args.backtest, args.hold_hours) else 1)
