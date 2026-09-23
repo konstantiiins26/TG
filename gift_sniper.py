@@ -2410,8 +2410,12 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
 
     lines = [
         head,
+        # Знак ставится форматом, а не вручную: захардкоженный «+» при
+        # убытке печатал «+-3.66», и это не опечатка, а строка, по которой
+        # принимают решение о деньгах.
         f"💰 Купить {q(ev['buy_price'])} → продать {q(ev['sale_price'])} → "
-        f"📈 +{q(ev['net_profit'])} TON ({ev['roi_pct']}%)",
+        f"{'📈' if ev['net_profit'] > 0 else '📉'} "
+        f"{q(ev['net_profit']):+} TON ({ev['roi_pct']}%)",
         "",
         "Почему этот:",
     ]
@@ -2456,11 +2460,21 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
     if warn:
         lines += [""] + warn
 
-    # Ссылка одна: площадка. Обозреватель и сырой адрес ушли в лог — в
-    # телефоне три ссылки подряд читаются как мусор, а нужна из них одна.
+    # Две ссылки: площадка и обозреватель. Сырой адрес ушёл в лог — он
+    # дублирует обе ссылки и в телефоне только мешает.
+    #
+    # Обозреватель нужен не для красоты: пустая страница на площадке значит
+    # ЛИБО что лот ушёл с продажи, ЛИБО что форма URL разъехалась. Различить
+    # это можно только обозревателем — он резолвит любой адрес всегда и
+    # показывает текущего владельца.
     link_addr = friendly_ton_address(addr)
+    links = []
     if GIFT_URL_TEMPLATE:
-        lines += ["", GIFT_URL_TEMPLATE.format(address=link_addr)]
+        links.append("🔗 " + GIFT_URL_TEMPLATE.format(address=link_addr))
+    if EXPLORER_URL_TEMPLATE:
+        links.append("🔍 " + EXPLORER_URL_TEMPLATE.format(address=link_addr))
+    if links:
+        lines += [""] + links
 
     # Кнопки нужны потому, что режим сейчас РУЧНОЙ: бот находит, а покупает и
     # выставляет владелец. Без отметки «купил» позиция не попадает в БД, и ни
