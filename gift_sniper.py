@@ -1464,7 +1464,7 @@ def get_market_snapshot(collection: str) -> dict:
     cached = _floor_cache.get(cache_key)
     now = time.monotonic()
 
-    all_items, source = _collect_sample(collection)
+    all_items, source, exhausted = _collect_sample(collection)
     if not all_items:
         return _empty_snapshot()
 
@@ -1488,11 +1488,20 @@ def get_market_snapshot(collection: str) -> dict:
     # перцентиль случайного куска, выданный за цену рынка. На коллекции из
     # 13 000 предметов выборка в 1500 давала floor вдвое выше настоящего, и
     # ошибка шла в сторону ЗАВЫШЕНИЯ ВЫРУЧКИ.
-    coll_size = fetch_collection_size(cache_key)
-    coverage = None
-    if coll_size:
-        coverage = (Decimal(len(all_items)) / Decimal(coll_size)
-                    * Decimal("100")).quantize(Decimal("0.1"))
+    # Обход дошёл до пустой страницы — коллекция увидена ЦЕЛИКОМ, и её
+    # размер равен числу собранных предметов. Это ИЗМЕРЕНИЕ, а не поле API:
+    # у коллекций подарков `next_item_index` приходит -1, и проверка
+    # покрытия по нему всегда получала «не знаю», то есть не защищала ни от
+    # чего. Заодно экономит запрос на коллекцию.
+    if exhausted:
+        coll_size = len(all_items)
+        coverage = Decimal("100.0")
+    else:
+        coll_size = fetch_collection_size(cache_key)
+        coverage = None
+        if coll_size:
+            coverage = (Decimal(len(all_items)) / Decimal(coll_size)
+                        * Decimal("100")).quantize(Decimal("0.1"))
 
     # Недостоверен, если выборка мала ЛИБО коллекция покрыта не вся. Второе
     # важнее первого: 184 лота — солидная выборка по числу, но если это 12%
@@ -1540,12 +1549,21 @@ def get_market_snapshot(collection: str) -> dict:
 def _collect_sample(collection: str):
     """
     Тянет FLOOR_SAMPLE_PAGES страниц с TonAPI; при полном провале — один
-    запрос к Getgems. Возвращает (items, source).
+    запрос к Getgems. Возвращает (items, source, exhausted).
+
+    `exhausted = True` означает, что обход УПЁРСЯ В ПУСТУЮ СТРАНИЦУ, то есть
+    коллекция кончилась и мы увидели её ЦЕЛИКОМ. Это ИЗМЕРЕНИЕ покрытия, и
+    оно сильнее любого поля в API: живой прогон 23.09.2026 показал, что у
+    всех 12 коллекций владельца `next_item_index = -1`, то есть защита по
+    покрытию молча не работала ВООБЩЕ — она всегда получала «не знаю».
+
+    Дыра в выборке (потерянная страница) или упёртая квота `exhausted`
+    снимают: там мы не дошли до конца, а споткнулись.
 
     Частичный успех допустим: если 3 страницы из 5 пришли, работаем с ними
     и пишем предупреждение — это лучше, чем потерять весь цикл.
     """
-    items, failures = [], 0
+    items, failures, exhausted = [], 0, False
     for page in range(FLOOR_SAMPLE_PAGES):
         try:
             batch = fetch_items_tonapi(collection, FLOOR_PAGE_SIZE, offset=page * FLOOR_PAGE_SIZE)
@@ -1562,21 +1580,24 @@ def _collect_sample(collection: str):
             log.warning(f"TonAPI: страница {page + 1}/{FLOOR_SAMPLE_PAGES} не получена ({e}).")
             continue
         if not batch:
+            exhausted = True
             break           # коллекция закончилась — дальше тянуть нечего
         items.extend(batch)
 
     if items:
         if failures:
             log.warning(f"Выборка неполная: {failures} страниц потеряно. Floor менее точен.")
-        return items, "TonAPI"
+            exhausted = False     # дыра в середине — конец не доказан
+        return items, "TonAPI", exhausted
 
     # --- Полный провал TonAPI: пробуем Getgems -----------------------------
     log.warning("TonAPI недоступен полностью. Переключаюсь на Getgems...")
     try:
-        return fetch_items_getgems(collection, FLOOR_PAGE_SIZE), "Getgems"
+        # У запасного источника одна страница — конца коллекции он не видит.
+        return fetch_items_getgems(collection, FLOOR_PAGE_SIZE), "Getgems", False
     except Exception as e:  # noqa: BLE001
         log.error(f"Оба источника недоступны. Getgems: {e}")
-        return [], "none"
+        return [], "none", False
 
 
 # =============================================================================
@@ -1925,6 +1946,14 @@ def score_flip(item: dict, snap: dict, model_colors=None):
     target = flip_uneven_price(price * FLIP_TARGET_MULT)
     net = target * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT) - price - GAS_FEE_TON
     out["target_ton"] = target
+    # НАСКОЛЬКО ЦЕЛЬ ВЫШЕ ЦЕН, С КОТОРЫМИ ЛОТ БУДЕТ КОНКУРИРОВАТЬ.
+    # Правило «x1.5» автор применяет к лоту, купленному НА floor. Купив на
+    # 25% НИЖЕ floor, тот же множитель ставит цену на 12% ВЫШЕ floor — то
+    # есть выше одинаковых лотов рядом, и шанс продажи уже не тот, из
+    # которого считался порог «каждый четвёртый». Живой прогон 23.09.2026
+    # дал такие строки сразу: цена 6.99 при floor 9.39, цель 10.90.
+    out["target_over_floor_pct"] = ((target / ref_floor - Decimal("1"))
+                                    * Decimal("100")).quantize(Decimal("0.1"))
     out["net_profit_ton"] = net.quantize(Decimal("0.0001"))
     out["exit_fallback_ton"] = ref_floor
     if net <= 0:
@@ -2081,6 +2110,11 @@ def flip_report(limit: int = 10):
                  f"{r['ref_floor']:>8.2f} {r['premium_pct']:>6}% "
                  f"{r['target_ton']:>8.2f} {r['net_profit_ton']:>9.4f}  "
                  f"#{r['mint']} / {r['traits'].get('backdrop', '?')}")
+        over = r.get("target_over_floor_pct")
+        if over is not None and over > 0:
+            log.info(f"         {_Color.YELLOW}цель на {over}% ВЫШЕ floor "
+                     f"{r['floor_source']} — рядом стоят такие же дешевле"
+                     f"{_Color.RESET}")
         log.info(f"         {_Color.GREY}{r['reason']} | {r['market']} | "
                  f"{GIFT_URL_TEMPLATE.format(address=friendly_ton_address(r['address']))}"
                  f"{_Color.RESET}")
@@ -4203,22 +4237,21 @@ def probe(address: str):
         log.debug(f"Не кошелёк или ошибка: {e}")
 
     # --- Попытка 2: это коллекция? Проверяем парсер на живых данных --------
+    # ЧЕРЕЗ _tonapi_get, а не голым requests: у него ретраи на 429 и разбор
+    # суточной квоты. Прежняя версия била в API напрямую и умирала на первом
+    # же «rate limit: limit for tier» — живой прогон 23.09.2026 это показал:
+    # обычный обход в том же прогоне спокойно ретраился и доходил.
     url = f"https://tonapi.io/v2/nfts/collections/{address}/items"
     try:
-        r = requests.get(url, params={"limit": 5}, headers=headers,
-                         timeout=HTTP_TIMEOUT_SEC)
+        raw_items = _tonapi_get(url, {"limit": 5}, headers).get("nft_items", [])
+    except RateLimited as e:
+        log.error(f"{_Color.RED}Лимит TonAPI: {e}{_Color.RESET}")
+        log.error("Ретраи не помогли. Если ключ уже задан — это лимит вашего "
+                  "тарифа, подождите и повторите; если нет — ключ на tonconsole.com")
+        return False
     except Exception as e:  # noqa: BLE001
-        log.error(f"Сеть недоступна: {e}")
+        log.error(f"Запрос не прошёл: {e}")
         return False
-
-    log.info(f"HTTP {r.status_code} от {url}")
-    if r.status_code != 200:
-        log.error(f"Ответ: {r.text[:400]}")
-        if r.status_code == 429:
-            log.error("Это лимит запросов — получите TONAPI_KEY на tonconsole.com")
-        return False
-
-    raw_items = r.json().get("nft_items", [])
     if not raw_items:
         log.warning("Ответ пустой: по этому адресу предметов нет. "
                     "Скорее всего адрес не коллекции.")

@@ -1703,7 +1703,8 @@ gs.FLOOR_SAMPLE_PAGES = 15
 try:
     _lim = _AlwaysLimited()
     gs.requests = _lim
-    _items, _source = gs._collect_sample("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF")
+    _items, _source, _exh = gs._collect_sample(
+        "EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF")
 
     # 3 попытки на первую страницу + 1 запрос к Getgems-фолбэку = 4.
     # Если бы обход продолжался, было бы 15 x 3 = 45 запросов.
@@ -1711,6 +1712,10 @@ try:
           _lim.calls <= 4, f"запросов={_lim.calls}")
     check("выборка пуста, а не наполовину собрана", _items == [])
     check("источник помечен как недоступный", _source == "none", _source)
+    # Упёрлись в квоту — это НЕ «дошли до конца коллекции». Иначе оборванный
+    # лимитом обход объявил бы покрытие 100% по огрызку выборки, то есть
+    # ровно та ошибка, от которой покрытие и заводилось.
+    check("лимит НЕ засчитывается как полный обход", _exh is False)
 finally:
     gs.requests = _oreq32
     gs.TONAPI_MIN_INTERVAL = _oint32
@@ -3203,7 +3208,7 @@ try:
     gs._collection_size_cache.clear()
     gs._collection_size_cache["0:c"] = 13000
     gs._floor_cache.clear()
-    gs._collect_sample = lambda c: (_mk_items(200), "TonAPI")
+    gs._collect_sample = lambda c: (_mk_items(200), "TonAPI", False)
     _s51 = gs.get_market_snapshot("0:c")
 
     check("покрытие посчитано", _s51["coverage_pct"] == Decimal("1.5"),
@@ -3220,7 +3225,7 @@ try:
     gs._collection_size_cache.clear()
     gs._collection_size_cache["0:full"] = 200
     gs._floor_cache.clear()
-    gs._collect_sample = lambda c: (_mk_items(200, "0:full"), "TonAPI")
+    gs._collect_sample = lambda c: (_mk_items(200, "0:full"), "TonAPI", False)
     _s51b = gs.get_market_snapshot("0:full")
     check("при полном покрытии floor снова достоверен",
           _s51b["floor_reliable"] is True and _s51b["coverage_pct"] == Decimal("100.0"),
@@ -3233,13 +3238,28 @@ try:
     gs._collection_size_cache.clear()
     gs._collection_size_cache["0:nosize"] = None
     gs._floor_cache.clear()
-    gs._collect_sample = lambda c: (_mk_items(200, "0:nosize"), "TonAPI")
+    gs._collect_sample = lambda c: (_mk_items(200, "0:nosize"), "TonAPI", False)
     _s51c = gs.get_market_snapshot("0:nosize")
     check("без размера коллекции покрытие = None, а не 100",
           _s51c["coverage_pct"] is None)
     check("пустой снапшот тоже несёт поля покрытия",
           "coverage_pct" in gs._empty_snapshot() and
           "collection_size" in gs._empty_snapshot())
+
+    # ГЛАВНОЕ, что показал живой прогон 23.09.2026: у ВСЕХ коллекций
+    # владельца next_item_index = -1, то есть покрытие всегда было «не знаю»
+    # и защита не работала ни разу. Дошедший до конца обход — это измерение,
+    # и оно обязано перебивать отсутствующее поле API.
+    gs._collection_size_cache.clear()
+    gs._collection_size_cache["0:ex"] = None          # API размера НЕ ДАЁТ
+    gs._floor_cache.clear()
+    gs._collect_sample = lambda c: (_mk_items(200, "0:ex"), "TonAPI", True)
+    _s51d = gs.get_market_snapshot("0:ex")
+    check("обход дошёл до конца -> покрытие 100 ИЗМЕРЕНО, а не None",
+          _s51d["coverage_pct"] == Decimal("100.0"), _s51d["coverage_pct"])
+    check("размер коллекции взят из самого обхода",
+          _s51d["collection_size"] == 200, _s51d["collection_size"])
+    check("и floor снова достоверен", _s51d["floor_reliable"] is True)
 finally:
     (gs._collect_sample, gs.DB_PATH) = _ob51
     gs._collection_size_cache.clear()
@@ -3507,6 +3527,26 @@ check("отсутствие цвета модели названо в missing",
 check("без монохрома доверие понижено", _r54b["confidence"] == "low")
 check("сторона bid названа отсутствующей",
       any("bid" in m for m in _r54b["missing"]))
+
+# ЦЕЛЬ ПРОДАЖИ ОТНОСИТЕЛЬНО FLOOR. Правило «x1.5» автор применяет к лоту,
+# купленному НА floor. Купив НИЖЕ floor, тот же множитель ставит цену ВЫШЕ
+# floor — конкурировать придётся с такими же лотами дешевле, и шанс продажи
+# уже не тот, из которого считался порог «каждый четвёртый».
+# Живой прогон 23.09.2026 дал такую строку сразу: 6.99 при floor 9.39.
+_under = {"address": "0:b", "sale_price_ton": Decimal("6.99"), "mint_index": 46400,
+          "traits": {"model": "X", "backdrop": "Sapphire"},
+          "sale_market": "Getgems Sales", "explicit_rarity_pct": None}
+_r_under = gs.score_flip(_under, {"floor": Decimal("9.39"), "peer_prices": {},
+                                  "trait_index": {}, "trait_total": 0}, None)
+check("цель x1.5 от цены НИЖЕ floor оказывается ВЫШЕ floor — и это названо",
+      _r_under["target_over_floor_pct"] > 0, _r_under["target_over_floor_pct"])
+# Обратный случай: купили на floor — цель тоже выше, это нормально для его
+# модели. Проверка нужна, чтобы поле считалось всегда, а не только в беде.
+_at = dict(_under, sale_price_ton=Decimal("4.00"))
+check("поле считается и при покупке ровно на floor",
+      gs.score_flip(_at, {"floor": Decimal("4.00"), "peer_prices": {},
+                          "trait_index": {}, "trait_total": 0},
+                    None)["target_over_floor_pct"] > 0)
 
 # --- шаблон таблицы цветов ---
 # Собрать список моделей бот может сам, а цвета — нет. Значит заполненное
