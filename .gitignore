@@ -17,3 +17,7 @@ wallet.key
 # обновлять, либо затирает — и ключ тихо пропадает.
 deploy/my-secrets.bat
 deploy/my-secrets.sh
+
+# Otchet rezhima --flip: rezultat progona, ne ishodnik
+flip-report.txt
+model_colors.json
