@@ -1262,6 +1262,43 @@ def build_trait_prices(on_sale_items):
     return out
 
 
+def build_number_prices(on_sale_items):
+    """
+    Цены выставленных лотов, сгруппированные по ОЦЕНКЕ НОМЕРА:
+
+        {"40:0": [5.6, 7.0], "0:0": [4.5], "35:1": [12.0], ...}
+
+    Ключ — `<балл по правилу видео>:<1 если номер красив по НАШЕМУ правилу>`.
+    Одна строка покрывает обе мерки сразу: хранить два разбиения значит
+    записать весь список цен дважды, а запись рынка и так невосстановима и
+    растёт каждый цикл.
+
+    ЗАЧЕМ. В уведомлении у номера стоит «+0%», и владелец спрашивает, почему
+    ноль при 40 баллах из 40. Ответ честный: `PREMIUM_MULT = 1.0`, премия за
+    номер НИКОГДА НЕ ИЗМЕРЯЛАСЬ. А измерить её было нечем — запись хранила
+    цены по трейтам (`trait_prices`), но не по номерам, то есть каждые сутки
+    наблюдения копили данные не про тот вопрос.
+
+    Это ровно тот случай, что был 22.09.2026 с фонами: тезис про фоны нельзя
+    было проверить, пока запись знала только модель. Лечится так же — новым
+    разбиением В ЗАПИСИ, а не рассуждением.
+
+    ВАЖНО, и отчёт говорит это вслух: здесь ЦЕНЫ ПРОДАВЦОВ, а не цены сделок.
+    Число отвечает на вопрос «сколько ПРОСЯТ за красивый номер», а не
+    «сколько за него платят». Вписать его прямо в `PREMIUM_MULT` нельзя.
+    """
+    out = {}
+    for it in on_sale_items:
+        mint = it.get("mint_index")
+        if mint is None:
+            continue
+        key = f"{flip_number_score(mint)}:{1 if is_pretty_mint(mint) else 0}"
+        out.setdefault(key, []).append(Decimal(str(it["sale_price_ton"])))
+    for key in out:
+        out[key].sort()
+    return out
+
+
 def peer_floor(item: dict, peer_prices: dict):
     """
     Floor среди лотов с тем же ключевым трейтом: (floor | None, размер выборки).
@@ -1544,6 +1581,10 @@ def get_market_snapshot(collection: str) -> dict:
         # Цены по ВСЕМ трейтам: peer_prices покрывает только PEER_TRAIT, а
         # премия за редкий ФОН по нему не считается вовсе.
         "trait_prices": build_trait_prices(on_sale),
+        # Цены по ОЦЕНКЕ НОМЕРА. Без этого разбиения вопрос «переплачивают ли
+        # за красивый номер» не проверяется по записи в принципе — а именно
+        # он стоит за «+0%» в уведомлении.
+        "number_prices": build_number_prices(on_sale),
         # Floor по площадкам: разница между ними и есть арбитраж.
         "market_floors": build_market_floors(on_sale),
         # Без этого поля снапшоты разных коллекций в записи неразличимы,
@@ -4657,6 +4698,8 @@ def record_snapshot(snap: dict, path: str = None):
         "trait_prices": {name: {val: [str(p) for p in prices]
                                 for val, prices in vals.items()}
                          for name, vals in (snap.get("trait_prices") or {}).items()},
+        "number_prices": {k: [str(p) for p in v]
+                          for k, v in (snap.get("number_prices") or {}).items()},
         "market_floors": {k: {"n": v["n"],
                               "floor": (str(v["floor"]) if v["floor"] is not None else None)}
                           for k, v in (snap.get("market_floors") or {}).items()},
@@ -5474,6 +5517,113 @@ def merge_recordings(other_path: str, base_path: str = None,
     return out_path
 
 
+def number_premium_report(path: str = None):
+    """
+    Просят ли за красивый номер больше, чем за обычный.
+
+    Отвечает на прямой вопрос владельца: «номер 40 из 40, почему +0%».
+    Ноль стоит потому, что `PREMIUM_MULT = 1.0` и премия за номер никогда не
+    измерялась. Этот отчёт — единственный способ её измерить.
+
+    СЧИТАЕТСЯ ПО ЦЕНАМ ПРОДАВЦОВ, а не по ценам сделок: истории сделок
+    TonAPI не отдаёт. Значит отношение говорит «сколько ПРОСЯТ», а не
+    «сколько платят», и вписать его прямо в `PREMIUM_MULT` нельзя. Оно
+    отвечает на более ранний вопрос: есть ли премия в ценах ВООБЩЕ.
+
+    Берётся ПОСЛЕДНИЙ снапшот каждой коллекции — срез витрины на один
+    момент. Усреднять по времени нельзя: в разные моменты на витрине разные
+    лоты, и среднее смешало бы их в несуществующий рынок.
+    """
+    path = path or RECORD_PATH
+    try:
+        snaps = _load_recording(path)
+    except FileNotFoundError:
+        log.error(f"Записи рынка нет: {path}. Сначала соберите её: "
+                  f"python gift_sniper.py --record")
+        return None
+    if not snaps:
+        log.error(f"{path} пуст — нечего анализировать.")
+        return None
+
+    latest = {}
+    for snap in snaps:
+        coll = snap.get("collection", "")
+        if coll not in latest or snap["ts"] > latest[coll]["ts"]:
+            latest[coll] = snap
+
+    log.info(f"{_Color.BOLD}=== ПРЕМИЯ ЗА КРАСИВЫЙ НОМЕР ==={_Color.RESET}")
+    log.info(f"Запись: {path} | снапшотов {len(snaps)} | коллекций {len(latest)}")
+
+    # Поле добавлено 23.09.2026. Старая запись его не содержит, и сказать об
+    # этом надо ПРЯМО: пустой отчёт прочитался бы как «премии нет» и закрыл
+    # бы вопрос неверно.
+    with_numbers = [s for s in latest.values() if s.get("number_prices")]
+    if not with_numbers:
+        log.warning(f"{_Color.YELLOW}В записи нет поля number_prices — она "
+                    f"собрана до 23.09.2026, когда цены по номерам не "
+                    f"писались вовсе. Премию за номер по ней посчитать "
+                    f"НЕЛЬЗЯ. Обновите бота и накопите запись заново — сутки "
+                    f"уже дадут срез витрины.{_Color.RESET}")
+        return None
+
+    # Копим по ВСЕМ коллекциям: номер — свойство не коллекции, а лота, и
+    # разбиение внутри одной коллекции быстро вырождается в один-два лота.
+    by_score, by_ours = {}, {0: [], 1: []}
+    for coll, snap in sorted(latest.items()):
+        floor = snap["floor"]
+        nprices = snap.get("number_prices") or {}
+        if floor <= 0 or not nprices:
+            continue
+        for key, prices in nprices.items():
+            try:
+                score_s, pretty_s = key.split(":")
+                score, pretty = int(score_s), int(pretty_s)
+            except (ValueError, AttributeError):
+                continue
+            # Цены разных коллекций несравнимы напрямую — сравниваем
+            # ОТНОШЕНИЕ к floor своей коллекции.
+            ratios = [Decimal(str(p)) / floor for p in prices]
+            by_score.setdefault(score, []).extend(ratios)
+            by_ours[pretty].extend(ratios)
+
+    def _med(vals):
+        vals = sorted(vals)
+        return vals[len(vals) // 2] if vals else None
+
+    base = _med(by_score.get(0, []))
+
+    log.info("")
+    log.info(f"{_Color.BOLD}По правилу видео (балл номера){_Color.RESET}")
+    log.info(f"{'балл':>6} {'лотов':>7} {'медиана цены':>14} {'против балла 0':>16}")
+    for score in sorted(by_score):
+        vals = by_score[score]
+        if len(vals) < MIN_PEER_SAMPLE:
+            continue
+        med = _med(vals)
+        rel = (f"{med / base:.2f}x" if base and base > 0 else "—")
+        log.info(f"{score:>6} {len(vals):>7} {med:>13.2f}x {rel:>16}")
+
+    log.info("")
+    log.info(f"{_Color.BOLD}По нашему правилу (минт <= 100 или из PRETTY_MINTS){_Color.RESET}")
+    plain, pretty = _med(by_ours[0]), _med(by_ours[1])
+    log.info(f"  обычные   {len(by_ours[0]):>6} лотов | медиана {plain or 0:.2f}x floor")
+    log.info(f"  красивые  {len(by_ours[1]):>6} лотов | медиана {pretty or 0:.2f}x floor")
+    if plain and pretty and plain > 0:
+        log.info(f"  отношение {pretty / plain:.2f}x")
+
+    log.info("")
+    log.warning(f"{_Color.YELLOW}ЭТО ЦЕНЫ ПРОДАВЦОВ, А НЕ ЦЕНЫ СДЕЛОК. "
+                f"Истории сделок TonAPI не отдаёт. Число отвечает на вопрос "
+                f"«сколько ПРОСЯТ за красивый номер», а не «сколько платят», "
+                f"и разница между этими вопросами и есть неликвид: красивый "
+                f"номер можно выставить за 10x floor и простоять с ним год."
+                f"{_Color.RESET}")
+    log.info("Около 1.00x — премии в ценах нет, и PREMIUM_MULT остаётся 1.0.")
+    log.info("Заметно выше — премия есть, и это её ВЕРХНЯЯ граница: "
+             "ставить надо ниже.")
+    return True
+
+
 def trait_premium_report(path: str = None):
     """
     Во сколько раз дороже floor стоят лоты с редким значением трейта.
@@ -6128,6 +6278,9 @@ def parse_args(argv=None):
     parser.add_argument("--premium", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="во сколько раз дороже floor просят за редкие "
                              "трейты (калибровка PREMIUM_MULT)")
+    parser.add_argument("--numbers", nargs="?", const=RECORD_PATH, metavar="FILE",
+                        help="просят ли больше за красивый НОМЕР "
+                             "(почему в уведомлении стоит +0%%)")
     parser.add_argument("--colors", action="store_true",
                         help="собрать model_colors.json по живым витринам: "
                              "список моделей с цветом, где он читается из "
@@ -6184,6 +6337,8 @@ if __name__ == "__main__":
         if args.flip:
             # Ходит в сеть за витриной, но НИЧЕГО не покупает и не пишет.
             sys.exit(0 if flip_report(args.flip) else 1)
+        if args.numbers:
+            sys.exit(0 if number_premium_report(args.numbers) else 1)
         if args.premium:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if trait_premium_report(args.premium) else 1)
