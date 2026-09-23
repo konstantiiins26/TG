@@ -163,7 +163,11 @@ PREMIUM_MULT        = Decimal(os.getenv("PREMIUM_MULT", "1.0"))
 # разносит во времени ПАЧКИ запросов, а страницы внутри пачки уходят подряд,
 # и упираются они в лимит по СЕКУНДАМ. От 429 спасает TONAPI_MIN_INTERVAL
 # (пауза между запросами) и ключ TONAPI_KEY, а не редкий опрос.
-FLOOR_PAGE_SIZE     = int(os.getenv("FLOOR_PAGE_SIZE", "100"))            # размер одной страницы выборки
+# 1000 — МАКСИМУМ, разрешённый TonAPI (openapi.yml: limitQuery maximum 1000).
+# Стояло 100, то есть вдесятеро меньше позволенного, и это ломало floor на
+# больших коллекциях: 15 страниц по 100 — это 1500 предметов из 13 000, то
+# есть 12% коллекции. Floor по такой выборке — не floor.
+FLOOR_PAGE_SIZE     = int(os.getenv("FLOOR_PAGE_SIZE", "1000"))           # размер одной страницы выборки (максимум TonAPI)
 FLOOR_SAMPLE_PAGES  = int(os.getenv("FLOOR_SAMPLE_PAGES", "5"))           # сколько страниц тянуть (5 x 100 = 500 лотов)
 FLOOR_PERCENTILE    = Decimal(os.getenv("FLOOR_PERCENTILE", "5"))         # 5-й перцентиль вместо голого min()
 # Порог взят из арифметики самого перцентиля, а не с потолка. Индекс, на
@@ -173,6 +177,7 @@ FLOOR_PERCENTILE    = Decimal(os.getenv("FLOOR_PERCENTILE", "5"))         # 5-й
 # При N=40 индекс 1.95, при N=100 — 4.95: floor держат уже несколько
 # независимых продавцов, и один ошибочный "пылевой" лот его не двигает.
 MIN_FLOOR_SAMPLE    = int(os.getenv("MIN_FLOOR_SAMPLE", "40"))            # меньше этого — floor недостоверен, не торгуем
+MIN_FLOOR_COVERAGE  = Decimal(os.getenv("MIN_FLOOR_COVERAGE", "80"))      # % коллекции в выборке; меньше — floor недостоверен
 FLOOR_CACHE_TTL_SEC = int(os.getenv("FLOOR_CACHE_TTL_SEC", "60"))         # кэш floor, чтобы не сканировать рынок каждые 12 сек
 
 # Страницы выборки уходят подряд, а TonAPI без ключа лимитирует по запросам
@@ -891,6 +896,47 @@ def _tonapi_get(url: str, params: dict, headers: dict) -> dict:
     raise RuntimeError("TonAPI: исчерпаны попытки")
 
 
+_collection_size_cache = {}
+
+
+def fetch_collection_size(collection: str):
+    """
+    Сколько предметов в коллекции (`next_item_index`). None — не удалось.
+
+    Зачем. Без этого числа бот НЕ ЗНАЕТ, какую долю коллекции он увидел, и
+    молча выдаёт за floor пятый перцентиль случайного куска. На коллекции
+    Spring Baskets (13 000 предметов) он так сообщил floor 11 TON при
+    настоящих 5.65 — почти вдвое выше, то есть в СТОРОНУ ЗАВЫШЕНИЯ ВЫРУЧКИ.
+    Поймано владельцем 23.09.2026 по скриншоту витрины.
+
+    Поле обязательное в схеме TonAPI (`NftCollection.next_item_index`), но
+    это ИНДЕКС следующего минта, а не точный счётчик: при сожжённых или
+    непоследовательных индексах он завышен. Для оценки покрытия этого
+    достаточно — ошибка в безопасную сторону (покрытие считается меньше).
+
+    Кешируется на весь прогон: размер коллекции за цикл не меняется, а
+    лишний запрос — это доля суточной квоты.
+    """
+    if collection in _collection_size_cache:
+        return _collection_size_cache[collection]
+
+    url = f"https://tonapi.io/v2/nfts/collections/{collection}"
+    headers = {"Accept": "application/json"}
+    if TONAPI_KEY:
+        headers["Authorization"] = f"Bearer {TONAPI_KEY}"
+    try:
+        data = _tonapi_get(url, {}, headers)
+        size = int(data.get("next_item_index"))
+        if size <= 0:
+            raise ValueError(f"next_item_index = {size}")
+    except Exception as e:  # noqa: BLE001 — без размера просто не знаем покрытие
+        log.warning(f"Размер коллекции {_short(collection)} не получен ({e}). "
+                    f"Покрытие выборки будет неизвестно.")
+        size = None
+    _collection_size_cache[collection] = size
+    return size
+
+
 def fetch_items_tonapi(collection: str, limit: int, offset: int = 0):
     """
     ОСНОВНОЙ ИСТОЧНИК: TonAPI.io
@@ -1389,7 +1435,8 @@ def _empty_snapshot(source="none"):
     """Пустой снапшот — чтобы вызывающий код не разбирал особые случаи."""
     return {"collection": "", "candidates": [], "floor": Decimal("0"),
             "sample_size": 0, "source": source, "trait_index": {}, "trait_total": 0,
-            "competition": 0, "floor_reliable": False}
+            "competition": 0, "floor_reliable": False,
+            "collection_size": None, "coverage_pct": None}
 
 
 def get_market_snapshot(collection: str) -> dict:
@@ -1432,7 +1479,32 @@ def get_market_snapshot(collection: str) -> dict:
     # редкость — свойство коллекции, а не текущих листингов.
     trait_index, trait_total = build_trait_index(all_items)
 
+    # ПОКРЫТИЕ: какую долю коллекции мы вообще увидели. Без него floor — это
+    # перцентиль случайного куска, выданный за цену рынка. На коллекции из
+    # 13 000 предметов выборка в 1500 давала floor вдвое выше настоящего, и
+    # ошибка шла в сторону ЗАВЫШЕНИЯ ВЫРУЧКИ.
+    coll_size = fetch_collection_size(cache_key)
+    coverage = None
+    if coll_size:
+        coverage = (Decimal(len(all_items)) / Decimal(coll_size)
+                    * Decimal("100")).quantize(Decimal("0.1"))
+
+    # Недостоверен, если выборка мала ЛИБО коллекция покрыта не вся. Второе
+    # важнее первого: 184 лота — солидная выборка по числу, но если это 12%
+    # коллекции, самые дешёвые лоты просто не попали в поле зрения.
+    reliable = bool(sample_size >= MIN_FLOOR_SAMPLE and floor > 0)
+    if coverage is not None and coverage < MIN_FLOOR_COVERAGE:
+        reliable = False
+        log.warning(
+            f"{_Color.YELLOW}{_short(cache_key)}: выборка покрывает "
+            f"{coverage}% коллекции ({len(all_items)} из {coll_size}). "
+            f"Floor по ней ЗАВЫШЕН — самых дешёвых лотов в ней может не быть. "
+            f"Нужно {MIN_FLOOR_COVERAGE}%: поднимите FLOOR_SAMPLE_PAGES до "
+            f"{-(-coll_size // FLOOR_PAGE_SIZE)}.{_Color.RESET}")
+
     return {
+        "collection_size": coll_size,
+        "coverage_pct": coverage,
         # Цены по сегментам: без них лот сравнивать не с чем, и бэктест
         # повторил бы ровно ту ошибку, от которой мы защищаемся.
         "peer_prices": build_peer_prices(on_sale),
@@ -1451,7 +1523,7 @@ def get_market_snapshot(collection: str) -> dict:
         "trait_index": trait_index,
         "trait_total": trait_total,
         "competition": compute_competition(prices, floor),
-        "floor_reliable": sample_size >= MIN_FLOOR_SAMPLE and floor > 0,
+        "floor_reliable": reliable,
     }
 
 
@@ -2325,8 +2397,11 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
     # находку в телефон, надо знать, за сколько покупать и за сколько потом
     # выставлять — иначе уведомление сообщает о возможности, которой нельзя
     # воспользоваться руками.
+    cov = snap.get("coverage_pct")
+    cov_note = (f" (выборка {cov}% коллекции)" if cov is not None else
+                " (покрытие коллекции НЕИЗВЕСТНО)")
     lines = [f"🎯 Находка: скидка {ev['discount_pct']}% от floor",
-             f"floor коллекции {snap['floor']} TON"]
+             f"floor коллекции {snap['floor']} TON{cov_note}"]
     lines += explain_trade(ev, snap, item)
 
     if ev.get("rarity_pct") is not None:
@@ -3267,6 +3342,12 @@ def record_snapshot(snap: dict, path: str = None):
         "sample_size": snap["sample_size"],
         "competition": snap["competition"],
         "floor_reliable": snap["floor_reliable"],
+        # Покрытие: floor по 12% коллекции и floor по всей коллекции — это
+        # разные числа, и в записи их надо различать, иначе бэктест
+        # сравнивает несравнимое.
+        "collection_size": snap.get("collection_size"),
+        "coverage_pct": (str(snap["coverage_pct"])
+                         if snap.get("coverage_pct") is not None else None),
         "trait_index": snap["trait_index"],
         "trait_total": snap["trait_total"],
         # Decimal не сериализуется в JSON — храним строками, как и floor.

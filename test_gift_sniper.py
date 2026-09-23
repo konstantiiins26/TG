@@ -3158,6 +3158,98 @@ finally:
 
 
 # =============================================================================
+print("\n[51] Покрытие коллекции: floor по куску — не floor")
+# =============================================================================
+
+# Поймано владельцем 23.09.2026: бот сообщил floor 11 TON по коллекции
+# Spring Baskets, где витрина Getgems показывала 5.65, а MRKT — 5.5.
+# Причина не в парсинге цен, а в ВЫБОРКЕ: 15 страниц по 100 — это 1500
+# предметов из 13 000, то есть 12% коллекции. Пятый перцентиль такого куска
+# соответствует примерно 91-му самому дешёвому лоту из 1820 выставленных,
+# а не первому. Ошибка шла в сторону ЗАВЫШЕНИЯ ВЫРУЧКИ — то есть бот
+# придумывал скидки, которых нет.
+
+# 1000 — максимум, разрешённый TonAPI (openapi.yml: limitQuery maximum 1000).
+# Стояло 100. Число запросов при этом НЕ меняется: та же страница, вдесятеро
+# больше предметов.
+check("размер страницы = максимум TonAPI",
+      source_default("FLOOR_PAGE_SIZE") == "1000",
+      source_default("FLOOR_PAGE_SIZE"))
+
+_db51 = tempfile.mktemp(suffix=".db")
+_ob51 = (gs._collect_sample, gs.DB_PATH)
+try:
+    gs.DB_PATH = _db51
+    gs.db_init()
+
+    def _mk_items(n, coll="0:c"):
+        return [{"address": f"0:{i:064x}", "sale_price_ton": Decimal(10 + i),
+                 "is_on_sale": True, "traits": {"model": "M"}, "mint_index": i,
+                 "collection_address": coll, "sale_address": "0:s",
+                 "sale_market": "Getgems Sales", "explicit_rarity_pct": None,
+                 "collection_name": "C"} for i in range(n)]
+
+    # --- покрытие 1.5%: выборка ОГРОМНАЯ по числу, но floor недостоверен ---
+    gs._collection_size_cache.clear()
+    gs._collection_size_cache["0:c"] = 13000
+    gs._floor_cache.clear()
+    gs._collect_sample = lambda c: (_mk_items(200), "TonAPI")
+    _s51 = gs.get_market_snapshot("0:c")
+
+    check("покрытие посчитано", _s51["coverage_pct"] == Decimal("1.5"),
+          _s51["coverage_pct"])
+    check("выборка по ЧИСЛУ проходит старый порог",
+          _s51["sample_size"] >= gs.MIN_FLOOR_SAMPLE, _s51["sample_size"])
+    # Вот ради чего всё: раньше этого хватало, и бот торговал по floor,
+    # посчитанному по 1.5% коллекции.
+    check("но floor всё равно НЕДОСТОВЕРЕН из-за покрытия",
+          _s51["floor_reliable"] is False)
+
+    # --- покрытие 100%: тот же код должен РАЗРЕШИТЬ торговлю ---
+    # Иначе тест доказывал бы лишь то, что проверка всегда против.
+    gs._collection_size_cache.clear()
+    gs._collection_size_cache["0:full"] = 200
+    gs._floor_cache.clear()
+    gs._collect_sample = lambda c: (_mk_items(200, "0:full"), "TonAPI")
+    _s51b = gs.get_market_snapshot("0:full")
+    check("при полном покрытии floor снова достоверен",
+          _s51b["floor_reliable"] is True and _s51b["coverage_pct"] == Decimal("100.0"),
+          (_s51b["floor_reliable"], _s51b["coverage_pct"]))
+
+    # --- размер коллекции неизвестен: не выдумываем покрытие ---
+    # Недоступный размер — это «не знаю», а не «всё в порядке». Но и не
+    # повод глушить торговлю: до 23.09.2026 бот работал вообще без этого
+    # числа, и такое поведение остаётся запасным.
+    gs._collection_size_cache.clear()
+    gs._collection_size_cache["0:nosize"] = None
+    gs._floor_cache.clear()
+    gs._collect_sample = lambda c: (_mk_items(200, "0:nosize"), "TonAPI")
+    _s51c = gs.get_market_snapshot("0:nosize")
+    check("без размера коллекции покрытие = None, а не 100",
+          _s51c["coverage_pct"] is None)
+    check("пустой снапшот тоже несёт поля покрытия",
+          "coverage_pct" in gs._empty_snapshot() and
+          "collection_size" in gs._empty_snapshot())
+finally:
+    (gs._collect_sample, gs.DB_PATH) = _ob51
+    gs._collection_size_cache.clear()
+    gs._floor_cache.clear()
+    if os.path.exists(_db51):
+        os.unlink(_db51)
+
+# Покрытие обязано попасть и в запись, и в уведомление: floor по 12%
+# коллекции и floor по всей коллекции — разные числа, и различать их должен
+# не только код, но и владелец.
+_src51 = open("gift_sniper.py", encoding="utf-8").read()
+check("покрытие сохраняется в запись рынка",
+      '"coverage_pct": (str(snap["coverage_pct"])' in _src51)
+check("покрытие названо в уведомлении о находке",
+      "выборка {cov}% коллекции" in _src51)
+check("неизвестное покрытие названо прямо, а не опущено",
+      "покрытие коллекции НЕИЗВЕСТНО" in _src51)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

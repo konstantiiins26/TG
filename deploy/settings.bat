@@ -83,6 +83,14 @@ REM 12 kollekciy x 15 stranic = 180 zaprosov. Pauza 1.1s mezhdu nimi
 REM zadana v kode, znachit sam cikl zanimaet ne menshe ~3.3 minut.
 REM POLL_INTERVAL_SEC nizhe etogo prosto ne sobludaetsya - cikl dlinnee.
 REM Fakticheskiy shag pri byudzhete 40000: ~6.5 min (schitaet sam bot).
+REM
+REM 23.09.2026: FLOOR_PAGE_SIZE podnyat so 100 do 1000 (maksimum TonAPI).
+REM 15 stranic x 1000 = 15 000 predmetov vmesto 1500. Chislo ZAPROSOV to zhe,
+REM no kollekciya iz 13 000 teper pokryvaetsya CELIKOM, a ne na 12%.
+REM Pochemu eto vazhno: floor po 12% kollekcii byl VDVOE vyshe nastoyashchego
+REM (11 TON protiv 5.65 na vitrine), to est bot pridumyval skidki, kotoryh net.
+REM Otvety stali v 10 raz bolshe po obemu - esli kvota TonAPI schitaetsya po
+REM trafiku, bot izmerit eto sam (budget_learn_limit) i rastyanet interval.
 set FLOOR_SAMPLE_PAGES=15
 set POLL_INTERVAL_SEC=120
 set DRY_RUN=1
