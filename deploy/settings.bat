@@ -245,4 +245,28 @@ REM Ranshe bralas obshchaya vyderzhka 300s pri cikle 6.5 min - odin i tot zhe
 REM lot schitalsya novym kazhdyy cikl. Smena ceny probivaet vyderzhku.
 set SEGMENT_SEEN_TTL_SEC=21600
 
+REM --- Pauza mezhdu zaprosami k TonAPI ---
+REM Tarify Ton Console (snyato so skrinshota 23.09.2026, REST API):
+REM   Free  $0     1 RPS   <- tekushchiy
+REM   Lite  $9.9  10 RPS
+REM   Standard $95 100 RPS
+REM
+REM VAZHNO: na Free potolok 1 zapros v sekundu, a bot po umolchaniyu shlet
+REM 0.91 (pauza 1.1s) - eto 91% ot limita. Lyuboy vsplesk daet 429, obhod
+REM kollekcii ryvetsya, i nablyudenie po segmentu ne rabotaet voobshche.
+REM
+REM Poka Free - luchshe zamedlitsya, chem rvat obhody:
+REM   set TONAPI_MIN_INTERVAL=2.0
+REM
+REM Posle pokupki Lite (10 RPS) berem POLOVINU potolka, ne ves:
+REM   set TONAPI_MIN_INTERVAL=0.2
+REM Idti vprityk k potolku - eto i est nyneshnyaya beda.
+REM
+REM Standard i vyshe pokupat NE nado: 100 RPS my ne ispolzuem, ogranichitel
+REM nash sobstvennyy, a ne tarif.
+REM
+REM Bez etoy stroki beretsya znachenie po umolchaniyu 1.1 - bezopasnoe dlya
+REM Free, no vprityk. Raskommentiruyte nuzhnoe.
+REM set TONAPI_MIN_INTERVAL=2.0
+
 REM Konec nastroek. Zapusk - v run.bat ili start-windows.bat.
