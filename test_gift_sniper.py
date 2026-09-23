@@ -3737,7 +3737,41 @@ check("названы оба floor — сегмента и коллекции",
 check("рядом с перцентилем назван самый дешёвый лот",
       "самый дешёвый" in _ns and "перцентиль" in _ns, _ns[:200])
 check("сказано, где купить и где выставить",
-      "Купить на" in _ns and "выставить на" in _ns)
+      "Купить" in _ns and "выставить" in _ns)
+
+# БЕЗЫМЯННАЯ ПЛОЩАДКА В СОВЕТ НЕ ГОДИТСЯ. Живой прогон 23.09.2026 выдал
+# владельцу «выставить на «(площадка неизвестна)»»: у части лотов TonAPI не
+# отдаёт sale.market.name, они попадают в общую корзину, и та оказалась с
+# самым высоким floor. Совет выставить лот там, где мы не знаем названия,
+# выполнить нельзя.
+_mf_unknown = {
+    gs._UNKNOWN_MARKET: {"floor": Decimal("99.0"), "n": 40},
+    "Getgems Sales":    {"floor": Decimal("5.0"), "n": 40},
+}
+check("безымянная корзина не выбирается площадкой продажи",
+      gs._best_sell_market({"market_floors": _mf_unknown})[0] == "Getgems Sales",
+      gs._best_sell_market({"market_floors": _mf_unknown}))
+
+# Тонкая выборка — тоже не совет: floor по четырём лотам это не floor.
+_mf_thin = {
+    "Thin Market":   {"floor": Decimal("99.0"), "n": 2},
+    "Getgems Sales": {"floor": Decimal("5.0"), "n": 40},
+}
+check("площадка с выборкой меньше MIN_MARKET_SAMPLE не выбирается",
+      gs._best_sell_market({"market_floors": _mf_thin})[0] == "Getgems Sales",
+      gs._best_sell_market({"market_floors": _mf_thin}))
+
+# Если названной площадки не нашлось — честное None, а не выдуманное имя.
+check("не из чего выбрать -> None, а не подстановка",
+      gs._best_sell_market({"market_floors": {
+          gs._UNKNOWN_MARKET: {"floor": Decimal("9.0"), "n": 40}}}) == (None, None))
+
+# И ровно один способ называть эту корзину на весь файл: раньше их было три,
+# и сравнить их между собой было нельзя.
+_src_um = open("gift_sniper.py", encoding="utf-8").read()
+check("корзина без имени названа одной константой",
+      _src_um.count('"(площадка неизвестна)"') == 1
+      and "(без имени)" not in _src_um, _src_um.count('"(площадка неизвестна)"'))
 check("номер оценён обеими мерками и обе дают ноль",
       "по правилу видео" in _ns and "+0%" in _ns)
 

@@ -1165,6 +1165,12 @@ def build_trait_index(items):
     return index, total
 
 
+# Корзина для лотов, у которых TonAPI не отдал `sale.market.name`. Имя одно
+# на весь файл: раньше та же корзина называлась тремя разными строками, и
+# сравнить их между собой было нельзя.
+_UNKNOWN_MARKET = "(площадка неизвестна)"
+
+
 def build_market_floors(on_sale_items):
     """
     Floor ОТДЕЛЬНО по каждой площадке: {"Getgems Sales": {"floor": D, "n": N}}.
@@ -1181,7 +1187,7 @@ def build_market_floors(on_sale_items):
     """
     by_market = {}
     for it in on_sale_items:
-        market = (it.get("sale_market") or "").strip() or "(площадка неизвестна)"
+        market = (it.get("sale_market") or "").strip() or _UNKNOWN_MARKET
         by_market.setdefault(market, []).append(Decimal(str(it["sale_price_ton"])))
 
     out = {}
@@ -2306,11 +2312,14 @@ def notify_segment_bargain(b: dict) -> bool:
                      f"по правилу видео {flip_number_score(mint)}/40  → +0%")
 
     # ГДЕ ПОКУПАЕМ И ГДЕ ПРОДАЁМ — коротко и прямо.
-    buy_m = item.get("sale_market") or "?"
-    sell_m = b.get("sell_market") or buy_m
+    buy_m = (item.get("sale_market") or "").strip() or _UNKNOWN_MARKET
+    sell_m = b.get("sell_market")
+    where = (f"🛒 Купить на «{buy_m}» → 🏪 выставить на «{sell_m}» (там дороже)"
+             if sell_m and sell_m != buy_m
+             else f"🛒 Купить и 🏪 выставить на «{buy_m}»")
     lines += [
         "",
-        f"🛒 Купить на «{buy_m}» → 🏪 выставить на «{sell_m}»",
+        where,
         # СВЕРКА С ВИТРИНОЙ. Getgems пишет «Floor price» и показывает САМЫЙ
         # ДЕШЁВЫЙ лот, а мы считаем 5-й перцентиль — числа расходятся
         # ЗАКОННО, и без этой строки владелец видит расхождение как баг.
@@ -2506,6 +2515,18 @@ def _best_sell_market(snap: dict):
     best, best_floor = None, None
     for market, info in (snap.get("market_floors") or {}).items():
         floor = info.get("floor")
+        # Безымянная корзина в совет «где продать» не годится: выставить
+        # лот на площадке, название которой мы не знаем, нельзя. Живой прогон
+        # 23.09.2026 выдал владельцу «выставить на «(площадка неизвестна)»» —
+        # у части лотов TonAPI не отдаёт `sale.market.name`, и эта корзина
+        # оказалась с самым высоким floor.
+        if market == _UNKNOWN_MARKET:
+            continue
+        # Тот же порог выборки, что у арбитража. Floor по четырём лотам —
+        # это не floor, и называть такую площадку «где дороже» значит
+        # советовать по шуму.
+        if int(info.get("n") or 0) < MIN_MARKET_SAMPLE:
+            continue
         if floor is None:
             continue
         floor = Decimal(str(floor))
@@ -2542,7 +2563,7 @@ def explain_trade(ev: dict, snap: dict, item: dict = None) -> list:
     # (TonAPI читает блокчейн, а не базу одного маркетплейса), и цена у них
     # разная. Без названия площадки владелец не найдёт лот руками, а без
     # второй площадки не увидит, что продавать выгоднее в другом месте.
-    buy_market = item.get("sale_market") or "площадка неизвестна"
+    buy_market = item.get("sale_market") or _UNKNOWN_MARKET
     sell_market, sell_floor = _best_sell_market(snap)
 
     lines = [
@@ -4702,8 +4723,8 @@ def probe(address: str):
     else:
         markets = {}
         for it in listed:
-            markets[it.get("sale_market") or "(без имени)"] = markets.get(
-                it.get("sale_market") or "(без имени)", 0) + 1
+            mname = (it.get("sale_market") or "").strip() or _UNKNOWN_MARKET
+            markets[mname] = markets.get(mname, 0) + 1
         log.info(f"Предметов {len(census)}, из них выставлено {len(listed)} "
                  f"({len(listed) * 100 // max(1, len(census))}%)")
         for name, n in sorted(markets.items(), key=lambda kv: -kv[1]):
