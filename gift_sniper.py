@@ -2038,8 +2038,9 @@ def build_colors_template():
     log.info("")
     log.info(f"{_Color.GREEN}Записано {FLIP_MODEL_COLORS_PATH}: "
              f"{len(table)} моделей{_Color.RESET}")
-    log.info(f"  цвет угадан по названию: {auto}")
-    log.info(f"  осталось вписать руками: {blank}")
+    known = len(table) - blank
+    log.info(f"  цвет известен: {known} (из них угадано сейчас: {auto})")
+    log.info(f"  цвета нет: {blank}")
     if blank:
         log.warning(f"{_Color.YELLOW}Пустые строки — это НЕ «монохрома нет», "
                     f"а «цвет неизвестен»: такие лоты идут с пометкой "
@@ -2111,11 +2112,8 @@ def flip_report(limit: int = 10):
                  f"{r['target_ton']:>8.2f} {r['net_profit_ton']:>9.4f}  "
                  f"#{r['mint']} / {r['traits'].get('backdrop', '?')}")
         over = r.get("target_over_floor_pct")
-        if over is not None and over > 0:
-            log.info(f"         {_Color.YELLOW}цель на {over}% ВЫШЕ floor "
-                     f"{r['floor_source']} — рядом стоят такие же дешевле"
-                     f"{_Color.RESET}")
-        log.info(f"         {_Color.GREY}{r['reason']} | {r['market']} | "
+        log.info(f"         {_Color.GREY}{r['reason']} | цель на {over}% выше "
+                 f"floor {r['floor_source']} | {r['market']} | "
                  f"{GIFT_URL_TEMPLATE.format(address=friendly_ton_address(r['address']))}"
                  f"{_Color.RESET}")
 
@@ -2128,6 +2126,17 @@ def flip_report(limit: int = 10):
                 f"при неудаче модель окупается, если по x{FLIP_TARGET_MULT} "
                 f"уходит примерно КАЖДЫЙ ЧЕТВЁРТЫЙ лот. Эту долю надо "
                 f"измерить по своей записи, а не принять на слово.")
+    # ЧТО ИМЕННО значит «уходит по x1.5», в терминах рынка, а не множителя.
+    # Лот, купленный РОВНО по floor, надо продать примерно на 48% дороже
+    # floor — то есть дороже одинаковых лотов, стоящих рядом. Колонка «цель
+    # выше floor» показывает это по каждой строке: чем меньше число, тем
+    # обычнее нужная сделка. Меньше всего оно у лотов, купленных НИЖЕ floor.
+    log.warning(f"Что это значит на рынке: лот, купленный РОВНО по floor, "
+                f"придётся продать примерно на "
+                f"{((FLIP_TARGET_MULT - 1) * 100):.0f}% дороже floor своего "
+                f"сегмента. Чем МЕНЬШЕ колонка «цель выше floor», тем "
+                f"обычнее нужная сделка — и меньше всего она у лотов, "
+                f"купленных НИЖЕ floor.")
     miss = sorted({m for r in rows for m in r["missing"]})
     if miss:
         log.warning("Чего в данных НЕТ (в баллах не участвует): " + "; ".join(miss))
@@ -4257,25 +4266,46 @@ def probe(address: str):
                     "Скорее всего адрес не коллекции.")
         return False
 
-    parsed = fetch_items_tonapi(address, limit=5)
-    log.info(f"Предметов в ответе: {len(raw_items)} | разобрано: {len(parsed)}")
+    # БОЛЬШАЯ выборка, и поля продажи проверяются ПО НЕЙ. Раньше проверка шла
+    # по пяти предметам — и живой прогон 23.09.2026 выдал «цена продажи 0/5
+    # НЕ РАЗОБРАНО» на коллекции, где десятью строками ниже сам же probe
+    # насчитал 123 выставленных лота из 1000. Выставлено ~12% предметов,
+    # поэтому в пятёрке их не бывает примерно в половине случаев, и вердикт
+    # «парсер сломан» был статистикой, а не фактом.
+    #
+    # Это третий раз за проект, когда вывод делается по слишком малой
+    # выборке: floor по 12% коллекции, площадки по 5 предметам, и вот это.
+    parsed = fetch_items_tonapi(address, limit=FLOOR_PAGE_SIZE)
+    log.info(f"Предметов в выборке: {len(parsed)}")
 
     # Проверяем КАЖДОЕ поле отдельно: молчаливо не разобранное поле — это
     # именно то, что потом ломает расчёты.
     on_sale = [i for i in parsed if i["is_on_sale"]]
     checks = [
-        ("цена продажи", sum(1 for i in parsed if i["sale_price_ton"] > 0)),
-        ("лоты на продаже", len(on_sale)),
-        ("номер минта", sum(1 for i in parsed if i["mint_index"] is not None)),
-        ("трейты", sum(1 for i in parsed if i.get("traits"))),
-        ("адрес коллекции", sum(1 for i in parsed if i["collection_address"])),
+        ("номер минта", sum(1 for i in parsed if i["mint_index"] is not None), len(parsed)),
+        ("трейты", sum(1 for i in parsed if i.get("traits")), len(parsed)),
+        ("адрес коллекции", sum(1 for i in parsed if i["collection_address"]), len(parsed)),
+        ("лоты на продаже", len(on_sale), len(parsed)),
     ]
+    # Цена и адрес контракта проверяются ТОЛЬКО по выставленным лотам: у лота
+    # не на продаже поля `sale` нет вовсе, и это не поломка парсера, а рынок.
+    if on_sale:
+        checks.append(("цена продажи", sum(1 for i in on_sale
+                                           if i["sale_price_ton"] > 0), len(on_sale)))
+        checks.append(("адрес контракта", sum(1 for i in on_sale
+                                              if i.get("sale_address")), len(on_sale)))
     log.info("")
-    for name, got in checks:
-        mark = f"{_Color.GREEN}OK{_Color.RESET}" if got else f"{_Color.RED}НЕ РАЗОБРАНО{_Color.RESET}"
-        log.info(f"  {name:<20} {got}/{len(parsed)}  {mark}")
+    for name, got, total in checks:
+        mark = (f"{_Color.GREEN}OK{_Color.RESET}" if got
+                else f"{_Color.RED}НЕ РАЗОБРАНО{_Color.RESET}")
+        log.info(f"  {name:<20} {got}/{total}  {mark}")
 
-    failed = [n for n, g in checks if not g]
+    if not on_sale:
+        log.warning(f"{_Color.YELLOW}В выборке нет ни одного выставленного "
+                    f"лота, поэтому поля продажи НЕ ПРОВЕРЕНЫ. Это не поломка: "
+                    f"выставлены единицы процентов предметов.{_Color.RESET}")
+
+    failed = [n for n, g, _ in checks if not g]
     if failed:
         log.info("")
         log.warning(f"{_Color.YELLOW}Не разобрано: {', '.join(failed)}. "
@@ -4299,8 +4329,7 @@ def probe(address: str):
     # «MRKT» в API называется так же, значит выдумать факт.
     log.info("")
     log.info(f"{_Color.BOLD}--- Площадки в выборке ---{_Color.RESET}")
-    census = fetch_items_tonapi(address, limit=FLOOR_PAGE_SIZE)
-    listed = [i for i in census if i["is_on_sale"]]
+    census, listed = parsed, on_sale          # та же выборка, второй запрос не нужен
     if not listed:
         log.warning(f"{_Color.YELLOW}В выборке {len(census)} предметов нет ни "
                     f"одного выставленного. Вывода о площадках сделать нельзя."
