@@ -2101,6 +2101,89 @@ def _segment_already_seen(item: dict, seg_floor: Decimal) -> bool:
     return False
 
 
+def required_discount_pct(floor_price: Decimal) -> Decimal:
+    """
+    Насколько ниже floor надо купить, чтобы выйти В НОЛЬ. В процентах.
+
+    Нужна ради дешёвых лотов. Газ — величина В ТОНАХ, а не в процентах,
+    поэтому на цене 5 TON он почти незаметен, а на цене 1 TON съедает
+    пятую часть. «Ищи подешевле» без этой цифры звучит разумно, а на деле
+    означает «ищи скидку 30% вместо 13%».
+    """
+    if floor_price <= 0:
+        return Decimal("0")
+    breakeven = max_profitable_buy(floor_price)
+    return ((Decimal("1") - breakeven / floor_price)
+            * Decimal("100")).quantize(Decimal("0.1"))
+
+
+def price_chain_lines(buy: Decimal, base_floor: Decimal, floor_label: str):
+    """
+    ЦЕПОЧКА, ИЗ КОТОРОЙ ПОЛУЧАЕТСЯ ЦЕНА ПРОДАЖИ. Каждая строка — число,
+    и они складываются: последняя строка равна `compute_net_profit()`.
+
+    По прямой просьбе владельца: «за каждый пункт пиши какая наценка идёт и
+    почему, чтобы потом из этих пунктов получалась цена продажи».
+
+    Считается ТЕМИ ЖЕ функциями, что и решение (`target_sale_price`,
+    `compute_net_profit`), а не пересчитывается заново в месте печати. Отчёт,
+    печатающий одни числа, пока решение принимается по другим, заставил бы
+    владельца выставить лот по цене, при которой сделка убыточна.
+    """
+    q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
+    sale = target_sale_price(base_floor)
+    undercut = base_floor - sale
+    fee = sale * MARKETPLACE_FEE_PCT
+    royalty = sale * ROYALTY_PCT
+    proceeds = sale - fee - royalty
+    net = compute_net_profit(base_floor, buy)
+
+    lines = [
+        "🧮 Откуда берётся цена продажи:",
+        f"  floor {floor_label}  {q(base_floor)}",
+        f"  − undercut {UNDERCUT_PCT * 100:.0f}%  −{q(undercut)}  "
+        f"встать ниже, иначе не уйдём первыми",
+        f"  = 🏷 ВЫСТАВЛЯЮ  {q(sale)}",
+        f"  − комиссия {MARKETPLACE_FEE_PCT * 100:.0f}%  −{q(fee)}  "
+        f"берётся с цены ПРОДАЖИ",
+    ]
+    if ROYALTY_PCT > 0:
+        lines.append(f"  − роялти {ROYALTY_PCT * 100:.0f}%  −{q(royalty)}")
+    lines += [
+        f"  − газ за круг  −{q(GAS_FEE_TON)}  безвозвратно",
+        f"  = на руки  {q(proceeds - GAS_FEE_TON)}",
+        f"  − заплатил  −{q(buy)}",
+        f"  = {'📈' if net > 0 else '📉'} ЧИСТЫМИ  {q(net):+} TON",
+    ]
+    return lines
+
+
+def premium_lines(rarity_pct, rarest_trait, mint, is_pretty: bool,
+                  discount_pct: Decimal, discount_of: str):
+    """
+    ПРИЗНАКИ И ИХ ВКЛАД В ЦЕНУ — с честными нулями.
+
+    Владелец просил, чтобы из пунктов складывалась цена. Складывается она
+    ровно из одного: из СКИДКИ. Красивый номер и редкий трейт дают **+0%**,
+    потому что `PREMIUM_MULT = 1.0` — премия не измерена по своей записи.
+
+    Написать тут «+15% за редкость» значило бы выдумать число и завысить
+    цену, по которой владелец выставит лот. Ноль рядом с признаком — это не
+    формальность, а единственная честная цифра, которая у нас есть.
+    """
+    lines = ["🏷 Признаки и их вклад в цену:"]
+    lines.append(f"  • дешевле {discount_of} на {discount_pct}%  "
+                 f"→ ЭТО И ЕСТЬ вся прибыль")
+    if rarity_pct is not None:
+        lines.append(f"  • редкий «{rarest_trait}»: {rarity_pct}% носителей  "
+                     f"→ +0%, премия не измерена")
+    if is_pretty and mint is not None:
+        lines.append(f"  • красивый номер #{mint}  → +0%, премия не измерена")
+    if PREMIUM_MULT != Decimal("1"):
+        lines.append(f"  (PREMIUM_MULT = {PREMIUM_MULT} — премия ВКЛЮЧЕНА)")
+    return lines
+
+
 def find_segment_bargains(snap: dict):
     """
     Лоты, дешёвые относительно floor СВОЕГО сегмента. Список, без побочных
@@ -2169,12 +2252,19 @@ def notify_segment_bargain(b: dict) -> bool:
     name = item.get("collection_name") or "лот"
     sale_price = target_sale_price(b["seg_floor"])
     lines = [
-        f"🔎 Дешевле своих: {name}" + (f" #{mint}" if mint is not None else ""),
+        # Первая строка — сразу «почему», а не название лота.
+        f"🔵 ДЕШЕВЛЕ СВОИХ · −{b['discount_pct']}% к floor модели",
+        f"🎁 {name}" + (f" #{mint}" if mint is not None else ""),
         f"💰 Купить {q(b['buy'])} → продать {q(sale_price)} → "
         f"📈 {q(b['profit']):+} TON ({b['roi']}%)",
         "",
-        f"• модель «{b['model']}»: дешевле похожих на {b['discount_pct']}%",
-        f"• floor этой модели {q(b['seg_floor'])} (лотов {b['peer_n']}), "
+    ]
+    lines += price_chain_lines(b["buy"], b["seg_floor"], "модели")
+    lines.append("")
+    lines += premium_lines(None, None, mint, False,
+                           b["discount_pct"], f"модели «{b['model']}»")
+    lines += [
+        f"  • floor этой модели {q(b['seg_floor'])} по {b['peer_n']} лотам, "
         f"floor коллекции {q(b['coll_floor'])}",
         "",
         # Главное предложение сообщения. Без него это выглядит как находка.
@@ -2183,6 +2273,11 @@ def notify_segment_bargain(b: dict) -> bool:
         "измерена. Решение ваше и покупка руками.",
         f"🔗 {GIFT_URL_TEMPLATE.format(address=friendly_ton_address(item['address']))}",
     ]
+    if b["buy"] > 0 and GAS_FEE_TON / b["buy"] > Decimal("0.05"):
+        share = (GAS_FEE_TON / b["buy"] * Decimal("100")).quantize(Decimal("0.1"))
+        lines.insert(-1, f"ℹ️ лот дешёвый: газ {GAS_FEE_TON} = {share}% от цены, "
+                         f"безубыток тут только от "
+                         f"−{required_discount_pct(b['seg_floor'])}% к floor")
     if item.get("sale_market") and ALLOWED_MARKETS and \
             item["sale_market"] not in ALLOWED_MARKETS:
         lines.insert(-1, f"⚠️ площадка «{item['sale_market']}» не проверена")
@@ -3217,10 +3312,15 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
     # а непрочитанное уведомление не отличается от неотправленного.
     name = item.get("collection_name") or "лот"
     mint = item.get("mint_index")
-    head = f"🎯 {name}" + (f" #{mint}" if mint is not None else "")
 
+    # ПЕРВАЯ СТРОКА — сразу «почему», а не название. По просьбе владельца:
+    # «чтобы видел сразу, почему купил». Название лота само по себе ничего
+    # не объясняет, а решение принимают по первой строке.
+    verdict = ("🟡 НАХОДКА · симуляция, бот не купит" if DRY_RUN
+               else "🟢 НАХОДКА · бот попробует купить")
     lines = [
-        head,
+        f"{verdict}",
+        f"🎯 {name}" + (f" #{mint}" if mint is not None else ""),
         # Знак ставится форматом, а не вручную: захардкоженный «+» при
         # убытке печатал «+-3.66», и это не опечатка, а строка, по которой
         # принимают решение о деньгах.
@@ -3228,30 +3328,40 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
         f"{'📈' if ev['net_profit'] > 0 else '📉'} "
         f"{q(ev['net_profit']):+} TON ({ev['roi_pct']}%)",
         "",
-        "Почему этот:",
     ]
 
-    # Причины — то единственное, ради чего стоит смотреть на лот. Без них
-    # сообщение превращается в «купи, потому что я так сказал».
-    lines.append(f"• дешевле floor коллекции на {ev['discount_pct']}% "
-                 f"({q(snap['floor'])} TON)")
+    # ЦЕПОЧКА ЦЕНЫ. Каждая строка — число, и они складываются в последнюю.
+    lines += price_chain_lines(
+        ev["buy_price"], ev["eff_floor"],
+        "сегмента" if (ev.get("peer_floor") is not None
+                       and ev["eff_floor"] != snap["floor"]) else "коллекции")
+    lines.append("")
+
+    # ПРИЗНАКИ И ИХ ВКЛАД — с честными нулями там, где премия не измерена.
+    lines += premium_lines(
+        ev.get("rarity_pct"), ev.get("rarest_trait"), mint,
+        bool(ev.get("is_pretty")), ev["discount_pct"], "floor коллекции")
     if ev.get("peer_floor") is not None and ev["eff_floor"] != snap["floor"]:
-        lines.append(f"• среди похожих ({ev['peer_n']} шт) дешевле нет — "
+        lines.append(f"  • среди похожих ({ev['peer_n']} шт) дешевле нет — "
                      f"их floor {q(ev['eff_floor'])}")
-    if ev.get("rarity_pct") is not None:
-        lines.append(f"• редкий «{ev['rarest_trait']}»: {ev['rarity_pct']}% "
-                     f"носителей")
-    if ev.get("is_pretty"):
-        lines.append(f"• красивый номер #{mint}")
     buy_market = item.get("sale_market") or ""
     sell_market, _sf = _best_sell_market(snap)
     if sell_market and buy_market and sell_market != buy_market:
-        lines.append(f"• купить на «{buy_market}», выставить на «{sell_market}» "
-                     f"— там дороже")
+        lines.append(f"  • купить на «{buy_market}», выставить на "
+                     f"«{sell_market}» — там дороже")
 
     # Предупреждения. Каждое означает «сделка может не состояться», и молчать
     # о них нельзя: владелец ждал бы покупки, которой не будет.
     warn = []
+    # Газ — величина В ТОНАХ. На цене 5 TON он почти незаметен, на цене
+    # 1 TON съедает пятую часть, и порог безубытка уезжает вдвое. Молчать
+    # об этом значит предлагать «искать подешевле» как бесплатный совет.
+    if ev["buy_price"] > 0 and GAS_FEE_TON / ev["buy_price"] > Decimal("0.05"):
+        gas_share = (GAS_FEE_TON / ev["buy_price"]
+                     * Decimal("100")).quantize(Decimal("0.1"))
+        warn.append(f"ℹ️ лот дешёвый: газ {GAS_FEE_TON} = {gas_share}% от цены, "
+                    f"поэтому здесь безубыток только от "
+                    f"−{required_discount_pct(ev['eff_floor'])}% к floor")
     cov = snap.get("coverage_pct")
     if cov is None:
         warn.append("⚠️ покрытие коллекции неизвестно — floor может врать")
