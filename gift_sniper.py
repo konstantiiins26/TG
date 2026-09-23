@@ -168,7 +168,12 @@ PREMIUM_MULT        = Decimal(os.getenv("PREMIUM_MULT", "1.0"))
 # больших коллекциях: 15 страниц по 100 — это 1500 предметов из 13 000, то
 # есть 12% коллекции. Floor по такой выборке — не floor.
 FLOOR_PAGE_SIZE     = int(os.getenv("FLOOR_PAGE_SIZE", "1000"))           # размер одной страницы выборки (максимум TonAPI)
-FLOOR_SAMPLE_PAGES  = int(os.getenv("FLOOR_SAMPLE_PAGES", "5"))           # сколько страниц тянуть (5 x 100 = 500 лотов)
+# 40 — это ПОТОЛОК, а не план: обход прекращается на первой пустой странице
+# (конец коллекции). Для коллекции из 13 000 предметов это 14 запросов и при
+# потолке 15, и при потолке 40 — лишние страницы просто не запрашиваются.
+# Поэтому высокий потолок бесплатен для маленьких коллекций и спасает
+# большие: при 15 страницах коллекция из 30 000 покрывалась бы наполовину.
+FLOOR_SAMPLE_PAGES  = int(os.getenv("FLOOR_SAMPLE_PAGES", "40"))          # потолок страниц (40 x 1000 = 40 000 предметов)
 FLOOR_PERCENTILE    = Decimal(os.getenv("FLOOR_PERCENTILE", "5"))         # 5-й перцентиль вместо голого min()
 # Порог взят из арифметики самого перцентиля, а не с потолка. Индекс, на
 # который попадает P5, равен (N-1)*0.05. При N=27 это 1.3 — перцентиль
@@ -2393,45 +2398,69 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
     _find_sent_ts.append(now)
 
     addr = item.get("address", "")
-    # Две цены и разбор, а не одно число «профит». Владельцу, который получил
-    # находку в телефон, надо знать, за сколько покупать и за сколько потом
-    # выставлять — иначе уведомление сообщает о возможности, которой нельзя
-    # воспользоваться руками.
-    cov = snap.get("coverage_pct")
-    cov_note = (f" (выборка {cov}% коллекции)" if cov is not None else
-                " (покрытие коллекции НЕИЗВЕСТНО)")
-    lines = [f"🎯 Находка: скидка {ev['discount_pct']}% от floor",
-             f"floor коллекции {snap['floor']} TON{cov_note}"]
-    lines += explain_trade(ev, snap, item)
+    q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
 
+    # КОРОТКО. Полный разбор (undercut, комиссия, газ, границы цены) уходит
+    # в ЛОГ через explain_trade() — там он и нужен, чтобы проверить расчёт.
+    # В телефон идут три числа и причина: длинное сообщение перестают читать,
+    # а непрочитанное уведомление не отличается от неотправленного.
+    name = item.get("collection_name") or "лот"
+    mint = item.get("mint_index")
+    head = f"🎯 {name}" + (f" #{mint}" if mint is not None else "")
+
+    lines = [
+        head,
+        f"💰 Купить {q(ev['buy_price'])} → продать {q(ev['sale_price'])} → "
+        f"📈 +{q(ev['net_profit'])} TON ({ev['roi_pct']}%)",
+        "",
+        "Почему этот:",
+    ]
+
+    # Причины — то единственное, ради чего стоит смотреть на лот. Без них
+    # сообщение превращается в «купи, потому что я так сказал».
+    lines.append(f"• дешевле floor коллекции на {ev['discount_pct']}% "
+                 f"({q(snap['floor'])} TON)")
+    if ev.get("peer_floor") is not None and ev["eff_floor"] != snap["floor"]:
+        lines.append(f"• среди похожих ({ev['peer_n']} шт) дешевле нет — "
+                     f"их floor {q(ev['eff_floor'])}")
     if ev.get("rarity_pct") is not None:
-        lines.append(f"редкость {ev['rarity_pct']}% по «{ev['rarest_trait']}»")
+        lines.append(f"• редкий «{ev['rarest_trait']}»: {ev['rarity_pct']}% "
+                     f"носителей")
+    if ev.get("is_pretty"):
+        lines.append(f"• красивый номер #{mint}")
+    buy_market = item.get("sale_market") or ""
+    sell_market, _sf = _best_sell_market(snap)
+    if sell_market and buy_market and sell_market != buy_market:
+        lines.append(f"• купить на «{buy_market}», выставить на «{sell_market}» "
+                     f"— там дороже")
 
-    # Почему находка может не стать покупкой — говорим сразу, иначе владелец
-    # ждёт сделки, которой не будет, и считает бота сломанным.
+    # Предупреждения. Каждое означает «сделка может не состояться», и молчать
+    # о них нельзя: владелец ждал бы покупки, которой не будет.
+    warn = []
+    cov = snap.get("coverage_pct")
+    if cov is None:
+        warn.append("⚠️ покрытие коллекции неизвестно — floor может врать")
+    elif cov < Decimal("100"):
+        warn.append(f"⚠️ видно {cov}% коллекции — floor может быть завышен")
+    if ev.get("is_pretty") or ev.get("is_rare"):
+        if not ev.get("premium_applied"):
+            warn.append("ℹ️ премия за редкость в цене НЕ учтена")
     if DRY_RUN:
-        lines.append("режим симуляции — покупки НЕ будет")
+        warn.append("ℹ️ симуляция — бот не купит")
     elif not SELLING_IMPLEMENTED:
-        lines.append("продажи нет как кода — живой режим закрыт")
+        warn.append("ℹ️ продажи нет как кода — живой режим закрыт")
     else:
         cap = max_position_size(ev["roi_pct"])
         if ev["buy_price"] > cap:
-            lines.append(f"⚠️ не влезет в лимит: потолок сделки {cap} TON")
+            warn.append(f"⚠️ не влезет в лимит {cap} TON")
+    if warn:
+        lines += [""] + warn
 
-    # Три способа добраться до лота вместо одного. Форма ссылки на площадку
-    # сверена с getgems.io (getgems.io/nft/<user-friendly адрес>), но пустая
-    # страница всё равно возможна — если лот УЖЕ УШЁЛ С ПРОДАЖИ. Это не баг,
-    # а рынок, и обозреватель отличает одно от другого: он резолвит любой
-    # адрес всегда и показывает текущего владельца.
-    #
-    # Витрины понимают user-friendly форму, а TonAPI отдаёт raw. Подставить
-    # raw в ссылку значит отправить владельца на пустую страницу.
+    # Ссылка одна: площадка. Обозреватель и сырой адрес ушли в лог — в
+    # телефоне три ссылки подряд читаются как мусор, а нужна из них одна.
     link_addr = friendly_ton_address(addr)
     if GIFT_URL_TEMPLATE:
-        lines.append(GIFT_URL_TEMPLATE.format(address=link_addr))
-    if EXPLORER_URL_TEMPLATE:
-        lines.append(EXPLORER_URL_TEMPLATE.format(address=link_addr))
-    lines.append(link_addr)
+        lines += ["", GIFT_URL_TEMPLATE.format(address=link_addr)]
 
     # Кнопки нужны потому, что режим сейчас РУЧНОЙ: бот находит, а покупает и
     # выставляет владелец. Без отметки «купил» позиция не попадает в БД, и ни

@@ -91,7 +91,7 @@ REM Pochemu eto vazhno: floor po 12% kollekcii byl VDVOE vyshe nastoyashchego
 REM (11 TON protiv 5.65 na vitrine), to est bot pridumyval skidki, kotoryh net.
 REM Otvety stali v 10 raz bolshe po obemu - esli kvota TonAPI schitaetsya po
 REM trafiku, bot izmerit eto sam (budget_learn_limit) i rastyanet interval.
-set FLOOR_SAMPLE_PAGES=15
+set FLOOR_SAMPLE_PAGES=40
 set POLL_INTERVAL_SEC=120
 set DRY_RUN=1
 
