@@ -76,6 +76,7 @@ _PINNED = {
     "ALLOWED_MARKETS": ["Getgems Sales"],
     "DRY_RUN": True, "CONFIRM_LIVE_TRADING": "", "COLLECTION_WHITELIST": [],
     "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "", "HEARTBEAT_MIN": 60,
+    "MIN_MARKET_SAMPLE": 5, "NEAR_MISS_TOP": 3,
 }
 for _name, _value in _PINNED.items():
     setattr(gs, _name, _value)
@@ -3253,6 +3254,163 @@ check("покрытие названо в уведомлении о находк
       "видно {cov}% коллекции" in _src51)
 check("неизвестное покрытие названо прямо, а не опущено",
       "покрытие коллекции неизвестно" in _src51)
+
+
+# =============================================================================
+print("\n[52] Арбитраж площадок: считается той же экономикой")
+# =============================================================================
+
+# Владельцу подходит и арбитраж, а общий floor разницу между площадками
+# УСРЕДНЯЕТ — то есть в обычных числах бота её не видно вовсе.
+
+_snap52 = {"market_floors": {
+    "Getgems Sales":        {"floor": Decimal("5.65"), "n": 40},
+    "Marketapp Marketplace": {"floor": Decimal("4.20"), "n": 9},
+    # Самый дешёвый floor в таблице — и он же самый ненадёжный: два лота.
+    # Если бы выборка не проверялась, арбитраж всегда находился бы здесь.
+    "Thin Market":          {"floor": Decimal("1.00"), "n": 2},
+}}
+_arb52 = gs.market_arbitrage(_snap52)
+
+check("арбитраж найден", _arb52 is not None)
+check("покупка на дешёвой площадке",
+      _arb52["buy_market"] == "Marketapp Marketplace", _arb52["buy_market"])
+check("продажа на дорогой площадке",
+      _arb52["sell_market"] == "Getgems Sales", _arb52["sell_market"])
+# ГЛАВНОЕ в этой секции: арбитраж НЕ заводит вторую модель прибыли рядом
+# с первой. Разойдясь, они дали бы два разных ответа на один вопрос.
+check("прибыль посчитана compute_net_profit, а не своей формулой",
+      _arb52["net_profit"] == gs.compute_net_profit(Decimal("5.65"), Decimal("4.20")),
+      _arb52["net_profit"])
+check("площадка с выборкой меньше MIN_MARKET_SAMPLE не участвует",
+      "Thin Market" not in (_arb52["buy_market"], _arb52["sell_market"]))
+# Покупать вне ALLOWED_MARKETS бот не умеет: протоколы контрактов продажи
+# различаются, и платить туда по нашей схеме значит отправить деньги вслепую.
+check("покупка вне ALLOWED_MARKETS помечена как недоступная боту",
+      _arb52["buyable"] is False)
+
+# Обратный случай: бот обязан признавать и ДОСТУПНУЮ покупку, иначе тест
+# доказывал бы лишь то, что buyable всегда False.
+_arb52b = gs.market_arbitrage({"market_floors": {
+    "Getgems Sales": {"floor": Decimal("4.00"), "n": 30},
+    "Marketapp Marketplace": {"floor": Decimal("6.00"), "n": 30},
+}})
+check("покупка на разрешённой площадке доступна",
+      _arb52b["buy_market"] == "Getgems Sales" and _arb52b["buyable"] is True)
+
+check("одна площадка — арбитража нет",
+      gs.market_arbitrage({"market_floors": {
+          "Getgems Sales": {"floor": Decimal("5.65"), "n": 40}}}) is None)
+check("нет market_floors — арбитража нет",
+      gs.market_arbitrage({}) is None)
+# Равные floor: разница нулевая, а комиссия и газ — нет. Сделка убыточна,
+# и показывать её как возможность значит звать владельца терять деньги.
+check("равные floor — арбитража нет (комиссия и газ не покрыты)",
+      gs.market_arbitrage({"market_floors": {
+          "A": {"floor": Decimal("5.00"), "n": 30},
+          "B": {"floor": Decimal("5.00"), "n": 30}}}) is None)
+
+# Оговорки обязаны идти РЯДОМ С ЧИСЛОМ: голая цифра «+1.02 TON» читается
+# как гарантия профита, а она ею не является.
+_l52 = gs._arbitrage_lines([{"collection": "0:c", **_snap52}])
+check("в сводке сказано, что бот сам там купить не может",
+      any("НЕ может" in x for x in _l52), _l52)
+check("в сводке сказано, что комиссии проверены только у Getgems",
+      any("только у Getgems" in x for x in _l52), _l52)
+check("без арбитража строк нет вовсе",
+      gs._arbitrage_lines([{"collection": "0:c", "market_floors": {}}]) == [])
+
+
+# =============================================================================
+print("\n[53] «Что видел, но не прошло»")
+# =============================================================================
+
+# После исправления floor находка требует лот примерно на 12% ниже
+# НАСТОЯЩЕГО пола, и тишина стала нормой. Молчащий бот неотличим от бота,
+# смотрящего в пустой рынок, — а решения у этих состояний разные.
+
+def _nm_item(price, mint=None, name="Spring Baskets"):
+    return {"address": "0:aa", "sale_price_ton": Decimal(str(price)),
+            "mint_index": mint, "collection_name": name,
+            "collection_address": "0:c", "sale_market": "Getgems Sales"}
+
+def _nm_ev(roi, disc, reason="ROI ниже порога"):
+    return {"roi_pct": Decimal(str(roi)), "discount_pct": Decimal(str(disc)),
+            "reason": reason}
+
+gs._near_misses.clear()
+# floor недостоверен — прибыль посчитана от выдуманного пола. Показать её
+# владельцу значит предложить сделку по несуществующей цене.
+gs.note_near_miss(_nm_item("5.0"), {"floor_reliable": False}, _nm_ev(4, 10))
+check("при недостоверном floor промах НЕ запоминается", gs._near_misses == [])
+
+_rel53 = {"floor_reliable": True}
+for _roi in (1, 9, 3, 7, 5):
+    gs.note_near_miss(_nm_item("5.0", mint=_roi), _rel53, _nm_ev(_roi, 10))
+check("держим только NEAR_MISS_TOP лучших",
+      len(gs._near_misses) == gs.NEAR_MISS_TOP, len(gs._near_misses))
+# Ранжирование по ROI, а не по скидке: скидка не учитывает ни комиссию,
+# ни газ, и «дешевле на 20%» может быть убыточнее «дешевле на 12%».
+check("лучшие — по ROI",
+      [n["roi_pct"] for n in gs._near_misses] ==
+      [Decimal("9"), Decimal("7"), Decimal("5")],
+      [n["roi_pct"] for n in gs._near_misses])
+
+_line53 = gs._near_miss_line({
+    "collection": "Spring Baskets", "mint": 1234,
+    "buy_price": Decimal("4.90"), "market": "Getgems Sales",
+    "roi_pct": Decimal("3"), "discount_pct": Decimal("13.0"),
+    "reason": "ROI 3% ниже порога 5%"})
+check("в строке есть цена, отклонение от floor и причина",
+      "4.90" in _line53 and "дешевле floor на 13%" in _line53
+      and "ниже порога" in _line53, _line53)
+# Лот ДОРОЖЕ floor обязан называться дорогим. «Дешевле на −5%» — строка,
+# которую перечитывают, а решение о деньгах перечитывания не терпит.
+check("лот дороже floor назван дорогим",
+      "дороже floor на 5%" in gs._near_miss_line({
+          "collection": "C", "mint": None, "buy_price": Decimal("6.0"),
+          "market": "G", "roi_pct": Decimal("-9"),
+          "discount_pct": Decimal("-5.0"), "reason": "убыточно"}))
+
+# Промахи обязаны попадать в оба пути отказа, иначе в режиме записи (где
+# process_item не вызывается вовсе) владелец не увидит ничего.
+_src53 = open("gift_sniper.py", encoding="utf-8").read()
+check("scan_finds запоминает промахи",
+      _src53.count("note_near_miss(item, snap, ev)") == 1)
+check("process_item запоминает промахи",
+      _src53.count("note_near_miss(item, snapshot, ev)") == 1)
+
+# --- сводка: арбитраж и промахи реально доходят до Telegram ---
+_ob53 = (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+         gs._last_heartbeat)
+_sent53 = []
+try:
+    gs._tg_call = (lambda method, payload:
+                   (_sent53.append(payload.get("text", "")),
+                    {"ok": True, "result": {"message_id": 1}})[1])
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "t", "1"
+    gs._last_heartbeat = 0.0
+    gs.notify_heartbeat([{"collection": "0:c", "sample_size": 100,
+                          "floor": Decimal("5.65"), "floor_reliable": True,
+                          **_snap52}], force=True)
+    _txt53 = _sent53[0] if _sent53 else ""
+    check("в сводке есть арбитраж", "Арбитраж площадок" in _txt53, _txt53)
+    check("в сводке есть промахи", "Ближе всего к сделке" in _txt53, _txt53)
+    check("промахи очищены после отправки", gs._near_misses == [])
+
+    # Пустой список — ДРУГОЙ факт, и он тоже обязан быть назван: молчание
+    # здесь прочиталось бы как «рынок рядом, просто не дотянул».
+    _sent53.clear()
+    gs._last_heartbeat = 0.0
+    gs.notify_heartbeat([{"collection": "0:c", "sample_size": 100,
+                          "floor": Decimal("5.65"), "floor_reliable": True}],
+                        force=True)
+    check("пустой список промахов назван прямо",
+          "Оценивать было нечего" in _sent53[0], _sent53[0])
+finally:
+    (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+     gs._last_heartbeat) = _ob53
+    gs._near_misses.clear()
 
 
 # =============================================================================

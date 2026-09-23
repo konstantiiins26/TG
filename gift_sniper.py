@@ -1632,6 +1632,58 @@ def max_profitable_buy(floor_price: Decimal, premium: bool = False) -> Decimal:
     return max_buy_at_roi(floor_price, Decimal("0"), premium)
 
 
+MIN_MARKET_SAMPLE = int(os.getenv("MIN_MARKET_SAMPLE", "5"))   # лотов на площадке, ниже — её floor это шум
+
+
+def market_arbitrage(snap: dict):
+    """
+    Лучшая пара площадок «купить там — продать тут», или None.
+
+    Считается ТОЙ ЖЕ экономикой, что обычная сделка: цена продажи с undercut,
+    комиссия с цены ПРОДАЖИ, газ за круг. Иначе получилась бы вторая модель
+    прибыли рядом с первой, и они разошлись бы в первый же день.
+
+    ЧЕТЫРЕ ОГОВОРКИ, и все обязаны идти рядом с числом:
+
+    1. **Комиссии проверены ТОЛЬКО у Getgems** (2%, роялти 0). У Marketapp
+       ставка своя и не измерена; на площадке «Other» был лот с Creator Fee
+       0.45 при комиссии 0 — то есть там разбивка совсем другая. Отчёт
+       считает всем одинаково, и это допущение, а не факт.
+    2. **Бот НЕ УМЕЕТ покупать вне `ALLOWED_MARKETS`.** Протоколы контрактов
+       продажи различаются: у одного лота адрес контракта совпадал с адресом
+       предмета. Арбитраж — подсказка ДЛЯ РУК, а не план бота.
+    3. **Разный floor может означать разный состав лотов**, а не выгоду: на
+       тонкой площадке в выборке может не быть дешёвых моделей вовсе.
+    4. **Floor по паре лотов — это не floor.** Площадки с выборкой меньше
+       `MIN_MARKET_SAMPLE` не участвуют.
+    """
+    mf = snap.get("market_floors") or {}
+    usable = {}
+    for name, info in mf.items():
+        floor = info.get("floor")
+        if floor is None or int(info.get("n") or 0) < MIN_MARKET_SAMPLE:
+            continue
+        usable[name] = (Decimal(str(floor)), int(info["n"]))
+    if len(usable) < 2:
+        return None
+
+    best = None
+    for buy_m, (buy_floor, buy_n) in usable.items():
+        for sell_m, (sell_floor, sell_n) in usable.items():
+            if buy_m == sell_m:
+                continue
+            profit = compute_net_profit(sell_floor, buy_floor)
+            if profit <= 0:
+                continue
+            roi = compute_roi_pct(profit, buy_floor)
+            if best is None or profit > best["net_profit"]:
+                best = {"buy_market": buy_m, "buy_floor": buy_floor, "buy_n": buy_n,
+                        "sell_market": sell_m, "sell_floor": sell_floor,
+                        "sell_n": sell_n, "net_profit": profit, "roi_pct": roi,
+                        "buyable": (not ALLOWED_MARKETS) or buy_m in ALLOWED_MARKETS}
+    return best
+
+
 def _best_sell_market(snap: dict):
     """
     Площадка с самым высоким floor в этом снапшоте: (имя, floor) или (None, None).
@@ -2317,6 +2369,93 @@ def test_telegram() -> bool:
     return False
 
 
+# Лучшие ОТКЛОНЁННЫЕ лоты между сводками. Держатся не ради полноты отчёта:
+# бот, который час молчит, неотличим от бота, который час смотрит в пустой
+# рынок, — а решения у этих двух состояний разные. «Ничего не нашлось» после
+# исправления floor стало нормой (находка теперь требует лот примерно на 12%
+# ниже НАСТОЯЩЕГО пола), и без этого списка владелец видел бы только тишину
+# и не знал, близок рынок к сделке или бесконечно далёк.
+#
+# Ранжируются по ROI, а не по скидке: скидка от floor не учитывает ни
+# комиссию, ни газ, и лот «дешевле на 20%» может быть убыточнее лота
+# «дешевле на 12%» из более дорогой коллекции. Мерить надо тем же, чем
+# принимается решение.
+NEAR_MISS_TOP = int(os.getenv("NEAR_MISS_TOP", "3"))
+_near_misses: list = []
+
+
+def note_near_miss(item: dict, snap: dict, ev: dict):
+    """
+    Запоминает отклонённый лот, если он в числе лучших за период.
+
+    Вызывается ТОЛЬКО когда floor достоверен: при недостоверном floor цифры
+    прибыли посчитаны от выдуманного пола, и показывать их владельцу значит
+    предлагать ему сделку по несуществующей цене.
+    """
+    if NEAR_MISS_TOP <= 0 or not snap.get("floor_reliable"):
+        return
+    _near_misses.append({
+        "collection": item.get("collection_name") or _short(
+            item.get("collection_address", "")),
+        "mint": item.get("mint_index"),
+        "buy_price": Decimal(str(item["sale_price_ton"])),
+        "market": item.get("sale_market"),
+        "roi_pct": ev["roi_pct"],
+        "discount_pct": ev["discount_pct"],
+        "reason": ev["reason"],
+    })
+    _near_misses.sort(key=lambda n: n["roi_pct"], reverse=True)
+    del _near_misses[NEAR_MISS_TOP:]
+
+
+def _near_miss_line(nm: dict) -> str:
+    """Одна строка про отклонённый лот: цена, отклонение от floor, причина."""
+    head = nm["collection"] + (f" #{nm['mint']}" if nm["mint"] is not None else "")
+    d = nm["discount_pct"]
+    rel = (f"дешевле floor на {d:.0f}%" if d > 0
+           else f"дороже floor на {-d:.0f}%" if d < 0 else "ровно по floor")
+    return (f"• {head} — {nm['buy_price'].quantize(Decimal('0.01'))} TON "
+            f"({rel}, ROI {nm['roi_pct']}%)\n  ↳ {nm['reason']}")
+
+
+def _arbitrage_lines(snapshots: list) -> list:
+    """
+    Строки про арбитраж между площадками для сводки, или пустой список.
+
+    Берётся ЛУЧШАЯ пара по одной коллекции — та, где чистыми больше всего.
+    Печатать арбитраж по всем двенадцати коллекциям значит превратить сводку
+    в простыню, которую перестанут читать (тот же довод, по которому
+    существует HEARTBEAT_MIN).
+    """
+    best = None
+    for snap in snapshots:
+        arb = market_arbitrage(snap)
+        if arb is None:
+            continue
+        if best is None or arb["net_profit"] > best[1]["net_profit"]:
+            best = (snap, arb)
+    if best is None:
+        return []
+    snap, arb = best
+    name = _short(snap.get("collection", "?"))
+    q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
+    lines = [
+        "",
+        f"🔀 Арбитраж площадок ({name})",
+        f"Купить на «{arb['buy_market']}» {q(arb['buy_floor'])} "
+        f"(лотов {arb['buy_n']}) → продать на «{arb['sell_market']}» "
+        f"{q(arb['sell_floor'])} (лотов {arb['sell_n']}) → "
+        f"{q(arb['net_profit']):+} TON ({arb['roi_pct']}%)",
+    ]
+    # Оговорки обязаны идти рядом с числом, а не в документации: голая
+    # цифра «+1.02 TON» читается как гарантия, а она ею не является.
+    if not arb["buyable"]:
+        lines.append("⚠️ бот сам там купить НЕ может — только руками")
+    lines.append("⚠️ комиссии проверены только у Getgems; разный floor может "
+                 "означать разный состав лотов, а не выгоду")
+    return lines
+
+
 # Тихий счётчик: сводка шлётся раз в HEARTBEAT_MIN минут, а не каждый цикл.
 # Уведомление, приходящее каждую минуту, перестают читать через час — и
 # пропускают то единственное, ради которого всё затевалось.
@@ -2356,6 +2495,26 @@ def notify_heartbeat(snapshots: list, force: bool = False):
     if _finds_suppressed:
         lines.append(f"Находок не отправлено из-за лимита: {_finds_suppressed}")
         _finds_suppressed = 0
+
+    # Арбитраж между площадками: владельцу подходит и он, а общий floor
+    # разницу между площадками УСРЕДНЯЕТ, то есть в обычных строках выше её
+    # не видно вовсе.
+    lines.extend(_arbitrage_lines(snapshots))
+
+    # «Что видел, но не прошло». Ставится ПОСЛЕ чисел: это объяснение к
+    # тишине, а не сигнал к покупке, и читается последним.
+    if _near_misses:
+        lines.append("")
+        lines.append("👀 Ближе всего к сделке (не прошли):")
+        lines.extend(_near_miss_line(nm) for nm in _near_misses)
+        _near_misses.clear()
+    elif NEAR_MISS_TOP > 0:
+        # Пустой список — это тоже факт, и он ДРУГОЙ: значит фильтр не видел
+        # ни одного лота с достоверным floor. Молчание тут прочиталось бы как
+        # «рынок рядом, просто не дотянул».
+        lines.append("")
+        lines.append("👀 Оценивать было нечего: лотов с достоверным floor "
+                     "за этот час не набралось")
 
     notify("\n".join(lines))
     return True
@@ -2632,6 +2791,7 @@ def scan_finds(snap: dict, recent_sales) -> int:
             continue
         ev = evaluate_trade(item, snap, recent_sales)
         if not ev["allowed"]:
+            note_near_miss(item, snap, ev)
             continue
         found += 1
         log.info(f"{_Color.GREEN}НАХОДКА{_Color.RESET} {_short(item['address'])} | "
@@ -3310,6 +3470,7 @@ def process_item(client: Anthropic, item: dict, snapshot: dict, recent_sales):
 
     if not ev["allowed"]:
         log.info(f"{_Color.YELLOW}SKIP (фильтр){_Color.RESET} | {ev['reason']}")
+        note_near_miss(item, snapshot, ev)
         return
 
     # Лот прошёл фильтр — печатаем расклад целиком. Одной строки «ROI 12%»
@@ -4690,6 +4851,20 @@ def _process_collection(client, collection: str, record: bool, trade: bool):
         snap = get_market_snapshot(collection)
         candidates = snap["candidates"]
         log.info(f"{_Color.BOLD}[{_short(collection)}]{_Color.RESET}")
+
+        # Арбитраж площадок считается в КАЖДОМ цикле и в любом режиме:
+        # владельцу подходит и он, а купить на второй площадке бот всё равно
+        # не умеет — значит это подсказка для рук, и попасть она должна в
+        # лог сразу, а не только в часовую сводку.
+        arb = market_arbitrage(snap)
+        if arb is not None:
+            log.info(f"{_Color.GREEN}АРБИТРАЖ{_Color.RESET} купить на "
+                     f"«{arb['buy_market']}» {arb['buy_floor']:.4f} "
+                     f"(лотов {arb['buy_n']}) → продать на "
+                     f"«{arb['sell_market']}» {arb['sell_floor']:.4f} "
+                     f"(лотов {arb['sell_n']}) → чистыми {arb['net_profit']:.4f} "
+                     f"TON, ROI {arb['roi_pct']}%"
+                     f"{'' if arb['buyable'] else ' | бот сам купить там НЕ может'}")
 
         # Пишем снапшот ДО торговых решений: запись нужна и тогда,
         # когда торговать нельзя (иначе в истории будут дыры).
