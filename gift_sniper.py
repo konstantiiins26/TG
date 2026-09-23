@@ -4135,6 +4135,41 @@ def probe(address: str):
         log.info("")
         log.info(f"{_Color.GREEN}Парсер разобрал всё. Коллекцию можно "
                  f"добавлять в TARGET_COLLECTIONS.{_Color.RESET}")
+
+    # --- ПЕРЕПИСЬ ПЛОЩАДОК ------------------------------------------------
+    # Отдельный запрос на БОЛЬШУЮ выборку. Пять предметов выше годятся, чтобы
+    # проверить парсер, но не годятся, чтобы ответить «видим ли мы лоты такой-то
+    # площадки»: выставлено единицы процентов предметов, и в пятёрке их обычно
+    # ноль. Вопрос стоит о ДОЛЕ, а не о наличии — та же ошибка, что стоила нам
+    # двукратно завышенного floor.
+    #
+    # Имена печатаются ДОСЛОВНО, как их отдаёт `sale.market.name`. Сопоставить
+    # их с тем, что владелец видит в приложении, может только он: гадать, что
+    # «MRKT» в API называется так же, значит выдумать факт.
+    log.info("")
+    log.info(f"{_Color.BOLD}--- Площадки в выборке ---{_Color.RESET}")
+    census = fetch_items_tonapi(address, limit=FLOOR_PAGE_SIZE)
+    listed = [i for i in census if i["is_on_sale"]]
+    if not listed:
+        log.warning(f"{_Color.YELLOW}В выборке {len(census)} предметов нет ни "
+                    f"одного выставленного. Вывода о площадках сделать нельзя."
+                    f"{_Color.RESET}")
+    else:
+        markets = {}
+        for it in listed:
+            markets[it.get("sale_market") or "(без имени)"] = markets.get(
+                it.get("sale_market") or "(без имени)", 0) + 1
+        log.info(f"Предметов {len(census)}, из них выставлено {len(listed)} "
+                 f"({len(listed) * 100 // max(1, len(census))}%)")
+        for name, n in sorted(markets.items(), key=lambda kv: -kv[1]):
+            allowed = (not ALLOWED_MARKETS) or name in ALLOWED_MARKETS
+            log.info(f"  {name:<32} {n:>5} лотов  "
+                     f"{'бот может купить' if allowed else 'ПОКУПКА ЗАПРЕЩЕНА'}")
+        log.info("")
+        log.warning("Площадки, которой здесь НЕТ, бот не видит вовсе — ни для "
+                    "floor, ни для арбитража, ни для --flip. Если она торгует "
+                    "не через контракт продажи в блокчейне, TonAPI её и не "
+                    "покажет, и это не чинится настройкой.")
     return not failed
 
 
