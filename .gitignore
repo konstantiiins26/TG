@@ -1,0 +1,23 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Состояние бота и записи рынка — не в репозиторий
+*.db
+*.jsonl
+
+# Состояние рантайма
+sniper_state.db
+wallet.key
+
+# Ключи пользователя. Лежат рядом с запускалкой, но в git НЕ попадают:
+# файл в репозитории, куда вписывают токен, git pull либо отказывается
+# обновлять, либо затирает — и ключ тихо пропадает.
+deploy/my-secrets.bat
+deploy/my-secrets.sh
+
+# Otchet rezhima --flip: rezultat progona, ne ishodnik
+flip-report.txt
+model_colors.json
