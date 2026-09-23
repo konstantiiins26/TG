@@ -23,9 +23,18 @@ echo  Otchet budet v: %LOG%
 echo ================================================================
 echo.
 
-echo [1/3] Tablica cvetov modeley (--colors)...
-py gift_sniper.py --colors >> "%LOG%" 2>&1
-echo       gotovo
+REM Tablicu cvetov peresobirat kazhdyy raz NE nado: spisok modeley pochti ne
+REM menyaetsya, a progon stoit 12 zaprosov i sekund 15 pri uzhe zhestkom
+REM limite TonAPI. Sobiraem tolko esli faila net. Nuzhno obnovit vruchnuyu -
+REM deploy\run.bat --colors
+if exist "%~dp0..\model_colors.json" (
+  echo [1/3] Tablica cvetov uzhe est - propuskayu
+  echo [1/3] model_colors.json uzhe sobran, shag propushchen >> "%LOG%"
+) else (
+  echo [1/3] Tablica cvetov modeley (--colors)...
+  py gift_sniper.py --colors >> "%LOG%" 2>&1
+  echo       gotovo
+)
 
 echo [2/3] Poisk lotov po modeli avtora (--flip)...
 py gift_sniper.py --flip >> "%LOG%" 2>&1
