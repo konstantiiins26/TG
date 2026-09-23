@@ -1615,6 +1615,13 @@ def get_market_snapshot(collection: str) -> dict:
     }
 
 
+# Лучшая (самая длинная) выборка по коллекции за этот прогон. Обход, который
+# вдруг стал заметно короче, — признак обрезанного ответа, а не усохшей
+# коллекции: предметы между циклами не исчезают тысячами.
+_walk_best: dict = {}
+_WALK_SHRINK_OK = Decimal("0.9")
+
+
 def _collect_sample(collection: str):
     """
     Тянет FLOOR_SAMPLE_PAGES страниц с TonAPI; при полном провале — один
@@ -1668,6 +1675,7 @@ def _collect_sample(collection: str):
     # укороченный ответ сбивает страницы с шага, и формула начала бы
     # перезапрашивать уже собранное.
     items, failures, exhausted, offset = [], 0, False, 0
+    ending, pages, last_len = "потолок страниц", 0, None
     for _page in range(FLOOR_SAMPLE_PAGES):
         try:
             batch = fetch_items_tonapi(collection, FLOOR_PAGE_SIZE, offset=offset)
@@ -1678,6 +1686,7 @@ def _collect_sample(collection: str):
             log.error(f"{_Color.RED}Лимит TonAPI на странице "
                       f"{_page + 1}/{FLOOR_SAMPLE_PAGES}. Остальные страницы "
                       f"пропускаю. {e}{_Color.RESET}")
+            ending = "упёрлись в квоту"
             break
         except Exception as e:  # noqa: BLE001 — страница могла не прийти, это не фатально
             failures += 1
@@ -1694,10 +1703,13 @@ def _collect_sample(collection: str):
                      f"offset={offset}. Это НЕ доказывает конец коллекции "
                      f"(так же выглядит потолок смещения TonAPI), покрытие "
                      f"останется неподтверждённым.{_Color.RESET}")
+            ending = f"пустая страница на offset={offset}"
             break
 
         items.extend(batch)
         offset += len(batch)
+        pages += 1
+        last_len = len(batch)
 
         if len(batch) < FLOOR_PAGE_SIZE:
             # Похоже на конец. Проверяем ещё одним запросом: укороченный
@@ -1708,6 +1720,7 @@ def _collect_sample(collection: str):
             except Exception as e:  # noqa: BLE001
                 log.warning(f"Проверка конца коллекции не удалась ({e}). "
                             f"Покрытие считаю неподтверждённым.")
+                ending = "проверка конца не удалась"
                 break
             if tail:
                 # Неполная страница была обрезкой, а не концом.
@@ -1716,14 +1729,40 @@ def _collect_sample(collection: str):
                             f"ещё есть предметы — это обрезка ответа, не конец.")
                 items.extend(tail)
                 offset += len(tail)
+                pages += 1
+                last_len = len(tail)
                 continue
             exhausted = True
+            ending = f"неполная страница {len(batch)}/{FLOOR_PAGE_SIZE}, за ней пусто"
             break
 
     if items:
         if failures:
             log.warning(f"Выборка неполная: {failures} страниц потеряно. Floor менее точен.")
             exhausted = False     # дыра в середине — конец не доказан
+            ending = f"{failures} страниц потеряно"
+
+        # СКОЛЬКО ПРЕДМЕТОВ МЫ УВИДЕЛИ — и чем обход кончился. Без этой строки
+        # нельзя отличить «коллекция маленькая» от «ответ обрезали»: в логе
+        # стояло только число ВЫСТАВЛЕННЫХ лотов, а оно зависит и от размера
+        # выборки, и от доли выставленных сразу.
+        log.info(f"{_Color.GREY}{_short(collection)}: обход {pages} стр, "
+                 f"{len(items)} предметов, конец: {ending}{_Color.RESET}")
+
+        # ОБХОД, КОТОРЫЙ ВДРУГ СТАЛ КОРОЧЕ, — ЭТО ОБРЕЗКА, А НЕ УСОХШАЯ
+        # КОЛЛЕКЦИЯ. Коллекция не теряет десятую часть предметов между
+        # циклами. Поэтому держим лучший результат за прогон и, если этот
+        # обход заметно короче, конец НЕ считаем доказанным.
+        best = _walk_best.get(collection, 0)
+        if len(items) > best:
+            _walk_best[collection] = len(items)
+        elif best and len(items) < best * _WALK_SHRINK_OK:
+            log.warning(
+                f"{_Color.YELLOW}{_short(collection)}: обход дал "
+                f"{len(items)} предметов против {best} в лучшем за прогон. "
+                f"Коллекция столько не теряет — значит ответ обрезан. "
+                f"Конец НЕ считаю доказанным.{_Color.RESET}")
+            exhausted = False
         return items, "TonAPI", exhausted
 
     # --- Полный провал TonAPI: пробуем Getgems -----------------------------
@@ -1822,6 +1861,13 @@ def market_arbitrage(snap: dict):
     mf = snap.get("market_floors") or {}
     usable = {}
     for name, info in mf.items():
+        # Безымянная корзина в выбор НЕ участвует — ни как «где купить», ни
+        # как «где продать». Совет «выставить на «(площадка неизвестна)»»
+        # невозможно выполнить. Это тот же баг, что был в
+        # `_best_sell_market()` 23.09.2026; здесь он остался незамеченным,
+        # потому что чинили одно место, а корзина попадает в ДВА.
+        if name == _UNKNOWN_MARKET:
+            continue
         floor = info.get("floor")
         if floor is None or int(info.get("n") or 0) < MIN_MARKET_SAMPLE:
             continue

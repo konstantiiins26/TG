@@ -4196,6 +4196,83 @@ try:
 finally:
     gs.DB_PATH = _ob61
 
+
+# =============================================================================
+# [62] ОБХОД, СТАВШИЙ КОРОЧЕ, — ЭТО ОБРЕЗКА; АРБИТРАЖ БЕЗ БЕЗЫМЯННОЙ ПЛОЩАДКИ
+# =============================================================================
+# Живой лог 23.09.2026, 22:03. Два наблюдения в одном экране:
+#   1) «АРБИТРАЖ ... продать на «(площадка неизвестна)» 8.2000 (лотов 5)» —
+#      совет, который невозможно выполнить. `_best_sell_market()` чинили
+#      23.09, но корзина попадает в ДВА места, а поправили одно.
+#   2) exhausted=True при 12 лотах Leonardo, хотя на витрине их около 38.
+#      Отказов 429 при этом НОЛЬ, то есть обход рвётся не лимитом.
+print("\n[62] Короткий обход = обрезка; безымянная площадка вне арбитража")
+
+_mf62 = {
+    "Getgems Sales": {"n": 766, "floor": Decimal("4.99")},
+    gs._UNKNOWN_MARKET: {"n": 5, "floor": Decimal("8.20")},
+}
+_arb62 = gs.market_arbitrage({"market_floors": _mf62})
+# Двух НАЗВАННЫХ площадок нет, значит сравнивать не с чем — и выдумывать
+# направление нельзя.
+check("безымянная площадка не даёт пары для арбитража", _arb62 is None, _arb62)
+
+# Разрыв берём заведомо прибыльный: на узком газ 0.15 съедает всё, и тест
+# доказывал бы не то (пары нет из-за экономики, а не из-за безымянной).
+_mf62b = dict(_mf62, **{"Marketapp Marketplace": {"n": 45, "floor": Decimal("6.95")}})
+_arb62b = gs.market_arbitrage({"market_floors": _mf62b})
+check("пара из двух названных площадок считается", _arb62b is not None)
+if _arb62b:
+    check("безымянная не стала «где продать»",
+          _arb62b["sell_market"] != gs._UNKNOWN_MARKET, _arb62b["sell_market"])
+    check("безымянная не стала «где купить»",
+          _arb62b["buy_market"] != gs._UNKNOWN_MARKET, _arb62b["buy_market"])
+
+# --- обход, который вдруг стал короче --------------------------------
+_ofetch62 = gs.fetch_items_tonapi
+_opages62 = gs.FLOOR_SAMPLE_PAGES
+_obest62 = dict(gs._walk_best)
+gs.FLOOR_SAMPLE_PAGES = 40
+gs._walk_best.clear()
+try:
+    _part62 = max(1, gs.FLOOR_PAGE_SIZE // 4)
+    _full62 = {"n": 3}
+
+    def _long(collection, limit, offset=0):
+        if offset < 3 * limit:
+            return [{"i": offset}] * limit
+        return [{"i": offset}] * _part62 if offset == 3 * limit else []
+
+    gs.fetch_items_tonapi = _long
+    _it, _s, _exh = gs._collect_sample("0:test62")
+    check("длинный обход с неполной страницей засчитан", _exh is True)
+    _long_len = len(_it)
+
+    # Тот же адрес, но ответ обрезан вчетверо. Коллекция столько предметов
+    # между циклами не теряет — значит обрезали ответ, и «конец» не доказан.
+    def _short(collection, limit, offset=0):
+        return [{"i": offset}] * _part62 if offset == 0 else []
+
+    gs.fetch_items_tonapi = _short
+    _it2, _s2, _exh2 = gs._collect_sample("0:test62")
+    check("внезапно короткий обход НЕ считается полным", _exh2 is False,
+          f"собрано {len(_it2)} против {_long_len}")
+    check("собранное при этом не выбрасывается", len(_it2) == _part62, len(_it2))
+
+    # А для НОВОЙ коллекции сравнивать не с чем — первый обход принимается
+    # как есть, иначе наблюдение не заработало бы никогда.
+    gs.fetch_items_tonapi = _short
+    _it3, _s3, _exh3 = gs._collect_sample("0:test62_new")
+    check("первый обход новой коллекции принимается", _exh3 is True)
+finally:
+    gs.fetch_items_tonapi = _ofetch62
+    gs.FLOOR_SAMPLE_PAGES = _opages62
+    gs._walk_best.clear()
+    gs._walk_best.update(_obest62)
+
+_src62 = open("gift_sniper.py", encoding="utf-8").read()
+check("в лог печатается, ЧЕМ кончился обход", "конец:" in _src62)
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:
