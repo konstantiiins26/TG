@@ -191,6 +191,12 @@ FLOOR_CACHE_TTL_SEC = int(os.getenv("FLOOR_CACHE_TTL_SEC", "60"))         # кэ
 # между запросами и ретраим 429 с нарастающим ожиданием — потерянная
 # страница молча прореживает выборку, а floor по тонкой выборке завышается.
 TONAPI_MIN_INTERVAL = Decimal(os.getenv("TONAPI_MIN_INTERVAL", "1.1"))    # секунд между запросами к TonAPI
+# Счётчики ЗА ЦИКЛ, не за сутки. Нужны, чтобы решение «платить за тариф или
+# замедлиться» принималось по измерению, а не по догадке: 1.1с между
+# запросами это 0.91 запроса в секунду, и если потолок тарифа около 1 rps,
+# мы идём впритык — любой скачок даёт 429. Видно это только по счётчику.
+_cycle_requests = 0
+_cycle_429 = 0
 TONAPI_MAX_RETRIES  = int(os.getenv("TONAPI_MAX_RETRIES", "3"))           # попыток на страницу при 429
 
 # СУТОЧНЫЙ БЮДЖЕТ ЗАПРОСОВ. Квота у TonAPI дневная, и её легко сжечь за часы:
@@ -669,6 +675,8 @@ def _count_tonapi_request():
     if _tonapi_budget_day != today:
         _tonapi_budget_day, _tonapi_used_today = today, 0
     _tonapi_used_today += 1
+    global _cycle_requests
+    _cycle_requests += 1
     if _tonapi_used_today % _BUDGET_FLUSH_EVERY == 0:
         budget_flush()
 
@@ -889,6 +897,8 @@ def _tonapi_get(url: str, params: dict, headers: dict) -> dict:
             except ValueError:
                 pause = delay * (2 ** (attempt + 1))
             pause = min(pause, 30.0)
+            global _cycle_429
+            _cycle_429 += 1
             log.warning(f"TonAPI: 429, жду {pause:.1f}с и повторяю "
                         f"(попытка {attempt + 2}/{TONAPI_MAX_RETRIES}).")
             time.sleep(pause)
@@ -5840,7 +5850,24 @@ def main(record: bool = False, trade: bool = True):
                      f"Интервал растянут до {interval:.0f}с, чтобы хватило "
                      f"до полуночи UTC.{_Color.RESET}")
         sleep_for = max(0, interval - elapsed)
-        log.info(f"{_Color.GREY}Итерация заняла {elapsed:.1f}s. Сплю {sleep_for:.1f}s...{_Color.RESET}")
+        global _cycle_requests, _cycle_429
+        rate = _cycle_requests / elapsed if elapsed > 0 else 0
+        share = _cycle_429 * 100 // max(1, _cycle_requests)
+        log.info(f"{_Color.GREY}Итерация заняла {elapsed:.1f}s | запросов "
+                 f"{_cycle_requests} ({rate:.2f}/с) | отказов 429: "
+                 f"{_cycle_429} ({share}%). Сплю {sleep_for:.1f}s..."
+                 f"{_Color.RESET}")
+        # Совет по ИЗМЕРЕНИЮ, а не по догадке: пока доля отказов высока,
+        # платить за тариф рано — сначала проверить, снимается ли она
+        # паузой. Обратное тоже верно: отказов нет, а обходы всё равно
+        # рвутся — дело не в частоте.
+        if _cycle_429 and share >= 10:
+            log.warning(f"{_Color.YELLOW}Каждый {max(1, 100 // share)}-й "
+                        f"запрос упёрся в лимит. Прежде чем платить за тариф, "
+                        f"попробуйте паузу побольше: "
+                        f"set TONAPI_MIN_INTERVAL={TONAPI_MIN_INTERVAL + Decimal('0.5')}"
+                        f"{_Color.RESET}")
+        _cycle_requests, _cycle_429 = 0, 0
         time.sleep(sleep_for)
 
 
