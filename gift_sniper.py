@@ -1445,7 +1445,7 @@ _floor_cache = {}
 def _empty_snapshot(source="none"):
     """Пустой снапшот — чтобы вызывающий код не разбирал особые случаи."""
     return {"collection": "", "candidates": [], "on_sale": [],
-            "floor": Decimal("0"), "cheapest": Decimal("0"),
+            "floor": Decimal("0"), "cheapest": Decimal("0"), "exhausted": False,
             "sample_size": 0, "source": source, "trait_index": {}, "trait_total": 0,
             "competition": 0, "floor_reliable": False,
             "collection_size": None, "coverage_pct": None}
@@ -1503,6 +1503,8 @@ def get_market_snapshot(collection: str) -> dict:
     if exhausted:
         coll_size = len(all_items)
         coverage = Decimal("100.0")
+        # флаг нужен отдельно от покрытия: по нему решается, можно ли вообще
+        # утверждать что-то про САМЫЙ ДЕШЁВЫЙ лот сегмента (см. ниже)
     else:
         coll_size = fetch_collection_size(cache_key)
         coverage = None
@@ -1549,6 +1551,10 @@ def get_market_snapshot(collection: str) -> dict:
         # и числа законно расходятся. Владелец сверяет наши цифры с экраном,
         # поэтому обе обязаны быть рядом, иначе выглядит как ошибка бота.
         "cheapest": prices[0] if prices else Decimal("0"),
+        # Дошёл ли обход до КОНЦА коллекции. Оборванный лимитом обход даёт
+        # выборку «первые N страниц по индексу» — это не случайная выборка, и
+        # самый дешёвый лот сегмента в неё мог просто не попасть.
+        "exhausted": exhausted,
         "sample_size": sample_size,
         "source": source,
         "trait_index": trait_index,
@@ -2110,6 +2116,10 @@ SEGMENT_SEEN_TTL_SEC = int(os.getenv("SEGMENT_SEEN_TTL_SEC", "21600"))
 _segment_seen: dict = {}
 _segment_sent_ts: list = []
 _segment_suppressed = 0
+# Сколько коллекций за период пропущено из-за ОБОРВАННОГО обхода. Молчание,
+# причина которого не названа, неотличимо от поломки — тот же довод, что у
+# «находок не было» против «тихо не отправили».
+_segment_truncated = 0
 
 
 def _segment_already_seen(item: dict, seg_floor: Decimal) -> bool:
@@ -2281,6 +2291,29 @@ def find_segment_bargains(snap: dict):
     """
     if not snap.get("floor_reliable"):
         return []
+
+    # ОБХОД ОБЯЗАН БЫТЬ ПОЛНЫМ. Живой прогон 23.09.2026, Pool Floats #141416:
+    # бот объявил «следующий Leonardo стоит 14.00», а на витрине их четыре по
+    # 5.00 и ещё десяток по 6-8. Функция считала верно — НЕВЕРНА БЫЛА ВЫБОРКА:
+    # обход оборвался на лимите TonAPI, и в наши 12 лотов Leonardo дешёвые
+    # просто не попали.
+    #
+    # Утверждение «это самый дешёвый конкурент» — про ВСЮ витрину, а не про
+    # нашу выборку. По куску коллекции его сделать нельзя: оборванный обход
+    # даёт первые N страниц ПО ИНДЕКСУ, а не случайный срез, и ошибка идёт
+    # в сторону ЗАВЫШЕНИЯ конкурентной цены, то есть выдуманной прибыли.
+    #
+    # Четвёртый раз за проект вывод делается по выборке, полноту которой
+    # никто не проверил. Здесь проверка стоит ДО вывода, а не после жалобы.
+    if not snap.get("exhausted"):
+        global _segment_truncated
+        _segment_truncated += 1
+        log.info(f"{_Color.GREY}Наблюдение по сегменту пропущено: обход "
+                 f"коллекции не дошёл до конца (лимит TonAPI или слишком "
+                 f"большая коллекция). Сравнивать с конкурентами по куску "
+                 f"витрины нельзя.{_Color.RESET}")
+        return []
+
     out = []
     for item in snap.get("on_sale", []):
         if not is_collection_trusted(item.get("collection_address", "")):
@@ -3384,7 +3417,7 @@ def notify_heartbeat(snapshots: list, force: bool = False):
         lines.append(f"Банк: {available_bankroll()} TON свободно, "
                      f"позиций {open_positions_count()}")
 
-    global _finds_suppressed, _segment_suppressed
+    global _finds_suppressed, _segment_suppressed, _segment_truncated
     if _finds_suppressed:
         lines.append(f"Находок не отправлено из-за лимита: {_finds_suppressed}")
         _finds_suppressed = 0
@@ -3392,6 +3425,11 @@ def notify_heartbeat(snapshots: list, force: bool = False):
         lines.append(f"«Дешевле своих» не отправлено из-за лимита: "
                      f"{_segment_suppressed}")
         _segment_suppressed = 0
+    if _segment_truncated:
+        lines.append(f"⚠️ коллекций без сравнения с конкурентами: "
+                     f"{_segment_truncated} — обход не дошёл до конца "
+                     f"(лимит TonAPI)")
+        _segment_truncated = 0
 
     # Арбитраж между площадками: владельцу подходит и он, а общий floor
     # разницу между площадками УСРЕДНЯЕТ, то есть в обычных строках выше её
