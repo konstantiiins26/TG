@@ -1896,6 +1896,12 @@ def score_flip(item: dict, snap: dict, model_colors=None):
 
     out = {"address": item.get("address", ""), "price_ton": price,
            "mint": item.get("mint_index"), "ref_floor": ref_floor,
+           # ОБА пола по отдельности. Модель автора смотрит на floor СЕГМЕНТА
+           # («дёшев ли лот среди своей модели»), наша — на min(коллекция,
+           # сегмент). Когда floor коллекции ниже, min() стирает сегментную
+           # скидку целиком, и лот, дешёвый в своём сегменте, наша модель
+           # видит как обычный. Без обоих чисел это расхождение необъяснимо.
+           "floor_collection": floor_coll, "floor_segment": f_model,
            "floor_source": "модели" if f_model is not None else "коллекции",
            "peer_n": peer_n, "decision": "SKIP", "total": 0,
            "scores": {}, "missing": [], "reason": "", "confidence": "high",
@@ -2094,6 +2100,15 @@ def flip_report(limit: int = 10):
             if res["decision"] == "SKIP":
                 continue
             res["collection"] = snap.get("collection", collection)
+            # ЧТО СКАЗАЛА БЫ НАША МОДЕЛЬ ПРО ЭТОТ ЖЕ ЛОТ. Вызывается
+            # evaluate_trade() — та же функция, что принимает решения в
+            # торговле, а не её копия. Иначе отчёт объяснял бы поведение
+            # кода, которого нет.
+            ev = evaluate_trade(item, snap, None)
+            res["ours_ok"] = ev["allowed"]
+            res["ours_reason"] = ev["reason"]
+            res["ours_roi"] = ev["roi_pct"]
+            res["eff_floor"] = ev["eff_floor"]
             rows.append(res)
 
     if not rows:
@@ -2112,6 +2127,15 @@ def flip_report(limit: int = 10):
                  f"{r['target_ton']:>8.2f} {r['net_profit_ton']:>9.4f}  "
                  f"#{r['mint']} / {r['traits'].get('backdrop', '?')}")
         over = r.get("target_over_floor_pct")
+        fc = r.get("floor_collection")
+        fs = r.get("floor_segment")
+        log.info(f"         {_Color.GREY}floor коллекции "
+                 f"{fc if fc else '—'} | floor сегмента "
+                 f"{fs if fs is not None else 'нет данных'} | "
+                 f"наша оценка по {r.get('eff_floor')}{_Color.RESET}")
+        ours = (f"{_Color.GREEN}НАША МОДЕЛЬ: ДА{_Color.RESET}" if r.get("ours_ok")
+                else f"{_Color.YELLOW}наша модель: нет{_Color.RESET}")
+        log.info(f"         {ours} ({r.get('ours_reason')})")
         log.info(f"         {_Color.GREY}{r['reason']} | цель на {over}% выше "
                  f"floor {r['floor_source']} | {r['market']} | "
                  f"{GIFT_URL_TEMPLATE.format(address=friendly_ton_address(r['address']))}"
@@ -2137,6 +2161,21 @@ def flip_report(limit: int = 10):
                 f"сегмента. Чем МЕНЬШЕ колонка «цель выше floor», тем "
                 f"обычнее нужная сделка — и меньше всего она у лотов, "
                 f"купленных НИЖЕ floor.")
+    # СКОЛЬКО ЛОТОВ РАЗОШЛИСЬ. Это главный вывод отчёта: он показывает не
+    # «кто прав», а ГДЕ проходит граница между двумя моделями на живом рынке.
+    both = sum(1 for r in rows if r.get("ours_ok"))
+    only_flip = len(rows) - both
+    log.info("")
+    log.info(f"Из {len(rows)} кандидатов автора наша модель одобряет {both}, "
+             f"отклоняет {only_flip}.")
+    if only_flip:
+        log.warning("Расхождение объясняется одним местом: мы оцениваем лот по "
+                    "min(floor коллекции, floor сегмента). Когда floor "
+                    "коллекции НИЖЕ, минимум стирает сегментную скидку, и лот, "
+                    "дешёвый среди СВОЕЙ модели, мы видим как обычный. Это "
+                    "решение осознанное (оценка никогда не растёт), но платим "
+                    "за него именно этим классом сделок.")
+
     miss = sorted({m for r in rows for m in r["missing"]})
     if miss:
         log.warning("Чего в данных НЕТ (в баллах не участвует): " + "; ".join(miss))

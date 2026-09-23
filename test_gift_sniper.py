@@ -3548,6 +3548,40 @@ check("поле считается и при покупке ровно на floo
                           "trait_index": {}, "trait_total": 0},
                     None)["target_over_floor_pct"] > 0)
 
+# РАСХОЖДЕНИЕ ДВУХ МОДЕЛЕЙ — не мнение, а арифметика min(). Лот, дешёвый
+# в СВОЁМ сегменте, наша модель видит как обычный, если floor коллекции ниже.
+# Это и есть ответ на «почему --flip его нашёл, а торговля нет».
+_seg = {"floor": Decimal("5.00"),                       # floor КОЛЛЕКЦИИ ниже
+        "peer_prices": {"Sapphire": [Decimal("9.39")] * 6},
+        "trait_index": {}, "trait_total": 0, "floor_reliable": True,
+        "competition": 0}
+_lot = {"address": "0:s", "sale_price_ton": Decimal("6.99"), "mint_index": 46400,
+        "traits": {"model": "Sapphire", "backdrop": "Sapphire"},
+        "sale_market": "Getgems Sales", "explicit_rarity_pct": None}
+_ev_seg = gs.evaluate_trade(_lot, _seg, None)
+check("floor коллекции ниже -> оцениваем по нему, лот отклонён",
+      _ev_seg["eff_floor"] == Decimal("5.00") and _ev_seg["allowed"] is False,
+      (_ev_seg["eff_floor"], _ev_seg["reason"]))
+
+# Тот же лот, но floor коллекции ВЫШЕ сегментного: минимум берёт сегмент,
+# и сделка проходит. Без этой половины тест доказывал бы лишь, что мы всегда
+# против.
+_seg2 = dict(_seg, floor=Decimal("12.00"))
+_ev2 = gs.evaluate_trade(_lot, _seg2, None)
+check("floor коллекции выше -> оцениваем по сегменту, лот проходит",
+      _ev2["eff_floor"] == Decimal("9.39") and _ev2["allowed"] is True,
+      (_ev2["eff_floor"], _ev2["reason"]))
+
+# Отчёт обязан вызывать ЕЁ ЖЕ, а не копию логики: иначе он объяснял бы
+# поведение кода, которого нет.
+_src_flip = open("gift_sniper.py", encoding="utf-8").read()
+_fr = _src_flip[_src_flip.index("def flip_report("):]
+_fr = _fr[:_fr.index("\ndef ")]
+check("отчёт прогоняет саму evaluate_trade(), а не пересказ",
+      "evaluate_trade(item, snap, None)" in _fr)
+check("отчёт печатает ОБА floor",
+      "floor коллекции" in _fr and "floor сегмента" in _fr)
+
 # ПОЛЯ ПРОДАЖИ ПРОВЕРЯЮТСЯ ТОЛЬКО ПО ВЫСТАВЛЕННЫМ ЛОТАМ. Живой прогон
 # 23.09.2026 дал «цена продажи 0/5 НЕ РАЗОБРАНО» на коллекции, где сам же
 # probe десятью строками ниже насчитал 123 выставленных лота из 1000:
