@@ -191,4 +191,35 @@ REM Ryadom bot vsegda daet ssylku na obozrevatel i sam adres lota.
 set GIFT_URL_TEMPLATE=https://getgems.io/nft/{address}
 set EXPLORER_URL_TEMPLATE=https://tonviewer.com/{address}
 
+REM --- Rezhim --flip: model avtora video (monohrom + krasivyy nomer) ---
+REM ETO CHUZHAYA MODEL i ona NE upravlyaet torgovley. U nee DRUGOY VYHOD:
+REM pokupka NA floor (i do +20% vyshe), prodazha x1.5 s holdom do 48ch.
+REM Nasha model pokupaet TOLKO NIZHE floor. Smeshivat ih nelzya, poetomu
+REM --flip - eto otchet dlya ruk, a ne signal k pokupke.
+REM
+REM Porog bezubytochnosti poschitan: model okupaetsya, esli po x1.5 uhodit
+REM primerno KAZHDYY CHETVERTYY lot. Eta dolya NE IZMERENA.
+REM
+REM Byudzhet 7 - iz video u avtora. U vas bank bolshe, mozhno podnyat.
+set FLIP_BUDGET_TON=7
+
+REM Maksimalnaya pereplata nad floor. 0.20 = +20%, vyshe - SKIP "zavisnet".
+set FLIP_MAX_PREMIUM=0.20
+
+REM Ballov dlya BUY i dlya WATCH. Sam avtor svoy porog ne vyderzhivaet:
+REM ego primer #16630 nabiraet menshe 70. Snizte do 65 - uvidite bolshe,
+REM no i musora bolshe.
+set FLIP_BUY_SCORE=70
+set FLIP_WATCH_SCORE=50
+
+REM Vo skolko raz vystavlyat otnositelno ceny pokupki.
+set FLIP_TARGET_MULT=1.5
+
+REM Tablica "model -> cvet" dlya monohroma. Cveta modeli v API NET.
+REM Sobrat spisok modeley bot mozhet sam:  deploy\run.bat --colors
+REM Tam, gde cvet nazvan v imeni modeli (Cocoa Bear), on prostavlyaetsya
+REM avtomaticheski. Ostalnoe - odno slovo rukami, glyadya na kartinku.
+REM Zapolnennoe vami povtornyy zapusk NE zatret.
+set FLIP_MODEL_COLORS=model_colors.json
+
 REM Konec nastroek. Zapusk - v run.bat ili start-windows.bat.

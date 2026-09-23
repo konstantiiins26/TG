@@ -3447,23 +3447,43 @@ check("6.00 -> 5.87", gs.flip_uneven_price(Decimal("6.00")) == Decimal("5.87"))
 check("9.00 -> 8.87", gs.flip_uneven_price(Decimal("9.00")) == Decimal("8.87"))
 check("11.00 -> 10.9", gs.flip_uneven_price(Decimal("11.00")) == Decimal("10.9"))
 
+# --- цветовой словарь: «не знаю» НЕ равно «цвет другой» ---
+check("оникс — это чёрный", gs.color_of("Onyx Black") == "black")
+check("какао — это коричневый", gs.color_of("Cocoa Bear") == "brown")
+check("в названии без цвета цвета НЕТ (None, а не 'чёрный')",
+      gs.color_of("Plush Pepe") is None)
+
 # --- монохром: «не знаю» НЕ равно «монохрома нет» ---
 _it54 = {"address": "0:aa", "sale_price_ton": Decimal("3.9"), "mint_index": 22969,
-         "traits": {"model": "Cocoa Bear", "backdrop": "Onyx Black"},
+         "traits": {"model": "Plush Pepe", "backdrop": "Onyx Black"},
          "sale_market": "Getgems Sales", "explicit_rarity_pct": None}
 _m54, _known54 = gs.flip_mono_score(_it54, None)
-check("без таблицы цветов монохром НЕ посчитан",
+check("цвет модели неизвестен -> монохром НЕ посчитан",
       _m54 == 0 and _known54 is False)
-_m54b, _known54b = gs.flip_mono_score(_it54, {"cocoa bear": "black"})
-check("цвет модели совпал с фоном -> монохром есть",
-      _m54b > 0 and _known54b is True, (_m54b, _known54b))
-_m54c, _ = gs.flip_mono_score(_it54, {"cocoa bear": "green"})
+_m54b, _known54b = gs.flip_mono_score(_it54, {"plush pepe": "black"})
+check("таблица дала цвет, он совпал с фоном -> монохром есть",
+      _m54b == 40 and _known54b is True, (_m54b, _known54b))
+_m54c, _ = gs.flip_mono_score(_it54, {"plush pepe": "green"})
 check("зелёная модель на чёрном фоне -> 0", _m54c == 0)
+
+# Без таблицы, но цвет назван в САМОМ имени модели — считается. Ради этого
+# словарь и заведён: иначе ручная таблица требовалась бы на каждую модель.
+_named = {"traits": {"model": "Cocoa Bear", "backdrop": "Chocolate Brown"}}
+check("цвет из имени модели: коричневое на коричневом -> 40",
+      gs.flip_mono_score(_named, None) == (40, True),
+      gs.flip_mono_score(_named, None))
+check("цвет из имени модели: коричневое на синем -> 0, но ПОСЧИТАНО",
+      gs.flip_mono_score(
+          {"traits": {"model": "Cocoa Bear", "backdrop": "Sky Blue"}},
+          None) == (0, True))
+# Таблица СИЛЬНЕЕ словаря: она заполняется по картинке, словарь угадывает.
+check("таблица перебивает цвет из имени",
+      gs.flip_mono_score(_named, {"cocoa bear": "blue"}) == (0, True))
 
 # --- score_flip целиком ---
 _snap54 = {"floor": Decimal("3.6"), "peer_prices": {}, "trait_index": {},
            "trait_total": 0, "collection": "0:c"}
-_r54 = gs.score_flip(_it54, _snap54, {"cocoa bear": "black"})
+_r54 = gs.score_flip(_it54, _snap54, {"plush pepe": "black"})
 check("монохром + номер + Onyx Black -> BUY",
       _r54["decision"] == "BUY", (_r54["decision"], _r54["total"]))
 check("цель — неровная цена от x1.5",
@@ -3475,7 +3495,7 @@ check("цель — неровная цена от x1.5",
 # НИЖЕ floor), поэтому проверяется отдельно.
 _over = dict(_it54, sale_price_ton=Decimal("8.0"))
 check("переплата над floor -> SKIP",
-      gs.score_flip(_over, _snap54, {"cocoa bear": "black"})["decision"] == "SKIP")
+      gs.score_flip(_over, _snap54, {"plush pepe": "black"})["decision"] == "SKIP")
 _rich = dict(_it54, sale_price_ton=Decimal("9.0"))
 check("дороже бюджета -> SKIP",
       "бюджета" in gs.score_flip(_rich, _snap54, None)["reason"])
@@ -3487,6 +3507,18 @@ check("отсутствие цвета модели названо в missing",
 check("без монохрома доверие понижено", _r54b["confidence"] == "low")
 check("сторона bid названа отсутствующей",
       any("bid" in m for m in _r54b["missing"]))
+
+# --- шаблон таблицы цветов ---
+# Собрать список моделей бот может сам, а цвета — нет. Значит заполненное
+# руками обязано пережить повторный запуск: затереть его автоподстановкой
+# значило бы выбросить единственные настоящие данные в файле.
+_src_colors = open("gift_sniper.py", encoding="utf-8").read()
+_bct = _src_colors[_src_colors.index("def build_colors_template("):]
+_bct = _bct[:_bct.index("\ndef ")]
+check("шаблон не перезаписывает заполненное владельцем",
+      "if prev:" in _bct and "table[name] = prev" in _bct)
+check("незаполненное — пустая строка, а не выдуманный цвет",
+      'table[name] = ""' in _bct)
 
 # ГЛАВНОЕ: чужая модель НЕ управляет торговлей. evaluate_trade() про неё не
 # знает, иначе бот начал бы покупать ВЫШЕ floor на непроверенном основании.

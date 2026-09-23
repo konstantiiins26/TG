@@ -1713,9 +1713,51 @@ FLIP_TARGET_MULT   = Decimal(os.getenv("FLIP_TARGET_MULT", "1.5"))
 # Фоны, за которые, по модели автора, платят. Остальные стоят одинаково дёшево.
 FLIP_GOOD_BACKDROPS = {"black": 15, "onyx black": 12}
 # Таблица «модель -> цвет» для монохрома. В API цвета модели НЕТ, и это
-# главный признак автора — без таблицы он не считается ВООБЩЕ, а не считается
+# главный признак автора — без цвета он не считается ВООБЩЕ, а не считается
 # нулём: ноль означал бы «монохрома нет», а правда — «мы не знаем».
 FLIP_MODEL_COLORS_PATH = os.getenv("FLIP_MODEL_COLORS", "model_colors.json")
+
+# Цветовые СЛОВА и их канонический цвет. Нужны, чтобы не требовать ручную
+# таблицу там, где цвет назван прямо в имени: «Onyx Black» -> чёрный,
+# «Cocoa Bear» -> коричневый. Это ЛЕКСИЧЕСКАЯ догадка, а не измерение цвета
+# картинки, поэтому таблица владельца всегда сильнее словаря.
+#
+# Синонимы взяты узкие и очевидные (оникс — чёрный камень, какао —
+# коричневое). Широкие натяжки сюда класть нельзя: ошибка здесь превращается
+# в «монохром есть» там, где его нет, а это прямо завышает балл лота.
+_COLOR_WORDS = {
+    "black": ("black", "onyx", "obsidian", "ebony", "midnight", "ink", "coal"),
+    "white": ("white", "ivory", "pearl", "snow", "cream"),
+    "grey":  ("grey", "gray", "silver", "steel", "ash", "platinum"),
+    "brown": ("brown", "cocoa", "chocolate", "coffee", "caramel", "bronze",
+              "copper", "tan", "mocha", "chestnut", "mahogany", "cinnamon"),
+    "red":   ("red", "crimson", "ruby", "scarlet", "burgundy", "cherry", "wine"),
+    "pink":  ("pink", "rose", "roseate", "magenta", "fuchsia", "blush"),
+    "orange": ("orange", "amber", "apricot", "peach", "tangerine", "rust", "coral"),
+    "yellow": ("yellow", "gold", "golden", "lemon", "honey", "mustard", "sand"),
+    "green": ("green", "emerald", "mint", "lime", "olive", "jade", "forest", "sage"),
+    "blue":  ("blue", "azure", "navy", "sapphire", "sky", "cobalt", "cyan"),
+    "teal":  ("teal", "turquoise", "aqua"),
+    "purple": ("purple", "violet", "lavender", "lilac", "plum", "amethyst",
+               "indigo", "orchid"),
+}
+_WORD_TO_COLOR = {w: c for c, words in _COLOR_WORDS.items() for w in words}
+
+
+def color_of(text: str):
+    """
+    Канонический цвет по СЛОВАМ строки, или None.
+
+    None означает «в названии цвета нет» — и это не то же самое, что «цвет
+    другой». Различать обязательно: на этом стоит вся честность монохрома.
+    """
+    if not text:
+        return None
+    for word in re.split(r"[^a-z]+", str(text).strip().lower()):
+        color = _WORD_TO_COLOR.get(word)
+        if color:
+            return color
+    return None
 
 
 def flip_number_score(mint_index) -> int:
@@ -1774,29 +1816,30 @@ def flip_mono_score(item: dict, model_colors):
     """
     Баллы за монохром (0-40) и признак «посчитано ли вообще».
 
+    Цвет модели берётся В ДВА ХОДА: сначала таблица владельца, потом слова
+    самого названия («Cocoa Bear» -> коричневый). Таблица сильнее словаря:
+    она заполняется по картинке, а словарь только угадывает по имени.
+
     Возвращает (score, known). `known = False` означает, что цвет модели
-    неизвестен — и тогда скоринг НЕ штрафует лот нулём, а честно понижает
-    доверие. Это главный признак автора, и выдавать «монохрома нет» там, где
-    мы просто не смотрели, значит отбрасывать ровно те лоты, ради которых
-    модель и нужна.
+    определить не удалось — и тогда скоринг НЕ штрафует лот нулём, а честно
+    понижает доверие. Это главный признак автора, и выдавать «монохрома нет»
+    там, где мы просто не смотрели, значит отбрасывать ровно те лоты, ради
+    которых модель и нужна.
     """
     traits = item.get("traits") or {}
-    backdrop = str(traits.get("backdrop", "")).strip().lower()
-    model = str(traits.get("model", "")).strip().lower()
-    if not backdrop or not model or not model_colors:
+    backdrop = str(traits.get("backdrop", "")).strip()
+    model = str(traits.get("model", "")).strip()
+    if not backdrop or not model:
         return 0, False
-    mcolor = model_colors.get(model)
-    if not mcolor:
+
+    table_value = (model_colors or {}).get(model.lower())
+    m_color = color_of(table_value) or (color_of(model) if not table_value else None)
+    if m_color is None and not table_value:
+        m_color = color_of(model)
+    b_color = color_of(backdrop)
+    if m_color is None or b_color is None:
         return 0, False
-    # Сравниваем ЦВЕТОВЫЕ СЛОВА, а не оттенки: hex модели у нас нет, и
-    # притворяться, что есть, хуже, чем признать грубость сравнения.
-    bwords = set(re.split(r"[^a-z]+", backdrop)) - {""}
-    mwords = set(re.split(r"[^a-z]+", mcolor)) - {""}
-    if not bwords or not mwords:
-        return 0, False
-    if mwords & bwords:
-        return (40 if mwords == bwords else 25), True
-    return 0, True
+    return (40 if m_color == b_color else 0), True
 
 
 def flip_uneven_price(target: Decimal) -> Decimal:
@@ -1903,6 +1946,82 @@ def score_flip(item: dict, snap: dict, model_colors=None):
     return out
 
 
+def build_colors_template():
+    """
+    Собирает `model_colors.json` ИЗ ЖИВЫХ ДАННЫХ: все модели, которые реально
+    встретились на витринах отслеживаемых коллекций.
+
+    Существует потому, что составить эту таблицу за владельца нельзя: имена
+    моделей знает только рынок, а их цвета — только картинка. Зато список
+    имён бот собирает сам, и вписывать остаётся ОДНО СЛОВО там, где словарь
+    не справился.
+
+    Где цвет читается из имени модели («Cocoa Bear»), он проставляется сразу.
+    Где нет — пустая строка: пустое значение честно означает «не знаю», и
+    монохром по такой модели не считается вовсе.
+
+    УЖЕ ЗАПОЛНЕННЫЕ значения НЕ ПЕРЕЗАПИСЫВАЮТСЯ. Владелец вносит их
+    вручную, глядя на картинку; затереть это автоподстановкой значило бы
+    выбросить единственные настоящие данные в файле.
+    """
+    existing = _load_model_colors() or {}
+    log.info(f"{_Color.BOLD}=== ТАБЛИЦА ЦВЕТОВ МОДЕЛЕЙ ==={_Color.RESET}")
+    if existing:
+        log.info(f"Уже заполнено: {len(existing)} — эти строки не трогаю.")
+
+    seen = {}
+    for collection in TARGET_COLLECTIONS:
+        try:
+            items = fetch_items_tonapi(collection, limit=FLOOR_PAGE_SIZE)
+        except Exception as exc:                        # noqa: BLE001
+            log.error(f"{_short(collection)}: {exc}")
+            continue
+        names = {str((i.get("traits") or {}).get("model", "")).strip()
+                 for i in items}
+        names.discard("")
+        for n in names:
+            seen.setdefault(n, 0)
+            seen[n] += 1
+        log.info(f"  {_short(collection)}: моделей {len(names)}")
+
+    if not seen:
+        log.error("Моделей не найдено. Проверьте TARGET_COLLECTIONS и ключ "
+                  "TonAPI — без витрины собирать таблицу не из чего.")
+        return False
+
+    table, auto, blank = {}, 0, 0
+    for name in sorted(seen):
+        prev = existing.get(name.lower())
+        if prev:
+            table[name] = prev
+            continue
+        guess = color_of(name)
+        if guess:
+            table[name] = guess
+            auto += 1
+        else:
+            table[name] = ""
+            blank += 1
+
+    with open(FLIP_MODEL_COLORS_PATH, "w", encoding="utf-8") as fh:
+        json.dump(table, fh, ensure_ascii=False, indent=2, sort_keys=True)
+
+    log.info("")
+    log.info(f"{_Color.GREEN}Записано {FLIP_MODEL_COLORS_PATH}: "
+             f"{len(table)} моделей{_Color.RESET}")
+    log.info(f"  цвет угадан по названию: {auto}")
+    log.info(f"  осталось вписать руками: {blank}")
+    if blank:
+        log.warning(f"{_Color.YELLOW}Пустые строки — это НЕ «монохрома нет», "
+                    f"а «цвет неизвестен»: такие лоты идут с пометкой "
+                    f"confidence: low и монохром им не считается. Впишите "
+                    f"одно слово (black, brown, green...) глядя на картинку "
+                    f"модели.{_Color.RESET}")
+    log.info("Угаданное по названию можно править — таблица всегда сильнее "
+             "словаря, и повторный запуск ваши значения не затрёт.")
+    return True
+
+
 def flip_report(limit: int = 10):
     """
     Прогоняет ЖИВОЙ рынок через модель автора видео и печатает кандидатов.
@@ -1922,10 +2041,9 @@ def flip_report(limit: int = 10):
                  f"({FLIP_MODEL_COLORS_PATH})")
     else:
         log.warning(f"{_Color.YELLOW}Таблицы цветов моделей нет "
-                    f"({FLIP_MODEL_COLORS_PATH}) — МОНОХРОМ НЕ СЧИТАЕТСЯ. "
-                    f"Это главный признак автора: без него оценка опирается "
-                    f"на номер и фон, и половина его логики выключена."
-                    f"{_Color.RESET}")
+                    f"({FLIP_MODEL_COLORS_PATH}). Монохром считается только "
+                    f"там, где цвет назван прямо в имени модели. Соберите "
+                    f"таблицу одной командой: --colors{_Color.RESET}")
     log.info(f"Бюджет {FLIP_BUDGET_TON} TON | переплата не выше "
              f"{FLIP_MAX_PREMIUM * 100:.0f}% над floor | цель x{FLIP_TARGET_MULT}")
 
@@ -5285,6 +5403,10 @@ def parse_args(argv=None):
     parser.add_argument("--premium", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="во сколько раз дороже floor просят за редкие "
                              "трейты (калибровка PREMIUM_MULT)")
+    parser.add_argument("--colors", action="store_true",
+                        help="собрать model_colors.json по живым витринам: "
+                             "список моделей с цветом, где он читается из "
+                             "названия; остальное вписать руками")
     parser.add_argument("--flip", nargs="?", const=10, type=int, metavar="N",
                         help="найти лоты по модели автора видео (монохром, "
                              "красивый номер, фон Black); только отчёт, "
@@ -5331,6 +5453,9 @@ if __name__ == "__main__":
         if args.markets:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if market_report(args.markets) else 1)
+        if args.colors:
+            # Пишет ТОЛЬКО model_colors.json, ничего не покупает.
+            sys.exit(0 if build_colors_template() else 1)
         if args.flip:
             # Ходит в сеть за витриной, но НИЧЕГО не покупает и не пишет.
             sys.exit(0 if flip_report(args.flip) else 1)
