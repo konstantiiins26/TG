@@ -4148,6 +4148,54 @@ check("старая запись названа прямо, а не выдаёт
 check("оговорка про цены продавцов стоит в самом отчёте",
       "ЦЕНЫ ПРОДАВЦОВ, А НЕ ЦЕНЫ СДЕЛОК" in _src60)
 
+
+# =============================================================================
+# [61] РУЧНАЯ ПОКУПКА ПОПАДАЕТ В УЧЁТ (--bought)
+# =============================================================================
+# 23.09.2026: владелец купил лот из уведомления «ДЕШЕВЛЕ СВОИХ». У таких
+# уведомлений кнопок «Купил / Продал» НЕТ — они только у находок, — и позиция
+# не попадала в БД вообще. Без неё не работает ни PnL, ни риск-лимиты, ни
+# измерение того, чем такие лоты кончаются, а ради него наблюдение и заводилось.
+print("\n[61] Лот, купленный руками, заносится в учёт")
+
+_ob61 = gs.DB_PATH
+gs.DB_PATH = os.path.join(_tmpdir, "manual_buy.db")
+try:
+    gs.db_init()
+    _addr61 = "EQDmZLZ5vxQF1-smvcJoHSDhMI6NTRjz31OWIFUw94denDcK"
+    _pos = gs.record_manual_purchase(_addr61, "5.42", "6.94")
+    check("позиция открыта", isinstance(_pos, int) and _pos > 0, _pos)
+    check("она видна как открытая", gs.open_positions_count() == 1,
+          gs.open_positions_count())
+
+    # То же правило, что у кнопки «Купил» и execute_blockchain_buy(): в учёте
+    # не должно появиться позиции, которой нет. Ошибиться командой легко.
+    check("повтор того же адреса вторую позицию НЕ открывает",
+          gs.record_manual_purchase(_addr61, "5.42") is None)
+    check("после отказа позиция по-прежнему одна",
+          gs.open_positions_count() == 1, gs.open_positions_count())
+
+    # Адрес нормализуется: EQ-форма с витрины и raw из API — один лот.
+    check("EQ и raw считаются одним лотом",
+          gs.record_manual_purchase(gs.normalize_ton_address(_addr61), "5.42") is None)
+
+    # Мусор на входе не должен молча открывать позицию по нулевой цене.
+    check("нечисловая цена отклоняется",
+          gs.record_manual_purchase("EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "дёшево") is None)
+    check("неразобранный адрес отклоняется",
+          gs.record_manual_purchase("не-адрес", "5.42") is None)
+    check("нулевая цена отклоняется",
+          gs.record_manual_purchase("EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "0") is None)
+    check("после всех отказов позиция по-прежнему одна",
+          gs.open_positions_count() == 1, gs.open_positions_count())
+
+    # Закрытие идёт той же функцией, что и у находок: второй бухгалтерии нет.
+    _pnl = gs.close_position(_pos, Decimal("6.73"))
+    check("позиция закрывается штатно", _pnl is not None)
+    check("после закрытия открытых нет", gs.open_positions_count() == 0)
+finally:
+    gs.DB_PATH = _ob61
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:

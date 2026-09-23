@@ -3107,6 +3107,67 @@ def record_purchase(item: dict, buy_price: Decimal, floor: Decimal) -> int:
         return cur.lastrowid
 
 
+def record_manual_purchase(address: str, price: str, floor: str = None):
+    """
+    Заносит в учёт лот, купленный РУКАМИ. Режим `--bought АДРЕС ЦЕНА [FLOOR]`.
+
+    Появился 23.09.2026, когда владелец покупал лот из уведомления «ДЕШЕВЛЕ
+    СВОИХ». У таких уведомлений кнопок «Купил / Продал» НЕТ — они есть только
+    у находок, — и позиция не попадала в БД ВООБЩЕ. Без неё не работает
+    ничего из учёта: ни PnL, ни риск-лимиты, ни единственное измерение того,
+    чем такие лоты кончаются. А ради этого измерения наблюдение по сегменту
+    и заводилось.
+
+    ПОВТОРНАЯ ЗАПИСЬ ТОГО ЖЕ АДРЕСА ОТКЛОНЯЕТСЯ. То же правило, что у кнопки
+    «Купил» и у `execute_blockchain_buy()`: в учёте не должно появиться
+    позиции, которой нет. Ошибиться командой легко, а вторая позиция на тот
+    же лот тихо удваивает и риск, и PnL.
+
+    Floor на момент покупки НЕОБЯЗАТЕЛЕН, но лучше его указать: без него
+    бэктест не сможет сравнить прогноз с фактом — сравнивать будет не с чем.
+    """
+    try:
+        buy = Decimal(str(price))
+    except (InvalidOperation, ValueError):
+        log.error(f"Цена «{price}» — не число.")
+        return None
+    if buy <= 0:
+        log.error("Цена покупки должна быть больше нуля.")
+        return None
+
+    raw = normalize_ton_address(address)
+    if not raw:
+        log.error(f"Адрес «{address}» не разобран. Нужен EQ… или 0:…")
+        return None
+
+    with db_connect() as conn:
+        dup = conn.execute(
+            "SELECT id FROM positions WHERE address = ? AND status = 'open'",
+            (raw,)).fetchone()
+    if dup:
+        log.error(f"{_Color.RED}Позиция на этот лот уже открыта (№{dup['id']}). "
+                  f"Вторую не создаю — в учёте появился бы лот, которого нет. "
+                  f"Список: --positions{_Color.RESET}")
+        return None
+
+    try:
+        floor_dec = Decimal(str(floor)) if floor else Decimal("0")
+    except (InvalidOperation, ValueError):
+        log.error(f"Floor «{floor}» — не число.")
+        return None
+
+    pos_id = record_purchase({"address": raw, "collection_address": ""},
+                             buy, floor_dec)
+    log.info(f"{_Color.GREEN}Позиция №{pos_id} открыта: {buy} TON, "
+             f"{_short(raw)}{_Color.RESET}")
+    if floor_dec <= 0:
+        log.warning("Floor на момент покупки не указан. Бэктесту будет нечем "
+                    "сравнить прогноз с фактом — в следующий раз добавьте "
+                    "третьим аргументом цену конкурента.")
+    log.info(f"Когда продадите: --close {pos_id} ФАКТИЧЕСКАЯ_ЦЕНА")
+    return pos_id
+
+
 def close_position(position_id: int, sell_price: Decimal):
     """
     Закрывает позицию и считает реальный PnL по той же экономике, что и прогноз.
@@ -6269,6 +6330,10 @@ def parse_args(argv=None):
                         help="открытые позиции и их номера (для --close)")
     parser.add_argument("--closed", action="store_true",
                         help="вместе с --positions показать последние закрытые")
+    parser.add_argument("--bought", nargs="+",
+                        metavar=("ADDRESS PRICE", "FLOOR"),
+                        help="занести в учёт лот, купленный руками "
+                             "(у уведомлений «ДЕШЕВЛЕ СВОИХ» кнопок нет)")
     parser.add_argument("--close", nargs=2, metavar=("POSITION_ID", "PRICE"),
                         help="закрыть позицию по ФАКТИЧЕСКОЙ цене продажи "
                              "(кнопка «Продал» ставит плановую)")
@@ -6337,6 +6402,11 @@ if __name__ == "__main__":
         if args.flip:
             # Ходит в сеть за витриной, но НИЧЕГО не покупает и не пишет.
             sys.exit(0 if flip_report(args.flip) else 1)
+        if args.bought:
+            if not 2 <= len(args.bought) <= 3:
+                log.error("Нужно: --bought АДРЕС ЦЕНА [FLOOR_КОНКУРЕНТА]")
+                sys.exit(1)
+            sys.exit(0 if record_manual_purchase(*args.bought) else 1)
         if args.numbers:
             sys.exit(0 if number_premium_report(args.numbers) else 1)
         if args.premium:
