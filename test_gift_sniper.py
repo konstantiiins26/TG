@@ -77,6 +77,9 @@ _PINNED = {
     "DRY_RUN": True, "CONFIRM_LIVE_TRADING": "", "COLLECTION_WHITELIST": [],
     "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "", "HEARTBEAT_MIN": 60,
     "MIN_MARKET_SAMPLE": 5, "NEAR_MISS_TOP": 3,
+    "FLIP_BUDGET_TON": Decimal("7"), "FLIP_MAX_PREMIUM": Decimal("0.20"),
+    "FLIP_BUY_SCORE": 70, "FLIP_WATCH_SCORE": 50,
+    "FLIP_TARGET_MULT": Decimal("1.5"),
 }
 for _name, _value in _PINNED.items():
     setattr(gs, _name, _value)
@@ -3411,6 +3414,87 @@ finally:
     (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
      gs._last_heartbeat) = _ob53
     gs._near_misses.clear()
+
+
+# =============================================================================
+print("\n[54] Модель автора видео: скоринг номера и монохрома")
+# =============================================================================
+
+# Это ЧУЖАЯ модель, и проверяется она на ЕГО ЖЕ примерах: если наш код даёт
+# другие баллы, значит мы реализовали не то, что он описал.
+
+for _num, _want in [(19913, 35), (22969, 35), (226256, 22),
+                    (155745, 10), (97518, 0)]:
+    check(f"номер {_num} -> {_want}", gs.flip_number_score(_num) == _want,
+          gs.flip_number_score(_num))
+
+# Бонусы: мало разных цифр плюс структура. 1919 — повтор блока, 777 — три
+# подряд и <= 999; потолок 40 не пробивается.
+check("повтор блока 1919 -> 40", gs.flip_number_score(1919) == 40)
+check("777 -> 40 (потолок не пробит)", gs.flip_number_score(777) == 40)
+check("нет номера -> 0", gs.flip_number_score(None) == 0)
+
+# ПРОТИВОРЕЧИЕ В САМОМ ПРОМПТЕ, зафиксировано намеренно: правило считает
+# РАЗНЫЕ цифры, и у 16630 их четыре -> 10 + 5 за круглый хвост = 15. А
+# таблица примеров в том же промпте ставит 16630 оценку 35+5. Мы реализуем
+# ПРАВИЛО, потому что оно машинное; расхождение названо владельцу, чтобы
+# решение принимал он, а не молчаливая правка кода.
+check("16630 по ПРАВИЛУ (а не по таблице примеров) = 15",
+      gs.flip_number_score(16630) == 15, gs.flip_number_score(16630))
+
+# «Неровная» цена: преимущество в сортировке по цене.
+check("6.00 -> 5.87", gs.flip_uneven_price(Decimal("6.00")) == Decimal("5.87"))
+check("9.00 -> 8.87", gs.flip_uneven_price(Decimal("9.00")) == Decimal("8.87"))
+check("11.00 -> 10.9", gs.flip_uneven_price(Decimal("11.00")) == Decimal("10.9"))
+
+# --- монохром: «не знаю» НЕ равно «монохрома нет» ---
+_it54 = {"address": "0:aa", "sale_price_ton": Decimal("3.9"), "mint_index": 22969,
+         "traits": {"model": "Cocoa Bear", "backdrop": "Onyx Black"},
+         "sale_market": "Getgems Sales", "explicit_rarity_pct": None}
+_m54, _known54 = gs.flip_mono_score(_it54, None)
+check("без таблицы цветов монохром НЕ посчитан",
+      _m54 == 0 and _known54 is False)
+_m54b, _known54b = gs.flip_mono_score(_it54, {"cocoa bear": "black"})
+check("цвет модели совпал с фоном -> монохром есть",
+      _m54b > 0 and _known54b is True, (_m54b, _known54b))
+_m54c, _ = gs.flip_mono_score(_it54, {"cocoa bear": "green"})
+check("зелёная модель на чёрном фоне -> 0", _m54c == 0)
+
+# --- score_flip целиком ---
+_snap54 = {"floor": Decimal("3.6"), "peer_prices": {}, "trait_index": {},
+           "trait_total": 0, "collection": "0:c"}
+_r54 = gs.score_flip(_it54, _snap54, {"cocoa bear": "black"})
+check("монохром + номер + Onyx Black -> BUY",
+      _r54["decision"] == "BUY", (_r54["decision"], _r54["total"]))
+check("цель — неровная цена от x1.5",
+      _r54["target_ton"] == gs.flip_uneven_price(Decimal("3.9") * Decimal("1.5")),
+      _r54["target_ton"])
+
+# Жёсткие фильтры автора. Переплата больше 20% над floor -> SKIP «зависнет»:
+# это ЕГО правило, и оно прямо противоположно нашему (мы покупаем только
+# НИЖЕ floor), поэтому проверяется отдельно.
+_over = dict(_it54, sale_price_ton=Decimal("8.0"))
+check("переплата над floor -> SKIP",
+      gs.score_flip(_over, _snap54, {"cocoa bear": "black"})["decision"] == "SKIP")
+_rich = dict(_it54, sale_price_ton=Decimal("9.0"))
+check("дороже бюджета -> SKIP",
+      "бюджета" in gs.score_flip(_rich, _snap54, None)["reason"])
+
+# Чего в данных нет — обязано быть НАЗВАНО, а не подставлено нулём.
+_r54b = gs.score_flip(_it54, _snap54, None)
+check("отсутствие цвета модели названо в missing",
+      any("цвет модели" in m for m in _r54b["missing"]), _r54b["missing"])
+check("без монохрома доверие понижено", _r54b["confidence"] == "low")
+check("сторона bid названа отсутствующей",
+      any("bid" in m for m in _r54b["missing"]))
+
+# ГЛАВНОЕ: чужая модель НЕ управляет торговлей. evaluate_trade() про неё не
+# знает, иначе бот начал бы покупать ВЫШЕ floor на непроверенном основании.
+_src54 = open("gift_sniper.py", encoding="utf-8").read()
+_ev54 = _src54[_src54.index("def evaluate_trade("):]
+_ev54 = _ev54[:_ev54.index("\ndef ")]
+check("evaluate_trade не вызывает скоринг чужой модели",
+      "score_flip" not in _ev54 and "flip_" not in _ev54)
 
 
 # =============================================================================

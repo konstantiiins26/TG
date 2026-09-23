@@ -42,7 +42,7 @@ import logging
 import asyncio
 import argparse
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_UP
 
 # --- Сторонние зависимости -------------------------------------------------
 # requests   -> HTTP-запросы к рыночным API
@@ -1438,7 +1438,7 @@ _floor_cache = {}
 
 def _empty_snapshot(source="none"):
     """Пустой снапшот — чтобы вызывающий код не разбирал особые случаи."""
-    return {"collection": "", "candidates": [], "floor": Decimal("0"),
+    return {"collection": "", "candidates": [], "on_sale": [], "floor": Decimal("0"),
             "sample_size": 0, "source": source, "trait_index": {}, "trait_total": 0,
             "competition": 0, "floor_reliable": False,
             "collection_size": None, "coverage_pct": None}
@@ -1522,6 +1522,11 @@ def get_market_snapshot(collection: str) -> dict:
         # и бэктест подставил бы floor чужой коллекции.
         "collection": cache_key,
         "candidates": sorted(on_sale, key=lambda it: it["sale_price_ton"])[:CANDIDATES_TO_ANALYZE],
+        # ВСЕ выставленные лоты. В запись НЕ пишется (record_snapshot берёт
+        # поля поимённо) — нужно режимам, где сигнал не в цене: у модели
+        # автора видео это монохром и номер, и такой лот стоит не в первой
+        # пятёрке по дешевизне.
+        "on_sale": on_sale,
         "floor": floor,
         "sample_size": sample_size,
         "source": source,
@@ -1682,6 +1687,299 @@ def market_arbitrage(snap: dict):
                         "sell_n": sell_n, "net_profit": profit, "roi_pct": roi,
                         "buyable": (not ALLOWED_MARKETS) or buy_m in ALLOWED_MARKETS}
     return best
+
+
+# =============================================================================
+# МОДЕЛЬ ВЛАДЕЛЬЦА ВИДЕО («флип по монохрому и номеру») — ОТДЕЛЬНЫЙ КОНТУР
+# =============================================================================
+# Это ЧУЖАЯ модель, снятая с видео стороннего трейдера, и она НЕ проверена
+# нашей записью рынка. Держится отдельно от evaluate_trade() намеренно:
+#
+# У неё ДРУГОЙ ВЫХОД. Наша модель покупает НИЖЕ floor и продаёт ПО floor —
+# прибыль возможна только ниже ~0.87xfloor, то есть нужна ошибка продавца.
+# Эта покупает НА floor (и до +20% выше) и выставляет x1.5, рассчитывая, что
+# премия за монохром и красивый номер реальна. Сложить их в одну функцию
+# значило бы разрешить покупку выше floor на непроверенном основании —
+# ровно то, что запрещено правилом «изменения, увеличивающие расчётную
+# прибыль, требуют данных».
+#
+# Поэтому: отдельный скоринг, отдельный режим, НИ ОДНОЙ покупки. Отчёт.
+
+FLIP_BUDGET_TON    = Decimal(os.getenv("FLIP_BUDGET_TON", "7"))
+FLIP_MAX_PREMIUM   = Decimal(os.getenv("FLIP_MAX_PREMIUM", "0.20"))  # выше floor
+FLIP_BUY_SCORE     = int(os.getenv("FLIP_BUY_SCORE", "70"))
+FLIP_WATCH_SCORE   = int(os.getenv("FLIP_WATCH_SCORE", "50"))
+FLIP_TARGET_MULT   = Decimal(os.getenv("FLIP_TARGET_MULT", "1.5"))
+# Фоны, за которые, по модели автора, платят. Остальные стоят одинаково дёшево.
+FLIP_GOOD_BACKDROPS = {"black": 15, "onyx black": 12}
+# Таблица «модель -> цвет» для монохрома. В API цвета модели НЕТ, и это
+# главный признак автора — без таблицы он не считается ВООБЩЕ, а не считается
+# нулём: ноль означал бы «монохрома нет», а правда — «мы не знаем».
+FLIP_MODEL_COLORS_PATH = os.getenv("FLIP_MODEL_COLORS", "model_colors.json")
+
+
+def flip_number_score(mint_index) -> int:
+    """
+    Баллы за номер (0-40) по правилам автора: чем меньше РАЗНЫХ цифр, тем лучше.
+
+    Это единственный блок его модели, который считается из наших данных
+    полностью и без допущений: номер у нас уже есть, он берётся из
+    metadata.name. Пороги дословно по его примерам — 19913 и 22969 «сок»,
+    155745 (4 разные цифры) на грани, 97518 «отвратительный».
+    """
+    if mint_index is None:
+        return 0
+    digits = str(int(mint_index))
+    uniq, ln = len(set(digits)), len(digits)
+    if uniq <= 2:
+        base = 40
+    elif uniq == 3 and ln <= 5:
+        base = 35
+    elif uniq == 3:
+        base = 22
+    elif uniq == 4:
+        base = 10
+    else:
+        base = 0
+
+    bonus = 0
+    if digits == digits[::-1] and ln > 1:          # палиндром
+        bonus += 5
+    for k in (2, 3):                                # повтор блока: 226226, 1616
+        if ln == k * 2 and digits[:k] == digits[k:]:
+            bonus += 5
+            break
+    if re.search(r"(\d)\1\1", digits):             # три одинаковых подряд
+        bonus += 5
+    if digits.endswith("0") and ln >= 3:            # круглый хвост
+        bonus += 5
+    if int(digits) <= 999:
+        bonus += 5
+    return min(40, base + bonus)
+
+
+def _load_model_colors():
+    """Таблица «модель -> цвет», которую ведёт владелец. Нет файла — нет данных."""
+    try:
+        with open(FLIP_MODEL_COLORS_PATH, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(raw, dict) or not raw:
+        return None
+    return {str(k).strip().lower(): str(v).strip().lower() for k, v in raw.items()}
+
+
+def flip_mono_score(item: dict, model_colors):
+    """
+    Баллы за монохром (0-40) и признак «посчитано ли вообще».
+
+    Возвращает (score, known). `known = False` означает, что цвет модели
+    неизвестен — и тогда скоринг НЕ штрафует лот нулём, а честно понижает
+    доверие. Это главный признак автора, и выдавать «монохрома нет» там, где
+    мы просто не смотрели, значит отбрасывать ровно те лоты, ради которых
+    модель и нужна.
+    """
+    traits = item.get("traits") or {}
+    backdrop = str(traits.get("backdrop", "")).strip().lower()
+    model = str(traits.get("model", "")).strip().lower()
+    if not backdrop or not model or not model_colors:
+        return 0, False
+    mcolor = model_colors.get(model)
+    if not mcolor:
+        return 0, False
+    # Сравниваем ЦВЕТОВЫЕ СЛОВА, а не оттенки: hex модели у нас нет, и
+    # притворяться, что есть, хуже, чем признать грубость сравнения.
+    bwords = set(re.split(r"[^a-z]+", backdrop)) - {""}
+    mwords = set(re.split(r"[^a-z]+", mcolor)) - {""}
+    if not bwords or not mwords:
+        return 0, False
+    if mwords & bwords:
+        return (40 if mwords == bwords else 25), True
+    return 0, True
+
+
+def flip_uneven_price(target: Decimal) -> Decimal:
+    """
+    «Неровная» цена чуть ниже круглой: 6.00 -> 5.87, 9.00 -> 8.87, 11.00 -> 10.9.
+
+    Преимущество в сортировке по цене — лот встаёт выше конкурента с круглым
+    числом. Мелочь, но она ничего не стоит.
+    """
+    n = int(target.to_integral_value(rounding=ROUND_UP))
+    if n <= 0:
+        return target
+    return Decimal(n) - (Decimal("0.13") if n <= 10 else Decimal("0.1"))
+
+
+def score_flip(item: dict, snap: dict, model_colors=None):
+    """
+    Оценивает лот по модели автора видео. Ничего не покупает и не решает.
+
+    ЧЕГО В НАШИХ ДАННЫХ НЕТ и что поэтому не участвует:
+      * цвет модели — только через таблицу владельца (см. flip_mono_score);
+      * `collection_unlocked_days` (свежие коллекции) — API не отдаёт;
+      * `best_order_ton` (сторона bid) — не реализована, есть в списке
+        непроверенного в CLAUDE.md;
+      * `sales_24h` — только если включена история продаж.
+    Всё отсутствующее НЕ подменяется нулём: оно перечислено в `missing`,
+    и отчёт обязан это печатать.
+    """
+    price = Decimal(str(item["sale_price_ton"]))
+    floor_coll = snap.get("floor") or Decimal("0")
+    f_model, peer_n = peer_floor(item, snap.get("peer_prices"))
+    ref_floor = f_model if f_model is not None else floor_coll
+
+    out = {"address": item.get("address", ""), "price_ton": price,
+           "mint": item.get("mint_index"), "ref_floor": ref_floor,
+           "floor_source": "модели" if f_model is not None else "коллекции",
+           "peer_n": peer_n, "decision": "SKIP", "total": 0,
+           "scores": {}, "missing": [], "reason": "", "confidence": "high",
+           "market": item.get("sale_market"), "traits": item.get("traits") or {}}
+
+    if ref_floor <= 0:
+        out["reason"] = "floor неизвестен"
+        return out
+    premium = price / ref_floor - Decimal("1")
+    out["premium_pct"] = (premium * Decimal("100")).quantize(Decimal("0.1"))
+
+    # --- жёсткие фильтры -------------------------------------------------
+    if price > FLIP_BUDGET_TON:
+        out["reason"] = f"дороже бюджета {FLIP_BUDGET_TON} TON"
+        return out
+    if premium > FLIP_MAX_PREMIUM:
+        out["reason"] = (f"переплата {out['premium_pct']}% над floor "
+                         f"{out['floor_source']} — зависнет")
+        return out
+
+    # --- баллы -----------------------------------------------------------
+    mono, mono_known = flip_mono_score(item, model_colors)
+    num = flip_number_score(item.get("mint_index"))
+    backdrop = str((item.get("traits") or {}).get("backdrop", "")).strip().lower()
+    bd = FLIP_GOOD_BACKDROPS.get(backdrop, 0)
+
+    rarity_pct, _ = compute_rarity_pct(item, snap.get("trait_index", {}),
+                                       snap.get("trait_total", 0))
+    rar = 0
+    if rarity_pct is not None:
+        rar = 5 if rarity_pct <= Decimal("1") else (3 if rarity_pct <= Decimal("2") else 0)
+    else:
+        out["missing"].append("редкость модели")
+
+    if not mono_known:
+        out["missing"].append("цвет модели (монохром не посчитан)")
+        out["confidence"] = "low"
+    out["missing"].append("свежесть коллекции")
+    out["missing"].append("сторона bid (лучший ордер)")
+
+    total = mono + num + bd + rar
+    if premium <= 0:
+        total += 5
+    out["scores"] = {"mono": mono, "number": num, "backdrop": bd, "rarity": rar}
+    out["total"] = total
+
+    # --- цена выхода и прибыль -------------------------------------------
+    target = flip_uneven_price(price * FLIP_TARGET_MULT)
+    net = target * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT) - price - GAS_FEE_TON
+    out["target_ton"] = target
+    out["net_profit_ton"] = net.quantize(Decimal("0.0001"))
+    out["exit_fallback_ton"] = ref_floor
+    if net <= 0:
+        out["reason"] = "цель x1.5 не покрывает комиссию и газ"
+        return out
+
+    if total >= FLIP_BUY_SCORE:
+        out["decision"] = "BUY"
+    elif total >= FLIP_WATCH_SCORE:
+        out["decision"] = "WATCH"
+    bits = [f"номер {num}"]
+    if mono_known:
+        bits.append(f"монохром {mono}")
+    if bd:
+        bits.append(f"фон {backdrop} +{bd}")
+    if rar:
+        bits.append(f"редкость +{rar}")
+    out["reason"] = f"{total} баллов: " + ", ".join(bits)
+    return out
+
+
+def flip_report(limit: int = 10):
+    """
+    Прогоняет ЖИВОЙ рынок через модель автора видео и печатает кандидатов.
+
+    Отдельный режим, а не ветка торговли: покупок здесь нет ни одной, и
+    решения evaluate_trade() он не меняет. Ходит в сеть (нужна витрина), но
+    не в Claude.
+
+    Смотрит ВСЕ выставленные лоты коллекции, а не CANDIDATES_TO_ANALYZE самых
+    дешёвых: у автора сигнал — не цена, а монохром и номер, и такой лот может
+    стоять не в первой пятёрке.
+    """
+    model_colors = _load_model_colors()
+    log.info(f"{_Color.BOLD}=== ФЛИП ПО МОДЕЛИ ВИДЕО ==={_Color.RESET}")
+    if model_colors:
+        log.info(f"Таблица цветов моделей: {len(model_colors)} записей "
+                 f"({FLIP_MODEL_COLORS_PATH})")
+    else:
+        log.warning(f"{_Color.YELLOW}Таблицы цветов моделей нет "
+                    f"({FLIP_MODEL_COLORS_PATH}) — МОНОХРОМ НЕ СЧИТАЕТСЯ. "
+                    f"Это главный признак автора: без него оценка опирается "
+                    f"на номер и фон, и половина его логики выключена."
+                    f"{_Color.RESET}")
+    log.info(f"Бюджет {FLIP_BUDGET_TON} TON | переплата не выше "
+             f"{FLIP_MAX_PREMIUM * 100:.0f}% над floor | цель x{FLIP_TARGET_MULT}")
+
+    rows = []
+    for collection in TARGET_COLLECTIONS:
+        try:
+            snap = get_market_snapshot(collection)
+        except Exception as exc:                       # noqa: BLE001
+            log.error(f"{_short(collection)}: {exc}")
+            continue
+        if not snap.get("floor_reliable"):
+            log.warning(f"{_short(collection)}: floor недостоверен "
+                        f"(выборка {snap.get('sample_size')}, покрытие "
+                        f"{snap.get('coverage_pct')}%) — пропущено")
+            continue
+        for item in snap.get("on_sale", []) or snap.get("candidates", []):
+            res = score_flip(item, snap, model_colors)
+            if res["decision"] == "SKIP":
+                continue
+            res["collection"] = snap.get("collection", collection)
+            rows.append(res)
+
+    if not rows:
+        log.warning(f"{_Color.YELLOW}Кандидатов нет. Это не поломка: модель "
+                    f"требует номер с малым числом РАЗНЫХ цифр, а таких лотов "
+                    f"единицы процентов.{_Color.RESET}")
+        return []
+
+    rows.sort(key=lambda r: r["total"], reverse=True)
+    log.info("")
+    log.info(f"  {'Реш.':<6} {'Балл':>5} {'Цена':>8} {'Floor':>8} {'Премия':>7} "
+             f"{'Цель':>8} {'Чистыми':>9}  Номер / фон")
+    for r in rows[:limit]:
+        log.info(f"  {r['decision']:<6} {r['total']:>5} {r['price_ton']:>8.2f} "
+                 f"{r['ref_floor']:>8.2f} {r['premium_pct']:>6}% "
+                 f"{r['target_ton']:>8.2f} {r['net_profit_ton']:>9.4f}  "
+                 f"#{r['mint']} / {r['traits'].get('backdrop', '?')}")
+        log.info(f"         {_Color.GREY}{r['reason']} | {r['market']} | "
+                 f"{GIFT_URL_TEMPLATE.format(address=friendly_ton_address(r['address']))}"
+                 f"{_Color.RESET}")
+
+    log.info("")
+    log.warning("ЭТО ЧУЖАЯ МОДЕЛЬ И ОНА НЕ ПРОВЕРЕНА НАШЕЙ ЗАПИСЬЮ. Её выход — "
+                "продажа по x1.5, а не по floor: она рассчитывает, что за "
+                "монохром и красивый номер действительно платят. Если премии "
+                "нет, лот придётся сливать по floor.")
+    log.warning(f"Порог безубыточности: при покупке на floor и сливе по floor "
+                f"при неудаче модель окупается, если по x{FLIP_TARGET_MULT} "
+                f"уходит примерно КАЖДЫЙ ЧЕТВЁРТЫЙ лот. Эту долю надо "
+                f"измерить по своей записи, а не принять на слово.")
+    miss = sorted({m for r in rows for m in r["missing"]})
+    if miss:
+        log.warning("Чего в данных НЕТ (в баллах не участвует): " + "; ".join(miss))
+    return rows
 
 
 def _best_sell_market(snap: dict):
@@ -4952,6 +5250,10 @@ def parse_args(argv=None):
     parser.add_argument("--premium", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="во сколько раз дороже floor просят за редкие "
                              "трейты (калибровка PREMIUM_MULT)")
+    parser.add_argument("--flip", nargs="?", const=10, type=int, metavar="N",
+                        help="найти лоты по модели автора видео (монохром, "
+                             "красивый номер, фон Black); только отчёт, "
+                             "покупок нет")
     parser.add_argument("--markets", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="сравнить площадки по записи: где дешевле и есть ли "
                              "арбитраж между ними")
@@ -4994,6 +5296,9 @@ if __name__ == "__main__":
         if args.markets:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if market_report(args.markets) else 1)
+        if args.flip:
+            # Ходит в сеть за витриной, но НИЧЕГО не покупает и не пишет.
+            sys.exit(0 if flip_report(args.flip) else 1)
         if args.premium:
             # Только чтение записи: ни сети, ни покупок.
             sys.exit(0 if trait_premium_report(args.premium) else 1)
