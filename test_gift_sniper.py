@@ -79,6 +79,7 @@ _PINNED = {
     "MIN_MARKET_SAMPLE": 5, "NEAR_MISS_TOP": 3,
     "SEGMENT_NOTIFY_MAX_PER_HOUR": 12,
     "SEGMENT_MAX_PER_COLLECTION": 1, "SEGMENT_SEEN_TTL_SEC": 21600,
+    "SEGMENT_MIN_ROI_PCT": Decimal("10"), "SEGMENT_MAX_ROI_PCT": Decimal("100"),
     "FLIP_BUDGET_TON": Decimal("7"), "FLIP_MAX_PREMIUM": Decimal("0.20"),
     "FLIP_BUY_SCORE": 70, "FLIP_WATCH_SCORE": 50,
     "FLIP_TARGET_MULT": Decimal("1.5"),
@@ -4018,6 +4019,85 @@ finally:
 # иначе тест доказывал бы только арифметику страниц.
 check("без доказанного обхода наблюдение по сегменту молчит",
       gs.find_segment_bargains(dict(_snap55, exhausted=False)) == [])
+
+
+# =============================================================================
+# [59] ЧТО ПОКАЗЫВАТЬ В ТЕЛЕФОНЕ: порог ROI, потолок правдоподобия, конкуренты
+# =============================================================================
+# Timeless Books #72993, 23.09.2026. Бот увидел 5 лотов «Big Brother», взял
+# следующего за 32.80 и написал ROI 248.65%. На витрине под тем же фильтром:
+# 5.66, 5.66, 8, [наш 8.9], 9, 10, 12, 12, 13... — три лота ДЕШЕВЛЕ нашего,
+# и настоящая сделка была УБЫТОЧНОЙ.
+print("\n[59] Пороги показа: ROI от 10% и потолок правдоподобия")
+
+check("порог показа выше торгового порога ROI",
+      gs.SEGMENT_MIN_ROI_PCT > gs.MIN_ROI_PCT,
+      (gs.SEGMENT_MIN_ROI_PCT, gs.MIN_ROI_PCT))
+# Порога по ЧИСЛУ конкурентов нет намеренно: 23.09.2026 два живых случая
+# одного вечера дали сегменты 5 (вывод неверен) и 6 лотов (вывод верен).
+# Любой порог между ними выдуман, а порог выше убивает верную находку —
+# у модели Celestial на витрине всего 11 выставленных.
+check("порога по числу конкурентов НЕТ — его не с чем откалибровать",
+      not hasattr(gs, "MIN_SEGMENT_RIVALS"))
+check("причина записана рядом с кодом",
+      "Surge Boards  #20176" in open("gift_sniper.py", encoding="utf-8").read())
+
+
+def _lot59(addr, price, model="M"):
+    return {"address": addr, "collection_address": _snap55["on_sale"][0]["collection_address"],
+            "sale_price_ton": Decimal(price), "traits": {"model": model},
+            "is_on_sale": True, "mint_index": 500,
+            "sale_market": "Getgems Sales", "name": f"Lot {addr}"}
+
+
+# Сегмент из 20 конкурентов, наш лот заметно дешевле -> проходит.
+_rivals59 = [Decimal("9.00")] * 20
+_own59 = _lot59("0:cheap", "5.00")
+_base59 = dict(_snap55, on_sale=[_own59],
+               peer_prices={"M": sorted(_rivals59 + [Decimal("5.00")])})
+_got59 = gs.find_segment_bargains(_base59)
+check("нормальный лот с ROI выше порога проходит", len(_got59) == 1, _got59)
+
+# Тонкий сегмент показывается — и это осознанно: отличить верный вывод от
+# неверного по размеру сегмента нельзя (5 против 6 лотов в живых случаях).
+# Полноту витрины стерегут ворота `exhausted`, а не число здесь.
+_thin59 = dict(_base59, peer_prices={"M": [Decimal("5.00")] + [Decimal("9.00")] * 5})
+check("тонкий сегмент при ПОЛНОМ обходе проходит",
+      len(gs.find_segment_bargains(_thin59)) == 1)
+check("он же при НЕПОЛНОМ обходе молчит",
+      gs.find_segment_bargains(dict(_thin59, exhausted=False)) == [])
+
+# ROI между торговым порогом (5%) и порогом показа (10%) — в телефон не идёт.
+_small59 = dict(_base59, on_sale=[_lot59("0:small", "8.50")],
+                peer_prices={"M": sorted(_rivals59 + [Decimal("8.50")])})
+_roi_small = gs.compute_roi_pct(
+    gs.compute_net_profit(Decimal("9.00"), Decimal("8.50")), Decimal("8.50"))
+check("проверяемый лот действительно ниже порога показа",
+      _roi_small < gs.SEGMENT_MIN_ROI_PCT, _roi_small)
+check("мелкий ROI в телефон не идёт", gs.find_segment_bargains(_small59) == [])
+
+# ROI выше потолка правдоподобия — тоже не идёт, и это СЧИТАЕТСЯ.
+gs._segment_implausible = 0
+_huge59 = dict(_base59, on_sale=[_lot59("0:huge", "8.90")],
+               peer_prices={"M": sorted([Decimal("32.80")] * 20 + [Decimal("8.90")])})
+_roi_huge = gs.compute_roi_pct(
+    gs.compute_net_profit(Decimal("32.80"), Decimal("8.90")), Decimal("8.90"))
+check("проверяемый лот действительно выше потолка",
+      _roi_huge > gs.SEGMENT_MAX_ROI_PCT, _roi_huge)
+check("невероятный ROI в телефон не идёт", gs.find_segment_bargains(_huge59) == [])
+# Молчание обязано быть объяснимым: подавленное попадает в сводку.
+check("подавленное потолком посчитано", gs._segment_implausible == 1,
+      gs._segment_implausible)
+gs._segment_implausible = 0
+
+_src59 = open("gift_sniper.py", encoding="utf-8").read()
+check("счётчик подавленных печатается в сводке",
+      "потолку правдоподобия" in _src59)
+
+# ГЛАВНОЕ: пороги показа не трогают торговлю. Решение владельца «показывать,
+# но не покупать» в силе, и обратное тоже — торговый порог остаётся своим.
+check("торговый порог ROI не изменился", source_default("MIN_ROI_PCT") == "5",
+      source_default("MIN_ROI_PCT"))
 
 # =============================================================================
 print("\n" + "=" * 60)
