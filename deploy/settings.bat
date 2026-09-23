@@ -233,6 +233,16 @@ REM knopkami - tak nakaplivaetsya zapis, po kotoroy potom budet vidno,
 REM opravdana li pokupka po segmentnomu polu.
 REM
 REM Skolko takih soobshcheniy slat maksimum za chas. 0 = vyklyuchit.
-set SEGMENT_NOTIFY_MAX_PER_HOUR=5
+set SEGMENT_NOTIFY_MAX_PER_HOUR=12
+
+REM Skolko lotov ODNOY kollekcii za cikl. Kollekcii obhodyatsya po ocheredi,
+REM i bez etogo potolka pervaya vyedala ves chasovoy limit: vladelec poluchal
+REM tolko Surge Boards pri dvenadcati kollekciyah.
+set SEGMENT_MAX_PER_COLLECTION=1
+
+REM Kak dolgo NE povtoryat uzhe pokazannyy lot, sekundy. 21600 = 6 chasov.
+REM Ranshe bralas obshchaya vyderzhka 300s pri cikle 6.5 min - odin i tot zhe
+REM lot schitalsya novym kazhdyy cikl. Smena ceny probivaet vyderzhku.
+set SEGMENT_SEEN_TTL_SEC=21600
 
 REM Konec nastroek. Zapusk - v run.bat ili start-windows.bat.

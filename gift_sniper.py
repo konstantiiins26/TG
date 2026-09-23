@@ -1438,7 +1438,8 @@ _floor_cache = {}
 
 def _empty_snapshot(source="none"):
     """Пустой снапшот — чтобы вызывающий код не разбирал особые случаи."""
-    return {"collection": "", "candidates": [], "on_sale": [], "floor": Decimal("0"),
+    return {"collection": "", "candidates": [], "on_sale": [],
+            "floor": Decimal("0"), "cheapest": Decimal("0"),
             "sample_size": 0, "source": source, "trait_index": {}, "trait_total": 0,
             "competition": 0, "floor_reliable": False,
             "collection_size": None, "coverage_pct": None}
@@ -1537,6 +1538,11 @@ def get_market_snapshot(collection: str) -> dict:
         # пятёрке по дешевизне.
         "on_sale": on_sale,
         "floor": floor,
+        # САМЫЙ ДЕШЁВЫЙ лот в выборке. Витрины (Getgems, MRKT) показывают
+        # именно его и называют «Floor price», а мы считаем 5-й перцентиль —
+        # и числа законно расходятся. Владелец сверяет наши цифры с экраном,
+        # поэтому обе обязаны быть рядом, иначе выглядит как ошибка бота.
+        "cheapest": prices[0] if prices else Decimal("0"),
         "sample_size": sample_size,
         "source": source,
         "trait_index": trait_index,
@@ -2077,7 +2083,24 @@ def build_colors_template():
 # достаточно и станет видно, оправдана ли покупка по сегментному полу, — вот
 # тогда это станет основанием менять `min()`, а не раньше.
 
-SEGMENT_NOTIFY_MAX_PER_HOUR = int(os.getenv("SEGMENT_NOTIFY_MAX_PER_HOUR", "5"))
+SEGMENT_NOTIFY_MAX_PER_HOUR = int(os.getenv("SEGMENT_NOTIFY_MAX_PER_HOUR", "12"))
+# Сколько лотов ОДНОЙ коллекции показывать за цикл. Один.
+#
+# Живой прогон 23.09.2026: владелец получал только Surge Boards, хотя
+# коллекций двенадцать. Причина не в рынке — коллекции обходятся по очереди,
+# и первая же выедала весь часовой лимит. Лучший по ROI из коллекции
+# полезнее, чем пять подряд из одной.
+SEGMENT_MAX_PER_COLLECTION = int(os.getenv("SEGMENT_MAX_PER_COLLECTION", "1"))
+# Как долго НЕ повторять уже показанный лот. Шесть часов, а не пять минут.
+#
+# Вторая причина той же жалобы: `SEEN_TTL_SEC` = 300с, а цикл длится 6.5
+# минуты — то есть один и тот же лот считался новым КАЖДЫЙ ЦИКЛ и слал
+# уведомление снова. Три таких лота в одной коллекции забивали весь лимит
+# за час, и остальные одиннадцать коллекций не показывались НИ РАЗУ.
+#
+# Смена цены создаёт другой ключ, поэтому подешевевший лот придёт сразу —
+# выдержка глушит повтор, а не новость.
+SEGMENT_SEEN_TTL_SEC = int(os.getenv("SEGMENT_SEEN_TTL_SEC", "21600"))
 _segment_seen: dict = {}
 _segment_sent_ts: list = []
 _segment_suppressed = 0
@@ -2093,9 +2116,10 @@ def _segment_already_seen(item: dict, seg_floor: Decimal) -> bool:
     """
     key = f"{item['address']}:{item['sale_price_ton']}:{_floor_bucket(seg_floor)}"
     now = time.monotonic()
-    for k in [k for k, ts in _segment_seen.items() if now - ts > SEEN_TTL_SEC]:
+    for k in [k for k, ts in _segment_seen.items()
+              if now - ts > SEGMENT_SEEN_TTL_SEC]:
         _segment_seen.pop(k, None)
-    if now - _segment_seen.get(key, -1e9) < SEEN_TTL_SEC:
+    if now - _segment_seen.get(key, -1e9) < SEGMENT_SEEN_TTL_SEC:
         return True
     _segment_seen[key] = now
     return False
@@ -2213,9 +2237,17 @@ def find_segment_bargains(snap: dict):
         roi = compute_roi_pct(profit, buy)
         if profit <= 0 or roi < MIN_ROI_PCT:
             continue
+        seg_prices = [Decimal(str(x)) for x in
+                      (snap.get("peer_prices") or {}).get(
+                          str((item.get("traits") or {}).get(PEER_TRAIT)), [])]
         out.append({
             "item": item, "buy": buy, "seg_floor": seg_floor, "peer_n": peer_n,
             "coll_floor": snap.get("floor"),
+            # Минимумы — то, что видно на витрине. Без них наши перцентили
+            # читаются как ошибка: у владельца на экране другое число.
+            "seg_cheapest": min(seg_prices) if seg_prices else buy,
+            "coll_cheapest": snap.get("cheapest") or Decimal("0"),
+            "sell_market": _best_sell_market(snap)[0],
             "discount_pct": ((Decimal("1") - buy / seg_floor)
                              * Decimal("100")).quantize(Decimal("0.1")),
             "profit": profit, "roi": roi,
@@ -2263,9 +2295,30 @@ def notify_segment_bargain(b: dict) -> bool:
     lines.append("")
     lines += premium_lines(None, None, mint, False,
                            b["discount_pct"], f"модели «{b['model']}»")
+
+    # НОМЕР. Отвечает на вопрос «есть ли тут переплата за номер». По нашему
+    # правилу красив только минт <= 100 или из списка PRETTY_MINTS; по правилу
+    # автора видео — чем меньше РАЗНЫХ цифр, тем лучше. Обе оценки печатаются
+    # и обе дают +0%: премия не измерена ни по одной из них.
+    if mint is not None:
+        ours = "да" if is_pretty_mint(mint) else "нет"
+        lines.append(f"  • номер #{mint}: у нас красивым {ours}, "
+                     f"по правилу видео {flip_number_score(mint)}/40  → +0%")
+
+    # ГДЕ ПОКУПАЕМ И ГДЕ ПРОДАЁМ — коротко и прямо.
+    buy_m = item.get("sale_market") or "?"
+    sell_m = b.get("sell_market") or buy_m
     lines += [
-        f"  • floor этой модели {q(b['seg_floor'])} по {b['peer_n']} лотам, "
-        f"floor коллекции {q(b['coll_floor'])}",
+        "",
+        f"🛒 Купить на «{buy_m}» → 🏪 выставить на «{sell_m}»",
+        # СВЕРКА С ВИТРИНОЙ. Getgems пишет «Floor price» и показывает САМЫЙ
+        # ДЕШЁВЫЙ лот, а мы считаем 5-й перцентиль — числа расходятся
+        # ЗАКОННО, и без этой строки владелец видит расхождение как баг.
+        f"📏 Наш floor = 5-й перцентиль, витрина показывает минимум:",
+        f"  модель: у нас {q(b['seg_floor'])}, самый дешёвый "
+        f"{q(b['seg_cheapest'])} ({b['peer_n']} лотов в выборке)",
+        f"  коллекция: у нас {q(b['coll_floor'])}, самый дешёвый "
+        f"{q(b['coll_cheapest'])}",
         "",
         # Главное предложение сообщения. Без него это выглядит как находка.
         "⚠️ БОТ ЭТО НЕ КУПИТ. Оценка по floor СЕГМЕНТА, а торговля считает по "
@@ -2287,9 +2340,16 @@ def notify_segment_bargain(b: dict) -> bool:
 
 
 def scan_segment_bargains(snap: dict) -> int:
-    """Находит, логирует и шлёт. Возвращает число найденных. Покупок нет."""
-    found = 0
-    for b in find_segment_bargains(snap):
+    """
+    Находит, логирует и шлёт. Возвращает число найденных. Покупок нет.
+
+    В ЛОГ попадают ВСЕ находки, в ТЕЛЕФОН — не больше
+    `SEGMENT_MAX_PER_COLLECTION` лучших по ROI. Коллекции обходятся по
+    очереди, и без этого потолка первая же выедала весь часовой лимит:
+    владелец получал только Surge Boards при двенадцати коллекциях.
+    """
+    found, notified = 0, 0
+    for b in find_segment_bargains(snap):          # уже отсортированы по ROI
         if _segment_already_seen(b["item"], b["seg_floor"]):
             continue
         found += 1
@@ -2299,7 +2359,9 @@ def scan_segment_bargains(snap: dict) -> int:
                  f"(лотов {b['peer_n']}) | −{b['discount_pct']}% | "
                  f"профит {b['profit']:.4f} TON, ROI {b['roi']}% | "
                  f"{_Color.YELLOW}бот это НЕ купит{_Color.RESET}")
-        notify_segment_bargain(b)
+        if notified < SEGMENT_MAX_PER_COLLECTION:
+            if notify_segment_bargain(b):
+                notified += 1
     return found
 
 

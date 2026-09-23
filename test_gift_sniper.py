@@ -77,7 +77,8 @@ _PINNED = {
     "DRY_RUN": True, "CONFIRM_LIVE_TRADING": "", "COLLECTION_WHITELIST": [],
     "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "", "HEARTBEAT_MIN": 60,
     "MIN_MARKET_SAMPLE": 5, "NEAR_MISS_TOP": 3,
-    "SEGMENT_NOTIFY_MAX_PER_HOUR": 5,
+    "SEGMENT_NOTIFY_MAX_PER_HOUR": 12,
+    "SEGMENT_MAX_PER_COLLECTION": 1, "SEGMENT_SEEN_TTL_SEC": 21600,
     "FLIP_BUDGET_TON": Decimal("7"), "FLIP_MAX_PREMIUM": Decimal("0.20"),
     "FLIP_BUY_SCORE": 70, "FLIP_WATCH_SCORE": 50,
     "FLIP_TARGET_MULT": Decimal("1.5"),
@@ -3694,6 +3695,33 @@ check("торговый кеш при этом НЕ ТРОНУТ",
 gs._segment_seen.clear()
 gs._seen_cache.clear()
 
+# ПОЧЕМУ ПРИХОДИЛ ТОЛЬКО SURGE BOARDS. Две причины, обе в этом файле.
+#
+# 1) Выдержка повтора была SEEN_TTL_SEC = 300с при цикле 6.5 мин: один и тот
+#    же лот считался новым КАЖДЫЙ ЦИКЛ и слал уведомление снова, забивая
+#    часовой лимит. Теперь своя выдержка, шесть часов.
+check("выдержка повтора у наблюдения СВОЯ и длинная",
+      gs.SEGMENT_SEEN_TTL_SEC > gs.SEEN_TTL_SEC * 10,
+      (gs.SEGMENT_SEEN_TTL_SEC, gs.SEEN_TTL_SEC))
+# Смена цены обязана пробивать выдержку: подешевевший лот — это новость,
+# а не повтор.
+gs._segment_seen.clear()
+_i55 = _si("0:x1", "6.99", "Sapphire")
+gs._segment_already_seen(_i55, Decimal("9.39"))
+check("тот же лот по ДРУГОЙ цене не считается виденным",
+      gs._segment_already_seen(_si("0:x1", "5.50", "Sapphire"),
+                               Decimal("9.39")) is False)
+gs._segment_seen.clear()
+
+# 2) Коллекции обходятся по очереди, и первая выедала весь лимит. Теперь в
+#    телефон идёт не больше SEGMENT_MAX_PER_COLLECTION лучших по ROI, а в лог
+#    по-прежнему все.
+_src55b = open("gift_sniper.py", encoding="utf-8").read()
+_sc = _src55b[_src55b.index("def scan_segment_bargains("):]
+_sc = _sc[:_sc.index("\ndef ")]
+check("на коллекцию шлётся ограниченное число, а логируются все",
+      "notified < SEGMENT_MAX_PER_COLLECTION" in _sc and "found += 1" in _sc)
+
 # Сообщение ОБЯЗАНО говорить, что покупки не будет: похожее на находку
 # заставило бы ждать автоматической сделки, которой не случится.
 _src55 = open("gift_sniper.py", encoding="utf-8").read()
@@ -3701,7 +3729,17 @@ _ns = _src55[_src55.index("def notify_segment_bargain("):]
 _ns = _ns[:_ns.index("\ndef ")]
 check("в сообщении сказано, что бот это НЕ купит", "НЕ КУПИТ" in _ns)
 check("названы оба floor — сегмента и коллекции",
-      "floor этой модели" in _ns and "floor коллекции" in _ns)
+      "модель: у нас" in _ns and "коллекция: у нас" in _ns)
+# СВЕРКА С ВИТРИНОЙ. Getgems пишет «Floor price» и показывает САМЫЙ ДЕШЁВЫЙ
+# лот, мы считаем 5-й перцентиль. Владелец увидел 8.83 у нас и 6.79 на экране
+# и решил, что бот врёт. Числа расходятся законно, и сообщение обязано это
+# называть — иначе каждая проверка глазами выглядит как пойманный баг.
+check("рядом с перцентилем назван самый дешёвый лот",
+      "самый дешёвый" in _ns and "перцентиль" in _ns, _ns[:200])
+check("сказано, где купить и где выставить",
+      "Купить на" in _ns and "выставить на" in _ns)
+check("номер оценён обеими мерками и обе дают ноль",
+      "по правилу видео" in _ns and "+0%" in _ns)
 
 # И покупок тут нет ни одной — ни прямо, ни через торговый путь.
 _ss = _src55[_src55.index("def scan_segment_bargains("):]
