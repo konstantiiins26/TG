@@ -23,6 +23,11 @@ echo  Otchet budet v: %LOG%
 echo ================================================================
 echo.
 
+REM VNIMANIE pri pravke: ")" vnutri echo ZAKRYVAET blok if ( ... ) else ( ... ).
+REM Stroka "echo [1/3] ... (--colors)..." uronila ves fail s soobshcheniem
+REM "... was unexpected at this time". V .bat skobki - eto sintaksis, a ne
+REM oformlenie: v echo ih libo net, libo ekraniruyut kak ^( i ^).
+REM
 REM Tablicu cvetov peresobirat kazhdyy raz NE nado: spisok modeley pochti ne
 REM menyaetsya, a progon stoit 12 zaprosov i sekund 15 pri uzhe zhestkom
 REM limite TonAPI. Sobiraem tolko esli faila net. Nuzhno obnovit vruchnuyu -
@@ -31,12 +36,12 @@ if exist "%~dp0..\model_colors.json" (
   echo [1/3] Tablica cvetov uzhe est - propuskayu
   echo [1/3] model_colors.json uzhe sobran, shag propushchen >> "%LOG%"
 ) else (
-  echo [1/3] Tablica cvetov modeley (--colors)...
+  echo [1/3] Tablica cvetov modeley: --colors
   py gift_sniper.py --colors >> "%LOG%" 2>&1
   echo       gotovo
 )
 
-echo [2/3] Poisk lotov po modeli avtora (--flip)...
+echo [2/3] Poisk lotov po modeli avtora: --flip
 py gift_sniper.py --flip >> "%LOG%" 2>&1
 echo       gotovo
 
@@ -44,7 +49,7 @@ REM Ploshchadki proveryaem na PERVOY kollekcii iz spiska. Spisok zadaetsya
 REM v settings.bat, poetomu adres nikuda vpisyvat ne nado.
 for /f "tokens=1 delims=," %%a in ("%TARGET_COLLECTIONS%") do set FIRST_COLL=%%a
 
-echo [3/3] Kakie ploshchadki my voobshche vidim (--probe)...
+echo [3/3] Kakie ploshchadki my voobshche vidim: --probe
 py gift_sniper.py --probe %FIRST_COLL% >> "%LOG%" 2>&1
 echo       gotovo
 
