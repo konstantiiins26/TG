@@ -222,4 +222,17 @@ REM avtomaticheski. Ostalnoe - odno slovo rukami, glyadya na kartinku.
 REM Zapolnennoe vami povtornyy zapusk NE zatret.
 set FLIP_MODEL_COLORS=model_colors.json
 
+REM --- "Deshevle svoih": nablyudenie po segmentu, BEZ pokupki ---
+REM Loty deshevle floor SVOEY modeli torgovlya otklonyaet: eff_floor =
+REM min(floor kollekcii, floor segmenta), i pri bolee nizkom floor kollekcii
+REM minimum stiraet segmentnuyu skidku. Menyat min() znachilo by uvelichit
+REM raschetnuyu pribyl BEZ DANNYH - eto zapreshcheno pravilom proekta.
+REM
+REM Poetomu bot takie loty tolko POKAZYVAET. Pokupaete rukami, otmechaete
+REM knopkami - tak nakaplivaetsya zapis, po kotoroy potom budet vidno,
+REM opravdana li pokupka po segmentnomu polu.
+REM
+REM Skolko takih soobshcheniy slat maksimum za chas. 0 = vyklyuchit.
+set SEGMENT_NOTIFY_MAX_PER_HOUR=5
+
 REM Konec nastroek. Zapusk - v run.bat ili start-windows.bat.

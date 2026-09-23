@@ -77,6 +77,7 @@ _PINNED = {
     "DRY_RUN": True, "CONFIRM_LIVE_TRADING": "", "COLLECTION_WHITELIST": [],
     "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "", "HEARTBEAT_MIN": 60,
     "MIN_MARKET_SAMPLE": 5, "NEAR_MISS_TOP": 3,
+    "SEGMENT_NOTIFY_MAX_PER_HOUR": 5,
     "FLIP_BUDGET_TON": Decimal("7"), "FLIP_MAX_PREMIUM": Decimal("0.20"),
     "FLIP_BUY_SCORE": 70, "FLIP_WATCH_SCORE": 50,
     "FLIP_TARGET_MULT": Decimal("1.5"),
@@ -3621,6 +3622,83 @@ _ev54 = _src54[_src54.index("def evaluate_trade("):]
 _ev54 = _ev54[:_ev54.index("\ndef ")]
 check("evaluate_trade не вызывает скоринг чужой модели",
       "score_flip" not in _ev54 and "flip_" not in _ev54)
+
+
+# =============================================================================
+print("\n[55] «Дешевле своих»: показываем, но НЕ покупаем")
+# =============================================================================
+
+# Решение владельца 23.09.2026. Лоты, дешёвые относительно floor СВОЕЙ модели,
+# торговля отклоняет из-за min(floor коллекции, floor сегмента). Менять min()
+# значило бы увеличить расчётную прибыль без данных, поэтому здесь ровно
+# наблюдение: находим и показываем, покупок нет.
+
+def _si(addr, price, model, mint=1234):
+    return {"address": addr, "sale_price_ton": Decimal(str(price)),
+            "mint_index": mint, "traits": {"model": model},
+            "collection_address": "0:c", "sale_market": "Getgems Sales",
+            "is_on_sale": True, "explicit_rarity_pct": None,
+            "collection_name": "C"}
+
+# floor коллекции 5.00 (ниже сегментного) — именно тот случай, где торговля
+# отказывает, а наблюдение обязано лот показать.
+_snap55 = {
+    "floor": Decimal("5.00"), "floor_reliable": True,
+    "on_sale": [_si("0:x1", "6.99", "Sapphire"), _si("0:x2", "9.50", "Sapphire")],
+    "peer_prices": {"Sapphire": [Decimal("9.39")] * 6},
+    "trait_index": {}, "trait_total": 0, "competition": 0,
+}
+_b55 = gs.find_segment_bargains(_snap55)
+check("лот дешевле floor своего сегмента найден", len(_b55) == 1, len(_b55))
+check("это тот самый лот", _b55[0]["item"]["address"] == "0:x1")
+check("прибыль считается compute_net_profit, а не своей формулой",
+      _b55[0]["profit"] == gs.compute_net_profit(Decimal("9.39"), Decimal("6.99")),
+      _b55[0]["profit"])
+check("скидка от СЕГМЕНТНОГО пола, а не от коллекции",
+      _b55[0]["discount_pct"] == Decimal("25.6"), _b55[0]["discount_pct"])
+
+# А торговля тот же лот по-прежнему отклоняет — механизм не тронут.
+_ev55 = gs.evaluate_trade(_si("0:x1", "6.99", "Sapphire"), _snap55, None)
+check("торговля этот лот ВСЁ РАВНО отклоняет (min() не менялся)",
+      _ev55["allowed"] is False and _ev55["eff_floor"] == Decimal("5.00"),
+      (_ev55["allowed"], _ev55["eff_floor"]))
+
+# Недостоверный floor — не наблюдаем вовсе: прибыль от выдуманного пола.
+check("при недостоверном floor не ищем ничего",
+      gs.find_segment_bargains(dict(_snap55, floor_reliable=False)) == [])
+# Нет данных о похожих — не догадываемся.
+check("без выборки по сегменту лот не берётся",
+      gs.find_segment_bargains(dict(_snap55, peer_prices={})) == [])
+
+# ДЕДУПЛИКАЦИЯ ОТДЕЛЬНАЯ ОТ ТОРГОВОЙ. Общий кеш был бы тихой поломкой:
+# наблюдение пометило бы лот виденным, и торговый путь пропустил бы его молча.
+gs._segment_seen.clear()
+gs._seen_cache.clear()
+_it55 = _si("0:x1", "6.99", "Sapphire")
+check("первый раз лот не считается виденным",
+      gs._segment_already_seen(_it55, Decimal("9.39")) is False)
+check("повторно — уже виденным",
+      gs._segment_already_seen(_it55, Decimal("9.39")) is True)
+check("торговый кеш при этом НЕ ТРОНУТ",
+      gs.already_analyzed(_it55, Decimal("5.00")) is False)
+gs._segment_seen.clear()
+gs._seen_cache.clear()
+
+# Сообщение ОБЯЗАНО говорить, что покупки не будет: похожее на находку
+# заставило бы ждать автоматической сделки, которой не случится.
+_src55 = open("gift_sniper.py", encoding="utf-8").read()
+_ns = _src55[_src55.index("def notify_segment_bargain("):]
+_ns = _ns[:_ns.index("\ndef ")]
+check("в сообщении сказано, что бот это НЕ купит", "НЕ КУПИТ" in _ns)
+check("названы оба floor — сегмента и коллекции",
+      "floor этой модели" in _ns and "floor коллекции" in _ns)
+
+# И покупок тут нет ни одной — ни прямо, ни через торговый путь.
+_ss = _src55[_src55.index("def scan_segment_bargains("):]
+_ss = _ss[:_ss.index("\ndef ")]
+check("наблюдение не вызывает покупку",
+      "execute_blockchain_buy" not in _ss and "record_purchase" not in _ss
+      and "process_item" not in _ss)
 
 
 # =============================================================================

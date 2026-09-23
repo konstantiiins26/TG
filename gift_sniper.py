@@ -2058,6 +2058,156 @@ def build_colors_template():
     return True
 
 
+# =============================================================================
+# НАХОДКИ ПО СЕГМЕНТУ — ТОЛЬКО ПОКАЗ, БЕЗ ПОКУПКИ
+# =============================================================================
+# Решение владельца от 23.09.2026: «показывать, но не покупать».
+#
+# Повод. Лоты, дешёвые относительно floor СВОЕЙ модели (17-29% в первом же
+# прогоне, ROI 12-31% по нашей же формуле), торговля отклоняет из-за
+# `eff_floor = min(floor коллекции, floor сегмента)`: когда floor коллекции
+# ниже, минимум стирает сегментную скидку целиком.
+#
+# Менять `min()` значило бы увеличить расчётную прибыль БЕЗ ДАННЫХ — прямо
+# против правила проекта. Поэтому здесь ровно наблюдение: находим, называем,
+# показываем. Формула прибыли та же (`compute_net_profit`), торговый путь не
+# тронут, покупок нет ни одной.
+#
+# Смысл: накопить запись о том, ЧЕМ кончаются такие лоты. Когда их наберётся
+# достаточно и станет видно, оправдана ли покупка по сегментному полу, — вот
+# тогда это станет основанием менять `min()`, а не раньше.
+
+SEGMENT_NOTIFY_MAX_PER_HOUR = int(os.getenv("SEGMENT_NOTIFY_MAX_PER_HOUR", "5"))
+_segment_seen: dict = {}
+_segment_sent_ts: list = []
+_segment_suppressed = 0
+
+
+def _segment_already_seen(item: dict, seg_floor: Decimal) -> bool:
+    """
+    Дедупликация ОТДЕЛЬНАЯ от торговой (`already_analyzed`).
+
+    Общий кеш был бы тихой поломкой: наблюдение пометило бы лот виденным, и
+    торговый путь пропустил бы его молча. Два разных вопроса — два разных
+    журнала.
+    """
+    key = f"{item['address']}:{item['sale_price_ton']}:{_floor_bucket(seg_floor)}"
+    now = time.monotonic()
+    for k in [k for k, ts in _segment_seen.items() if now - ts > SEEN_TTL_SEC]:
+        _segment_seen.pop(k, None)
+    if now - _segment_seen.get(key, -1e9) < SEEN_TTL_SEC:
+        return True
+    _segment_seen[key] = now
+    return False
+
+
+def find_segment_bargains(snap: dict):
+    """
+    Лоты, дешёвые относительно floor СВОЕГО сегмента. Список, без побочных
+    эффектов и без сети.
+
+    Смотрит ВСЕ выставленные лоты, а не `CANDIDATES_TO_ANALYZE` самых дешёвых.
+    Это вторая причина, по которой торговля таких лотов не видела: пять самых
+    дешёвых по абсолютной цене — это лоты, ЗАДАЮЩИЕ floor, и скидки у них по
+    определению почти нет.
+
+    Прибыль считается `compute_net_profit()` — той же функцией, что и везде.
+    Второй формулы прибыли в проекте нет и быть не должно.
+    """
+    if not snap.get("floor_reliable"):
+        return []
+    out = []
+    for item in snap.get("on_sale", []):
+        if not is_collection_trusted(item.get("collection_address", "")):
+            continue
+        seg_floor, peer_n = peer_floor(item, snap.get("peer_prices"))
+        if seg_floor is None or seg_floor <= 0:
+            continue                      # сравнить не с чем — не догадываемся
+        buy = Decimal(str(item["sale_price_ton"]))
+        if buy >= seg_floor:
+            continue
+        profit = compute_net_profit(seg_floor, buy)
+        roi = compute_roi_pct(profit, buy)
+        if profit <= 0 or roi < MIN_ROI_PCT:
+            continue
+        out.append({
+            "item": item, "buy": buy, "seg_floor": seg_floor, "peer_n": peer_n,
+            "coll_floor": snap.get("floor"),
+            "discount_pct": ((Decimal("1") - buy / seg_floor)
+                             * Decimal("100")).quantize(Decimal("0.1")),
+            "profit": profit, "roi": roi,
+            "model": (item.get("traits") or {}).get("model", "?"),
+        })
+    out.sort(key=lambda b: b["roi"], reverse=True)
+    return out
+
+
+def notify_segment_bargain(b: dict) -> bool:
+    """
+    Сообщает о таком лоте. True, если отправлено.
+
+    ОБЯЗАТЕЛЬНО говорит, что бот это НЕ КУПИТ. Сообщение, похожее на обычную
+    находку, заставило бы владельца ждать автоматической сделки, которой не
+    будет, — та же ошибка, от которой в уведомлении о находке перечислены
+    причины «почему может не состояться».
+    """
+    global _segment_suppressed
+    if SEGMENT_NOTIFY_MAX_PER_HOUR <= 0:
+        return False
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    now = time.time()
+    _segment_sent_ts[:] = [t for t in _segment_sent_ts if now - t < 3600]
+    if len(_segment_sent_ts) >= SEGMENT_NOTIFY_MAX_PER_HOUR:
+        _segment_suppressed += 1
+        return False
+    _segment_sent_ts.append(now)
+
+    item = b["item"]
+    q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
+    mint = item.get("mint_index")
+    name = item.get("collection_name") or "лот"
+    sale_price = target_sale_price(b["seg_floor"])
+    lines = [
+        f"🔎 Дешевле своих: {name}" + (f" #{mint}" if mint is not None else ""),
+        f"💰 Купить {q(b['buy'])} → продать {q(sale_price)} → "
+        f"📈 {q(b['profit']):+} TON ({b['roi']}%)",
+        "",
+        f"• модель «{b['model']}»: дешевле похожих на {b['discount_pct']}%",
+        f"• floor этой модели {q(b['seg_floor'])} (лотов {b['peer_n']}), "
+        f"floor коллекции {q(b['coll_floor'])}",
+        "",
+        # Главное предложение сообщения. Без него это выглядит как находка.
+        "⚠️ БОТ ЭТО НЕ КУПИТ. Оценка по floor СЕГМЕНТА, а торговля считает по "
+        "минимуму из двух полов — намеренно, пока премия за сегмент не "
+        "измерена. Решение ваше и покупка руками.",
+        f"🔗 {GIFT_URL_TEMPLATE.format(address=friendly_ton_address(item['address']))}",
+    ]
+    if item.get("sale_market") and ALLOWED_MARKETS and \
+            item["sale_market"] not in ALLOWED_MARKETS:
+        lines.insert(-1, f"⚠️ площадка «{item['sale_market']}» не проверена")
+    return bool(_tg_call("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID, "text": "\n".join(lines),
+        "disable_web_page_preview": True}))
+
+
+def scan_segment_bargains(snap: dict) -> int:
+    """Находит, логирует и шлёт. Возвращает число найденных. Покупок нет."""
+    found = 0
+    for b in find_segment_bargains(snap):
+        if _segment_already_seen(b["item"], b["seg_floor"]):
+            continue
+        found += 1
+        log.info(f"{_Color.GREEN}ДЕШЕВЛЕ СВОИХ{_Color.RESET} "
+                 f"{_short(b['item']['address'])} | «{b['model']}» | "
+                 f"{b['buy']} при floor сегмента {b['seg_floor']} "
+                 f"(лотов {b['peer_n']}) | −{b['discount_pct']}% | "
+                 f"профит {b['profit']:.4f} TON, ROI {b['roi']}% | "
+                 f"{_Color.YELLOW}бот это НЕ купит{_Color.RESET}")
+        notify_segment_bargain(b)
+    return found
+
+
 def flip_report(limit: int = 10):
     """
     Прогоняет ЖИВОЙ рынок через модель автора видео и печатает кандидатов.
@@ -2989,10 +3139,14 @@ def notify_heartbeat(snapshots: list, force: bool = False):
         lines.append(f"Банк: {available_bankroll()} TON свободно, "
                      f"позиций {open_positions_count()}")
 
-    global _finds_suppressed
+    global _finds_suppressed, _segment_suppressed
     if _finds_suppressed:
         lines.append(f"Находок не отправлено из-за лимита: {_finds_suppressed}")
         _finds_suppressed = 0
+    if _segment_suppressed:
+        lines.append(f"«Дешевле своих» не отправлено из-за лимита: "
+                     f"{_segment_suppressed}")
+        _segment_suppressed = 0
 
     # Арбитраж между площадками: владельцу подходит и он, а общий floor
     # разницу между площадками УСРЕДНЯЕТ, то есть в обычных строках выше её
@@ -5436,6 +5590,9 @@ def _process_collection(client, collection: str, record: bool, trade: bool):
                 if found:
                     log.info(f"{_Color.GREEN}Находок в этом цикле: {found}"
                              f"{_Color.RESET}")
+                # Наблюдение по сегменту: покупок не делает, торговый путь не
+                # трогает. Смотрит ВСЕ выставленные лоты, а не пять дешёвых.
+                scan_segment_bargains(snap)
             else:
                 log.warning("Данных с рынка нет — снапшот НЕ записан.")
         elif not candidates:
@@ -5461,6 +5618,11 @@ def _process_collection(client, collection: str, record: bool, trade: bool):
             recent_sales = fetch_recent_sales_count(collection)
             if recent_sales is not None:
                 log.info(f"Продаж за {LIQUIDITY_WINDOW_HOURS}ч: {recent_sales}")
+
+            # Наблюдение по сегменту идёт ДО торговли и независимо от неё:
+            # это другой вопрос к тем же данным, и отвечать на него надо
+            # даже когда торговля по коллекции чем-то заблокирована.
+            scan_segment_bargains(snap)
 
             # Прогоняем самые дешёвые лоты через ИИ.
             for item in candidates:
