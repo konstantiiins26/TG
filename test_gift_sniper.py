@@ -4495,6 +4495,32 @@ finally:
     gs.seetg_get = _oget63
     gs._seetg_board_cache = None
 
+# СЫРАЯ БОРДА 06.10.2026 показала: у see.tg слаги в ЕДИНСТВЕННОМ числе
+# (TimelessBook, PoolFloat, CandyCane), у TonAPI имена во МНОЖЕСТВЕННОМ.
+# Точное сравнение не опознало ни одной коллекции из 121.
+check("множественное число нашего имени ловит их единственное",
+      gs._name_match("Surge Boards", "SurgeBoard") is not None
+      and gs._name_match("Timeless Books", "TimelessBook") is not None
+      and gs._name_match("Candy Canes", "CandyCane") is not None)
+check("точное совпадение ближе приставочного",
+      gs._name_match("PoolFloat", "PoolFloat") == 0
+      and gs._name_match("Pool Floats", "PoolFloat") > 0)
+# Допуск не должен превращаться в «похоже — значит оно»: решает всё равно
+# пересечение адресов, но лишние кандидаты стоят запросов к see.tg.
+check("разные коллекции не склеиваются",
+      gs._name_match("Pool Floats", "PoolParty") is None
+      and gs._name_match("Pool Floats", "SnakeBox") is None)
+check("короткие строки в допуск не идут",
+      gs._name_match("Bow", "BowTie") is None)
+
+# В карточке лота есть И адрес предмета, И кошелёк владельца. Берём ВСЕ:
+# первая попавшаяся могла бы оказаться кошельком, и верный кандидат получил
+# бы «не подтверждено».
+_a1, _a2 = "0:" + "ab" * 32, "0:" + "cd" * 32
+check("из ответа берутся все адреса, а не первый",
+      gs._seetg_all_addresses({"owner": {"address": _a1},
+                               "nft": {"address": _a2}}) == {_a1, _a2})
+
 check("имя и слаг сводятся к одному ключу",
       gs._slug_key("Spring Baskets") == gs._slug_key("SpringBaskets")
       == gs._slug_key("spring-baskets"))

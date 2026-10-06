@@ -2079,6 +2079,63 @@ def _slug_candidates(row) -> list:
     return out
 
 
+def _name_match(ours: str, theirs: str):
+    """
+    Насколько близки наши имена к их слагам. None — не похожи.
+
+    ПОЧЕМУ НЕ ТОЧНОЕ РАВЕНСТВО. Сырая борда, снятая 06.10.2026, показала:
+    у них слаги в ЕДИНСТВЕННОМ числе (`TimelessBook`, `PoolFloat`,
+    `CandyCane`), а у TonAPI имена коллекций во МНОЖЕСТВЕННОМ («Timeless
+    Books», «Pool Floats», «Candy Canes»). Точное сравнение не опознало ни
+    одной коллекции из 121 — и напечатало «у них такой коллекции нет».
+
+    Допуск безопасен ровно потому, что имя здесь НИЧЕГО НЕ РЕШАЕТ: оно
+    сужает круг, а принимает слаг только пересечение адресов. Ослабление
+    сравнения добавляет кандидатов на проверку, а не принятых ответов.
+
+    Возвращает «расстояние» (0 — точное совпадение), чтобы пробовать
+    ближайших первыми.
+    """
+    a, b = _slug_key(ours), _slug_key(theirs)
+    if not a or not b:
+        return None
+    if a == b:
+        return 0
+    if len(a) < 5 or len(b) < 5:
+        return None
+    if a.startswith(b) or b.startswith(a):
+        gap = abs(len(a) - len(b))
+        return gap if gap <= 3 else None
+    return None
+
+
+def _seetg_all_addresses(obj, depth: int = 0, out=None):
+    """
+    ВСЕ похожие на TON-адрес строки ответа, а не первая.
+
+    В карточке лота лежит и адрес предмета, и адрес кошелька владельца.
+    Взять первую попавшуюся значило бы сверять с нашей выборкой чужой
+    кошелёк и получать «не подтверждено» на верном кандидате. Наша выборка
+    состоит только из адресов предметов, поэтому лишние адреса просто не
+    совпадут ни с чем — вреда от них нет.
+    """
+    if out is None:
+        out = set()
+    if depth > 6:
+        return out
+    if isinstance(obj, str):
+        norm = normalize_ton_address(obj)
+        if norm:
+            out.add(norm)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _seetg_all_addresses(value, depth + 1, out)
+    elif isinstance(obj, list):
+        for value in obj:
+            _seetg_all_addresses(value, depth + 1, out)
+    return out
+
+
 def seetg_slug_by_census(our_name: str, our_addresses: set,
                          collection_address: str = ""):
     """
@@ -2115,15 +2172,19 @@ def seetg_slug_by_census(our_name: str, our_addresses: set,
     key = _slug_key(our_name)
     our_coll = normalize_ton_address(collection_address) if collection_address else None
 
-    by_addr, by_name = [], []
+    by_addr, scored = [], []
     for row in board:
         values = _row_strings(row)
         if our_coll and any(normalize_ton_address(v) == our_coll for v in values):
             by_addr.append(row)
-        elif key and any(_slug_key(v) == key for v in values):
-            by_name.append(row)
+            continue
+        dists = [d for d in (_name_match(our_name, v) for v in values)
+                 if d is not None]
+        if dists:
+            scored.append((min(dists), row))
 
-    cands = by_addr + by_name
+    scored.sort(key=lambda pair: pair[0])
+    cands = by_addr + [row for _d, row in scored]
     if not cands:
         # Промах печатается СЫРЬЁМ: «не нашли» и «не знаем, где искать» —
         # разные вещи, и по пустому отказу их не различить.
@@ -2136,7 +2197,7 @@ def seetg_slug_by_census(our_name: str, our_addresses: set,
         log.warning(f"    первые имена из борды: {', '.join(names[:40])}")
         return None, f"в борде see.tg не опознана коллекция «{our_name}»"
 
-    how = "по адресу контракта" if by_addr else "по имени"
+    how = "по адресу контракта" if by_addr else "по имени (с допуском)"
     tried = []
     for row in cands[:2]:
         for slug in _slug_candidates(row)[:3]:
@@ -2151,10 +2212,7 @@ def seetg_slug_by_census(our_name: str, our_addresses: set,
                 continue
             theirs = set()
             for gift in gifts:
-                addr = _seetg_find_address(gift)
-                norm = normalize_ton_address(addr) if addr else None
-                if norm:
-                    theirs.add(norm)
+                theirs |= _seetg_all_addresses(gift)
             hit = theirs & our_addresses
             if hit:
                 return slug, (f"кандидат найден {how}, подтверждён адресами: "
