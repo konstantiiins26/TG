@@ -4607,7 +4607,18 @@ check("при доказанном слаге обход TonAPI пропуска
 _ok63f, _why63f = gs.seetg_price_trusted([_gift63], Decimal("6.38"))
 check("совпадение с floor подтверждает разбор цены", _ok63f, _why63f)
 _bad63f, _whybad63f = gs.seetg_price_trusted([_gift63], Decimal("3.00"))
-check("расхождение с floor разбор цены отвергает", not _bad63f, _whybad63f)
+check("цена ВЫШЕ floor разбор отвергает: sort=price обязан дать дешёвый первым",
+      not _bad63f, _whybad63f)
+# Борда by=model пересобирается раз в несколько минут, а sort=price живой:
+# лот ЗАКОННО бывает дешевле борда-floor. Прогон 06.10.2026 терял коллекцию
+# на расхождении 1.6% при пороге 1%.
+_stale, _whystale = gs.seetg_price_trusted([_gift63], Decimal("6.50"))
+check("лот дешевле борда-floor — это отставание борды, а не поломка",
+      _stale and "борда отстаёт" in _whystale, _whystale)
+# Но запас вниз ОГРАНИЧЕН: заниженная цена покупки ЗАВЫШАЕТ прибыль.
+_deep, _whydeep = gs.seetg_price_trusted([_gift63], Decimal("20"))
+check("цена втрое ниже floor отвергается, а не принимается как «свежий лот»",
+      not _deep, _whydeep)
 check("в причине названы оба числа",
       "6.38" in _whybad63f and "3.00" in _whybad63f, _whybad63f)
 _none63f, _whynone = gs.seetg_price_trusted([{"saleInfo": {}}], Decimal("5"))

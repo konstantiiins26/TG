@@ -2640,11 +2640,33 @@ def seetg_price_trusted(gifts, board_floor):
     if first is None:
         raw = gifts[0].get("saleInfo")
         return False, f"цена не разобрана. Сырьё saleInfo: {str(raw)[:300]}"
-    gap = abs(first - board_floor)
-    if board_floor > 0 and gap / board_floor <= Decimal("0.01"):
-        return True, f"цена сошлась с floor коллекции ({first} ~ {board_floor})"
-    return False, (f"цена первого лота {first} не сошлась с floorTon коллекции "
-                   f"{board_floor} — разобрано не то поле")
+    if board_floor <= 0:
+        return False, "floor коллекции нулевой"
+    ratio = first / board_floor
+    # ПРОВЕРКА ОДНОСТОРОННЯЯ, и это не послабление «чтобы заработало».
+    # Борда `by=model` пересобирается у них раз в несколько минут (сказано в
+    # их же документации), а `sort=price` отвечает живыми лотами. Значит цена
+    # первого лота ЗАКОННО бывает НИЖЕ борда-floor: свежий дешёвый листинг
+    # борда ещё не увидела. Прогон 06.10.2026 поймал ровно это — 3.9168
+    # против 3.98, расхождение 1.6% при пороге 1%, и коллекция выпала зря.
+    #
+    # А ВЫШЕ быть не может: `sort=price` обязан отдать самый дешёвый первым,
+    # и если он дороже минимума по моделям, значит мы читаем не то поле.
+    # Асимметрия здесь не косметика: завышенная цена покупки занижала бы
+    # прибыль (безопасно), а заниженная — ЗАВЫШАЛА бы, поэтому запас вниз
+    # ограничен четвертью, а не оставлен открытым.
+    if Decimal("0.75") <= ratio <= Decimal("1.01"):
+        note = f"цена сошлась с floor коллекции ({first} ~ {board_floor})"
+        if ratio < Decimal("0.99"):
+            note += " — лот дешевле борда-floor, борда отстаёт на пару минут"
+        return True, note
+    if ratio > Decimal("1.01"):
+        return False, (f"цена первого лота {first} ВЫШЕ floorTon коллекции "
+                       f"{board_floor} — sort=price обязан отдать самый "
+                       f"дешёвый первым, значит разобрано не то поле")
+    return False, (f"цена первого лота {first} ниже floorTon коллекции "
+                   f"{board_floor} более чем на четверть — так борда не "
+                   f"устаревает, разобрано не то поле")
 
 
 def seetg_slug_for(collection: str, name: str, items):
