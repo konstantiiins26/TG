@@ -4365,6 +4365,140 @@ try:
 finally:
     gs.requests, gs.SEETG_TOKEN, gs.SEETG_MIN_INTERVAL = _oreq63, _otok63, _oint63
 
+# --- 404 и формы адреса -------------------------------------------------
+# Первый живой прогон 06.10.2026 получил "404 Client Error" и больше ничего.
+# По такой строке нельзя отличить «у них нет этого объекта» от «мы спросили
+# не тем параметром» — а лечатся эти случаи по-разному. Тело ответа обязано
+# попадать в сообщение.
+
+
+class _Resp63b(_Resp63):
+    text = ""
+
+
+_RAW63 = "0:" + "ab" * 32
+
+_oreq63b, _otok63b, _oint63b = gs.requests, gs.SEETG_TOKEN, gs.SEETG_MIN_INTERVAL
+gs.SEETG_TOKEN = "12:SeCrEtToKeN"
+gs.SEETG_MIN_INTERVAL = Decimal("0")
+try:
+    gs.requests = _Req63(_Resp63b(404, {"ok": False, "description": "gift not found"}))
+    try:
+        gs.seetg_get("/resolve", {"q": "EQ..."})
+        check("404 не проходит молча", False)
+    except RuntimeError as e:
+        check("404 несёт описание от сервера, а не голый код",
+              "not found" in str(e) and "404" in str(e), str(e))
+
+    # Адрес у каждого слоя пишется по-своему: EQ (bounceable), UQ и raw.
+    # Спросить одной формой и объявить «у них этого нет» — это вывод о целом
+    # по наблюдению за частью, тот самый класс ошибки проекта.
+    class _ReqForms63:
+        def __init__(self, accept):
+            self.accept = accept
+            self.asked = []
+
+        def get(self, url, params=None, headers=None, timeout=None):
+            q = (params or {}).get("q", "")
+            self.asked.append(q)
+            if self.accept(q):
+                return _Resp63b(200, {"ok": True, "result": {
+                    "type": "gift", "gift": {"slug": "SpringBaskets", "num": 7}}})
+            return _Resp63b(404, {"ok": False, "description": "not found"})
+
+    _items63 = [{"address": _RAW63, "sale_price_ton": Decimal("5")}]
+
+    _r = _ReqForms63(lambda q: q.startswith("0:"))
+    gs.requests = _r
+    _card, _by, _tries = gs.seetg_resolve_gift(_items63)
+    check("перебор форм доходит до raw",
+          _card is not None and (_card.get("gift") or {}).get("slug") == "SpringBaskets",
+          _card)
+    check("спрошены все три формы, raw последней",
+          len(_r.asked) == 3 and _r.asked[0].startswith("EQ")
+          and _r.asked[1].startswith("UQ") and _r.asked[2] == _RAW63, _r.asked)
+    check("неудачные формы названы поимённо", len(_tries) == 2, _tries)
+    check("сказано, какой формой нашли", "raw" in (_by or ""), _by)
+
+    # Если подходит первая форма, лишних запросов НЕ делается: правила see.tg
+    # запрещают лишний трафик, и перебор не должен стать обходом.
+    _r2 = _ReqForms63(lambda q: True)
+    gs.requests = _r2
+    _card2, _by2, _tries2 = gs.seetg_resolve_gift(_items63)
+    check("на первой подошедшей форме перебор прекращается",
+          len(_r2.asked) == 1 and not _tries2, _r2.asked)
+
+    # Ни одна форма не подошла — честный None, а не выдуманный слаг.
+    _r3 = _ReqForms63(lambda q: False)
+    gs.requests = _r3
+    _card3, _by3, _tries3 = gs.seetg_resolve_gift(_items63, tries=1)
+    check("при полном отказе слаг не выдумывается", _card3 is None and _by3 is None)
+    check("отказ по каждой форме записан", len(_tries3) == 3, _tries3)
+finally:
+    gs.requests, gs.SEETG_TOKEN, gs.SEETG_MIN_INTERVAL = _oreq63b, _otok63b, _oint63b
+
+# Круговая проверка: адрес берётся ИЗ ИХ ЖЕ ответа. Если он не распознаётся,
+# значит resolve не принимает адреса предметов — это измерение, а не чтение
+# документации.
+check("адрес находится в их карточке на любой глубине",
+      gs._seetg_find_address({"gift": {"owner": {"address": _RAW63}}}) == _RAW63)
+check("не-адрес за адрес не выдаётся",
+      gs._seetg_find_address({"gift": {"slug": "PlushPepe"}}) is None)
+check("контрольный образец взят из их документации",
+      "t.me/nft/PlushPepe-1" in _src63)
+check("контрольная проверка идёт ДО сравнения floor",
+      _src63.index("seetg_probe_resolve()")
+      < _src63.index("for coll in TARGET_COLLECTIONS[:limit_collections]"))
+
+# --- запасной путь к слагу: имя сужает, адреса доказывают ---------------
+# Совпадение названий — ДОГАДКА, и решать по ней запрещено правилом проекта.
+# Поэтому слаг принимается только после сверки адресов: пересеклись с нашей
+# выборкой — это та же коллекция (факт о блокчейне), нет — отказ.
+_OUR63 = {"0:" + "cd" * 32, "0:" + "ef" * 32}
+
+
+def _census_stub(gift_addrs):
+    def _get(path, params=None):
+        if path == "/floors" and (params or {}).get("by") == "collection":
+            return {"items": [{"slug": "SpringBaskets", "title": "Spring Baskets"},
+                              {"slug": "PlushPepe", "title": "Plush Pepe"}]}
+        if path == "/gifts":
+            return {"items": [{"address": a} for a in gift_addrs]}
+        return {}
+    return _get
+
+
+_oget63 = gs.seetg_get
+try:
+    gs._seetg_board_cache = None
+    gs.seetg_get = _census_stub(["0:" + "cd" * 32])
+    _slug, _why = gs.seetg_slug_by_census("Spring Baskets", _OUR63)
+    check("слаг принят, когда адреса пересеклись с нашей выборкой",
+          _slug == "SpringBaskets", (_slug, _why))
+    check("в пояснении сказано, что подтверждено адресами", "адрес" in _why, _why)
+
+    # Имя совпало, адреса — нет. Это и есть случай, ради которого проверка:
+    # принять такой слаг значило бы сравнить свой floor с ЧУЖОЙ коллекцией.
+    gs._seetg_board_cache = None
+    gs.seetg_get = _census_stub(["0:" + "11" * 32, "0:" + "22" * 32])
+    _slug2, _why2 = gs.seetg_slug_by_census("Spring Baskets", _OUR63)
+    check("совпадения имени МАЛО: без пересечения адресов слаг отвергнут",
+          _slug2 is None, (_slug2, _why2))
+    check("отказ назван причиной, а не молчанием", "подтвержд" in _why2, _why2)
+
+    # Имени нет в борде — честный отказ, а не ближайшее похожее.
+    gs._seetg_board_cache = None
+    gs.seetg_get = _census_stub(["0:" + "cd" * 32])
+    _slug3, _why3 = gs.seetg_slug_by_census("Nesuschestvuyushchaya", _OUR63)
+    check("неизвестное имя не подменяется похожим", _slug3 is None, (_slug3, _why3))
+finally:
+    gs.seetg_get = _oget63
+    gs._seetg_board_cache = None
+
+check("имя и слаг сводятся к одному ключу",
+      gs._slug_key("Spring Baskets") == gs._slug_key("SpringBaskets")
+      == gs._slug_key("spring-baskets"))
+
 # Нанотоны -> TON ТОЙ ЖЕ функцией, что и у TonAPI. Второй конвертер рядом с
 # первым молча перекрыл его и вернул None там, где парсер ждал Decimal —
 # поймано секцией [20] в первом же прогоне. Поэтому конвертер один.

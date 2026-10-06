@@ -1883,7 +1883,18 @@ def seetg_get(path: str, params: dict = None):
     if resp.status_code == 401:
         raise RuntimeError("see.tg: токен не принят (401). Проверьте, что "
                            "скопирован целиком в виде id:secret.")
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        # Тело ОБЯЗАНО попасть в сообщение. `raise_for_status()` даёт только
+        # "404 Client Error" — по такой строке нельзя отличить "у них нет
+        # этого объекта" от "мы спросили не тем параметром", а это разные
+        # диагнозы с разным лечением. Поймано первым же прогоном 06.10.2026.
+        detail = ""
+        try:
+            body = resp.json()
+            detail = str(body.get("description") or body.get("error") or body)
+        except Exception:  # noqa: BLE001 — тело может быть не JSON
+            detail = (resp.text or "")[:200]
+        raise RuntimeError(f"see.tg {resp.status_code} на {path}: {detail}")
     data = resp.json()
     if not data.get("ok"):
         raise RuntimeError(f"see.tg: {data.get('description') or data}")
@@ -1899,6 +1910,208 @@ def _seetg_rows(result):
             if isinstance(result.get(key), list):
                 return result[key]
     return []
+
+
+# Пример из ИХ ЖЕ документации — контрольный образец. Если он не распознаётся,
+# значит сломан наш запрос, а не покрытие их базы; если распознаётся, а наш
+# адрес нет — наоборот. Один запрос, который делит причины пополам.
+SEETG_DOC_EXAMPLE = "https://t.me/nft/PlushPepe-1"
+
+
+def _seetg_find_address(obj, depth: int = 0):
+    """Первый похожий на TON-адрес строковый лист в ответе (для круговой проверки)."""
+    if depth > 6:
+        return None
+    if isinstance(obj, str):
+        return obj if normalize_ton_address(obj) else None
+    if isinstance(obj, dict):
+        for key in ("address", "tonAddress", "nftAddress", "nft_address"):
+            got = _seetg_find_address(obj.get(key), depth + 1)
+            if got:
+                return got
+        for value in obj.values():
+            got = _seetg_find_address(value, depth + 1)
+            if got:
+                return got
+    elif isinstance(obj, list):
+        for value in obj:
+            got = _seetg_find_address(value, depth + 1)
+            if got:
+                return got
+    return None
+
+
+def seetg_resolve_gift(items, tries: int = 2):
+    """
+    Слаг коллекции по НАШЕМУ лоту: адрес скармливается /v1/resolve.
+
+    ПОЧЕМУ НЕСКОЛЬКО ФОРМ И НЕСКОЛЬКО ЛОТОВ, а не один запрос. Первый живой
+    прогон 06.10.2026 получил 404 на EQ-форме, и по ОДНОМУ отказу сказать
+    нечего: не сошлась форма адреса (EQ / UQ / raw — три разных написания
+    одного и того же), или у них нет именно нашего лота, или эндпоинт не
+    принимает адреса предметов вовсе. Это ровно тот класс ошибки, которому в
+    проекте посвящено правило: вывод о ЦЕЛОМ делается по наблюдению за ЧАСТЬЮ.
+    Поэтому спрашиваем всеми тремя формами и по нескольким лотам, и печатаем,
+    что именно спросили и что ответили.
+
+    Массовым парсингом это не является (правила see.tg, раздел 4b): единицы
+    запросов за прогон, ответ идёт в РЕШЕНИЕ, а не в архив.
+
+    Возвращает (карточка, чем нашли, список неудачных попыток).
+    """
+    attempts = []
+    for item in sorted(items, key=lambda it: it["sale_price_ton"])[:tries]:
+        raw = normalize_ton_address(item["address"]) or item["address"]
+        forms = [
+            ("EQ", friendly_ton_address(item["address"], bounceable=True)),
+            ("UQ", friendly_ton_address(item["address"], bounceable=False)),
+            ("raw", raw),
+        ]
+        for name, value in forms:
+            try:
+                card = seetg_get("/resolve", {"q": value})
+            except RateLimited:
+                raise
+            except Exception as e:  # noqa: BLE001
+                attempts.append(f"{name} {_short(value)} -> {e}")
+                continue
+            return card, f"{name} {_short(value)}", attempts
+    return None, None, attempts
+
+
+def seetg_probe_resolve():
+    """
+    Контрольный прогон /v1/resolve ДО сравнения floor. Три вопроса, три ответа.
+
+    1. Распознаётся ли пример из их документации? Нет — сломан наш запрос.
+    2. Есть ли в ответе TON-адрес предмета?
+    3. Распознаётся ли ЭТОТ ЖЕ адрес, взятый из их собственного ответа?
+       Нет — значит /v1/resolve адреса предметов не принимает, что бы ни было
+       написано в документации, и наш 404 объясняется этим, а не покрытием.
+
+    Третий шаг и есть смысл проверки: он отвечает на вопрос измерением, а не
+    чтением документации. Документация — чужое утверждение; сошедшийся круг —
+    факт о сервисе.
+    """
+    try:
+        card = seetg_get("/resolve", {"q": SEETG_DOC_EXAMPLE})
+    except Exception as e:  # noqa: BLE001
+        log.error(f"{_Color.RED}  контрольный resolve по примеру из их "
+                  f"документации ({SEETG_DOC_EXAMPLE}) не прошёл: {e}"
+                  f"{_Color.RESET}")
+        log.error("  значит дело не в наших адресах — не сходится сам запрос")
+        return False
+    gift = (card or {}).get("gift") or card or {}
+    log.info(f"  контрольный resolve прошёл: тип {(card or {}).get('type')}, "
+             f"слаг {gift.get('slug')}, номер {gift.get('num')}")
+
+    addr = _seetg_find_address(card)
+    if not addr:
+        log.warning("  в их карточке нет TON-адреса — круговую проверку "
+                    "сделать нечем")
+        return True
+    try:
+        back = seetg_get("/resolve", {"q": addr})
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"{_Color.YELLOW}  адрес ИЗ ИХ СОБСТВЕННОГО ответа "
+                    f"({_short(addr)}) не распознаётся: {e}{_Color.RESET}")
+        log.warning("  вывод измерен: /v1/resolve не принимает адреса "
+                    "предметов, слаг этим путём не достать")
+        return True
+    bgift = (back or {}).get("gift") or back or {}
+    log.info(f"{_Color.GREEN}  круг сошёлся: адрес {_short(addr)} распознан "
+             f"как {bgift.get('slug')}-{bgift.get('num')} — адреса предметов "
+             f"resolve принимает{_Color.RESET}")
+    return True
+
+
+_seetg_board_cache = None
+
+
+def _slug_key(text: str) -> str:
+    """«Spring Baskets», «SpringBaskets», «spring-baskets» -> одна строка."""
+    return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+
+
+def seetg_collection_board():
+    """
+    Все коллекции see.tg ОДНИМ запросом: /v1/floors?by=collection.
+
+    Один запрос на прогон, результат идёт в решение, а не в архив — правилам
+    это не противоречит (раздел 4b). Кеш на прогон: борда пересобирается у них
+    раз в несколько минут, а лишний запрос — доля суточной квоты.
+    """
+    global _seetg_board_cache
+    if _seetg_board_cache is None:
+        _seetg_board_cache = _seetg_rows(
+            seetg_get("/floors", {"by": "collection", "limit": 500}))
+    return _seetg_board_cache
+
+
+def _row_slug(row: dict) -> str:
+    for key in ("slug", "collectionSlug", "collection_slug", "collection"):
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, dict):
+            inner = value.get("slug") or value.get("name")
+            if isinstance(inner, str) and inner:
+                return inner
+    return ""
+
+
+def seetg_slug_by_census(our_name: str, our_addresses: set):
+    """
+    Слаг БЕЗ resolve: кандидат по имени, ДОКАЗАТЕЛЬСТВО — по адресам.
+
+    Совпадение названий — это догадка («коллекция называется так же»), и
+    принимать по ней решение запрещено правилом проекта. Поэтому имя только
+    СУЖАЕТ круг, а решает измерение: у кандидата спрашиваются несколько
+    предметов, и их TON-адреса сверяются с нашей собственной выборкой по этой
+    коллекции. Пересеклись — это та же коллекция, и это факт о блокчейне, а не
+    о названиях. Не пересеклись — слаг не принимается, и так и говорится.
+
+    Возвращает (слаг, пояснение) или (None, причина).
+    """
+    try:
+        board = seetg_collection_board()
+    except Exception as e:  # noqa: BLE001
+        return None, f"борда коллекций не получена: {e}"
+    if not board:
+        return None, "борда коллекций пуста"
+
+    key = _slug_key(our_name)
+    cands = [r for r in board
+             if key and key in (_slug_key(_row_slug(r)),
+                                _slug_key(str(r.get("title") or r.get("name") or "")))]
+    if not cands:
+        return None, (f"в борде see.tg нет коллекции с именем «{our_name}» "
+                      f"(строк в борде {len(board)})")
+
+    for row in cands[:3]:
+        slug = _row_slug(row)
+        if not slug:
+            continue
+        try:
+            gifts = _seetg_rows(seetg_get("/gifts", {"collection": slug,
+                                                     "was_on_chain": "true",
+                                                     "limit": 20}))
+        except Exception as e:  # noqa: BLE001
+            return None, f"проверка слага «{slug}» не удалась: {e}"
+        theirs = set()
+        for gift in gifts:
+            addr = _seetg_find_address(gift)
+            norm = normalize_ton_address(addr) if addr else None
+            if norm:
+                theirs.add(norm)
+        hit = theirs & our_addresses
+        if hit:
+            return slug, (f"подтверждено адресами: из {len(theirs)} их "
+                          f"предметов {len(hit)} есть в нашей выборке")
+        return None, (f"кандидат «{slug}» НЕ подтверждён: ни один из "
+                      f"{len(theirs)} их адресов не найден в нашей выборке — "
+                      f"принимать нельзя, это могла бы быть чужая коллекция")
+    return None, "у кандидатов нет слага"
 
 
 def seetg_check(limit_collections: int = 3):
@@ -1931,6 +2144,10 @@ def seetg_check(limit_collections: int = 3):
         log.error(f"{_Color.RED}see.tg недоступен: {e}{_Color.RESET}")
         return None
 
+    log.info("")
+    log.info(f"{_Color.BOLD}Контрольная проверка /v1/resolve{_Color.RESET}")
+    seetg_probe_resolve()
+
     agree = disagree = 0
     for coll in TARGET_COLLECTIONS[:limit_collections]:
         log.info("")
@@ -1945,22 +2162,44 @@ def seetg_check(limit_collections: int = 3):
             continue
 
         # Слаг добываем из НАШЕГО лота, а не из названия коллекции.
-        probe = min(on_sale, key=lambda it: it["sale_price_ton"])
-        friendly = friendly_ton_address(probe["address"])
         try:
-            card = seetg_get("/resolve", {"q": friendly})
-        except Exception as e:  # noqa: BLE001
-            log.error(f"  resolve не удался ({e}) — слаг коллекции неизвестен")
-            disagree += 1
-            continue
-
+            card, found_by, attempts = seetg_resolve_gift(on_sale)
+        except RateLimited as e:
+            log.error(f"  {e}")
+            return None
         gift = (card or {}).get("gift") or card or {}
         slug = gift.get("slug") or gift.get("collection") or ""
+        if card is None:
+            log.warning("  resolve не принял ни одну форму адреса:")
+            for line in attempts:
+                log.warning(f"    {line}")
+            # Запасной путь: имя СУЖАЕТ круг, адреса ДОКАЗЫВАЮТ совпадение.
+            ours_name = (on_sale[0].get("collection_name") or "")
+            ours_addrs = {normalize_ton_address(it["address"])
+                          for it in on_sale}
+            ours_addrs.discard(None)
+            try:
+                slug, why = seetg_slug_by_census(ours_name, ours_addrs)
+            except RateLimited as e:
+                log.error(f"  {e}")
+                return None
+            if not slug:
+                log.error(f"  слаг коллекции неизвестен — {why}")
+                disagree += 1
+                continue
+            log.info(f"{_Color.GREEN}  слаг «{slug}» найден в обход resolve: "
+                     f"{why}{_Color.RESET}")
         if not slug:
             log.error(f"  в ответе resolve нет слага. Сырой ответ: {card}")
             disagree += 1
             continue
-        log.info(f"  слаг коллекции: {slug} (по нашему лоту {_short(friendly)})")
+        if card is not None and attempts:
+            # Какая форма НЕ подошла — это факт о стыке двух слоёв, и он
+            # дороже самого слага: у каждого слоя адрес пишется по-своему.
+            for line in attempts:
+                log.info(f"    не подошло: {line}")
+        if card is not None:
+            log.info(f"  слаг коллекции: {slug} (нашли по {found_by})")
 
         try:
             rows = _seetg_rows(seetg_get("/floors", {"collection": slug,
