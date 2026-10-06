@@ -4562,6 +4562,54 @@ check("имя и слаг сводятся к одному ключу",
       gs._slug_key("Spring Baskets") == gs._slug_key("SpringBaskets")
       == gs._slug_key("spring-baskets"))
 
+# --- поиск через see.tg -------------------------------------------------
+# ГЛАВНОЕ: цена берётся ТОЛЬКО из saleInfo. Рядом лежит estimate.ton — ИХ
+# ОЦЕНКА (5279 при floor 5497), и схватить её вместо цены значит посчитать
+# прибыль от суммы, которую никто не просит.
+_gift63 = {"saleInfo": {"priceTon": "7.19", "market": "tonnel"},
+           "estimate": {"ton": 5279.05, "low": 3959.29},
+           "resellAmountTon": "0"}
+check("цена берётся из saleInfo", gs._seetg_price_ton(_gift63) == Decimal("7.19"))
+check("оценка за цену НЕ выдаётся",
+      gs._seetg_price_ton({"estimate": {"ton": 5279.05}}) is None)
+check("пустой saleInfo даёт None, а не ноль",
+      gs._seetg_price_ton({"saleInfo": None}) is None)
+
+# Разбор цены ПРОВЕРЯЕТСЯ сходимостью: первый лот из sort=price обязан
+# совпасть с floorTon коллекции — это одно утверждение, посчитанное двумя
+# их же методами. Не сошлось — читаем не то поле, считать нельзя.
+_ok63f, _why63f = gs.seetg_price_trusted([_gift63], Decimal("7.19"))
+check("совпадение с floor подтверждает разбор цены", _ok63f, _why63f)
+_bad63f, _whybad63f = gs.seetg_price_trusted([_gift63], Decimal("3.00"))
+check("расхождение с floor разбор цены отвергает", not _bad63f, _whybad63f)
+check("в причине названы оба числа",
+      "7.19" in _whybad63f and "3.00" in _whybad63f, _whybad63f)
+_none63f, _whynone = gs.seetg_price_trusted([{"saleInfo": {}}], Decimal("5"))
+check("неразобранная цена печатает сырьё, а не молчит",
+      not _none63f and "saleInfo" in _whynone, _whynone)
+
+# Суточный бюджет see.tg: у бесплатного тарифа потолок 1000, счётчик живёт
+# в БД — перезапущенный в обед бот иначе считал бы квоту нетронутой.
+check("бюджет по умолчанию ниже их потолка в 1000",
+      int(source_default("SEETG_DAILY_BUDGET")) < 1000,
+      source_default("SEETG_DAILY_BUDGET"))
+check("расход see.tg сохраняется в БД", "seetg_spent:" in _src63)
+check("исчерпанный бюджет поднимает RateLimited, а не шлёт запрос",
+      "Суточный бюджет see.tg исчерпан" in _src63)
+
+# Поиск не должен превратиться в выкачивание базы: запросов на коллекцию
+# ровно 2 + SEETG_PROBE_TOP, курсора нет.
+check("в поиске нет постраничного обхода курсором",
+      "cursor" not in _src63.split("def seetg_scan_collection")[1]
+      .split("\ndef ")[0])
+check("прибыль в поиске считает compute_net_profit",
+      "compute_net_profit" in _src63.split("def seetg_scan_collection")[1]
+      .split("\ndef ")[0])
+
+# Вердикт сверки печатался БЕЗУСЛОВНО и соврал при 3:0.
+check("вердикт сверки зависит от чисел",
+      "if disagree == 0 and agree > 0:" in _src63)
+
 # Форма ответов see.tg измеряется тремя запросами по ИХ ЖЕ примеру — наш слаг
 # для этого не нужен. Имена полей, угаданные по памяти, уже один раз выдали
 # «коллекции нет» вместо «не знаю имя поля».

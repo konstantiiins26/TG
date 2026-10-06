@@ -1837,6 +1837,52 @@ SEETG_TOKEN = os.getenv("SEETG_TOKEN", "").strip()
 # Free: 1 запрос/с, 60/мин, 1000/сутки. Берём паузу С ЗАПАСОМ, а не впритык —
 # ровно та ошибка, которая на TonAPI стоила нам оборванных обходов.
 SEETG_MIN_INTERVAL = Decimal(os.getenv("SEETG_MIN_INTERVAL", "1.2"))
+
+# СУТОЧНЫЙ БЮДЖЕТ see.tg. На бесплатном тарифе их страница называет 1000
+# запросов в сутки — это ИЗМЕРЕННОЕ число из их документации, а не наша
+# догадка, поэтому порог стоит ниже него с запасом. Зачем вообще считать:
+# кончившаяся квота у TonAPI однажды ослепила бота до полуночи, и там
+# счётчик пришлось заводить задним числом. Здесь он есть сразу.
+#
+# Расход хранится В БД по той же причине, что и у TonAPI: квота живёт на их
+# стороне, а счётчик в памяти процесса, и перезапущенный в обед бот считал бы
+# бюджет нетронутым.
+SEETG_DAILY_BUDGET = int(os.getenv("SEETG_DAILY_BUDGET", "900"))
+_seetg_spent_today = 0
+_seetg_spent_date = ""
+
+
+def _seetg_today() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def seetg_budget_load():
+    """Поднимает расход за СЕГОДНЯ. Вчерашний не берётся — квота суточная."""
+    global _seetg_spent_today, _seetg_spent_date
+    today = _seetg_today()
+    if _seetg_spent_date == today:
+        return _seetg_spent_today
+    stored = meta_get(f"seetg_spent:{today}")
+    try:
+        _seetg_spent_today = int(stored) if stored else 0
+    except (TypeError, ValueError):
+        _seetg_spent_today = 0
+    _seetg_spent_date = today
+    return _seetg_spent_today
+
+
+def seetg_budget_left() -> int:
+    return max(0, SEETG_DAILY_BUDGET - seetg_budget_load())
+
+
+def seetg_budget_spend(n: int = 1):
+    global _seetg_spent_today
+    seetg_budget_load()
+    _seetg_spent_today += n
+    try:
+        meta_set(f"seetg_spent:{_seetg_spent_date}", _seetg_spent_today)
+    except Exception as e:  # noqa: BLE001 — сбой записи не роняет наблюдение
+        log.warning(f"Расход see.tg не сохранён: {e}")
 _seetg_last_call = 0.0
 
 
@@ -1860,6 +1906,13 @@ def seetg_get(path: str, params: dict = None):
     if wait > 0:
         time.sleep(wait)
     _seetg_last_call = time.time()
+
+    if seetg_budget_left() <= 0:
+        raise RateLimited(
+            f"Суточный бюджет see.tg исчерпан ({SEETG_DAILY_BUDGET} запросов). "
+            f"Сбрасывается в полночь UTC. Поднять: SEETG_DAILY_BUDGET, но у "
+            f"бесплатного тарифа потолок 1000 в сутки.")
+    seetg_budget_spend()
 
     url = f"{SEETG_BASE}{path}"
     # Токен ЗАГОЛОВКОМ, не параметром: в URL он попал бы в логи и трейсбеки.
@@ -2484,9 +2537,272 @@ def seetg_check(limit_collections: int = 3):
 
     log.info("")
     log.info(f"{_Color.BOLD}Сошлось {agree}, разошлось {disagree}.{_Color.RESET}")
-    log.info("Пока не сошлось — источником floor see.tg НЕ становится. "
-             "Чужой API это утверждение, а не факт о блокчейне.")
+    if disagree == 0 and agree > 0:
+        # Вердикт печатался БЕЗУСЛОВНО и 06.10.2026 соврал при 3:0. Строка,
+        # по которой принимают решение о новом источнике, не должна зависеть
+        # от того, заметил ли её читатель противоречие с числами выше.
+        log.info(f"{_Color.GREEN}СОШЛОСЬ по всем {agree}: их floor везде НИЖЕ "
+                 f"нашего, выше не оказался ни разу — ровно то направление, "
+                 f"которое и предсказывалось. see.tg годится как источник "
+                 f"сравнения с конкурентами.{_Color.RESET}")
+    else:
+        log.info("Пока не сошлось — источником floor see.tg НЕ становится. "
+                 "Чужой API это утверждение, а не факт о блокчейне.")
     return disagree == 0 and agree > 0
+
+
+# Сколько самых дешёвых лотов коллекции тянуть за один заход и у скольких
+# кандидатов уточнять конкурента точным запросом. Обе цифры — это РАСХОД
+# КВОТЫ: на коллекцию уходит 2 + SEETG_PROBE_TOP запросов, и при 12
+# коллекциях прогон стоит около 60 из 900 суточных.
+SEETG_SCAN_LIMIT = int(os.getenv("SEETG_SCAN_LIMIT", "50"))
+SEETG_PROBE_TOP = int(os.getenv("SEETG_PROBE_TOP", "3"))
+
+
+def _seetg_price_ton(gift: dict):
+    """
+    Цена лота в TON из их карточки. None — не разобрана.
+
+    ПОЧЕМУ СТРОГО ВНУТРИ `saleInfo`, а не поиском числа по всему ответу.
+    Рядом лежит `estimate.ton` — ИХ ОЦЕНКА, у PlushPepe это 5279 при floor
+    5497. Вольный поиск «первого похожего на цену числа» однажды схватил бы
+    оценку вместо цены, и бот посчитал бы прибыль от суммы, которую никто не
+    просит. Это прямо запрещено правилом про расчётную прибыль.
+
+    Форма `saleInfo` на момент написания НЕ СНЯТА: в пробе она пришла пустой
+    (у того лота не было продажи). Поэтому ключи не угадываются жёстко —
+    берётся числовой лист под именем, оканчивающимся на «ton», и результат
+    ПРОВЕРЯЕТСЯ сходимостью (см. `seetg_price_trusted`).
+    """
+    info = gift.get("saleInfo")
+    if not isinstance(info, dict):
+        return None
+    best = None
+    for key, value in info.items():
+        if not key.lower().endswith("ton"):
+            continue
+        try:
+            price = Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        if price > 0 and (best is None or price < best):
+            best = price
+    return best
+
+
+def seetg_price_trusted(gifts, board_floor):
+    """
+    ПРОВЕРКА РАЗБОРА ЦЕНЫ СХОДИМОСТЬЮ, а не чтением документации.
+
+    `/v1/gifts?sort=price` отдаёт лоты от дешёвых, значит цена ПЕРВОГО обязана
+    совпасть с `floorTon` коллекции из борды — это одно и то же утверждение
+    «самый дешёвый активный листинг», посчитанное двумя их же методами.
+    Сошлось — разбор цены верен. Не сошлось — мы читаем не то поле, и считать
+    по нему прибыль нельзя.
+
+    Это тот же критерий, по которому принимались исходник Getgems и раскладка
+    контракта: чужой ответ становится фактом только после схождения.
+    """
+    if not gifts or board_floor is None:
+        return False, "сравнивать не с чем"
+    first = _seetg_price_ton(gifts[0])
+    if first is None:
+        raw = gifts[0].get("saleInfo")
+        return False, f"цена не разобрана. Сырьё saleInfo: {str(raw)[:300]}"
+    gap = abs(first - board_floor)
+    if board_floor > 0 and gap / board_floor <= Decimal("0.01"):
+        return True, f"цена сошлась с floor коллекции ({first} ~ {board_floor})"
+    return False, (f"цена первого лота {first} не сошлась с floorTon коллекции "
+                   f"{board_floor} — разобрано не то поле")
+
+
+def seetg_slug_for(collection: str, name: str, items):
+    """
+    Слаг коллекции с запоминанием В БД. Доказывается один раз, не каждый цикл.
+
+    Доказательство стоит запросов, а слаг не меняется — хранить его в памяти
+    процесса значило бы платить за него после каждого перезапуска. Тот же
+    довод, по которому в БД лежат расход квоты и смещение getUpdates.
+    """
+    key = f"seetg_slug:{normalize_ton_address(collection) or collection}"
+    cached = meta_get(key)
+    if cached:
+        return cached, "из БД (доказан ранее)"
+
+    addrs = {normalize_ton_address(it["address"]) for it in items}
+    addrs.discard(None)
+    slug, why = seetg_slug_by_census(name, addrs, collection_address=collection,
+                                     items_for_proof=items)
+    if slug:
+        meta_set(key, slug)
+    return slug, why
+
+
+def seetg_scan_collection(collection: str, name: str, items):
+    """
+    ПОИСК ЧЕРЕЗ see.tg: лот, который дешевле всех в своей модели НА ВСЕХ
+    МАРКЕТАХ. Возвращает список находок.
+
+    ПОЧЕМУ ЭТО ДРУГОЕ, ЧЕМ НАШ СЕГМЕНТНЫЙ ПОИСК. У TonAPI нет сортировки по
+    цене, поэтому «самый дешёвый конкурент» мы считали по первым N страницам
+    ПО ИНДЕКСУ — и ошиблись так пять раз подряд, каждый раз в сторону
+    завышения прибыли. Здесь и `sort=price`, и `by=model` отвечают про ВСЮ
+    витрину, включая MRKT, Portals и Tonnel, которых в TonAPI нет вовсе.
+
+    ПРАВИЛАМ see.tg это не противоречит: 2 + SEETG_PROBE_TOP запросов на
+    коллекцию, результат идёт в РЕШЕНИЕ, а не в архив. Постраничного обхода
+    всей базы здесь нет и быть не должно (раздел 4b).
+    """
+    slug, why = seetg_slug_for(collection, name, items)
+    if not slug:
+        return [], f"слаг неизвестен — {why}"
+
+    rows = _seetg_rows(seetg_get("/floors", {"by": "model", "collection": slug,
+                                             "limit": 500}))
+    model_floor, model_market = {}, {}
+    for row in rows:
+        key = row.get("key")
+        try:
+            model_floor[key] = Decimal(str(row.get("floorTon")))
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        model_market[key] = row.get("floorMarket")
+    if not model_floor:
+        return [], "пол по моделям не получен"
+
+    gifts = _seetg_rows(seetg_get("/gifts", {
+        "collection": slug, "on_sale": "true", "sort": "price",
+        "limit": SEETG_SCAN_LIMIT}))
+    if not gifts:
+        return [], "выставленных лотов не отдали"
+
+    # Floor коллекции — минимум по моделям: отдельный запрос за ним не нужен.
+    board_floor = min(model_floor.values())
+    ok, note = seetg_price_trusted(gifts, board_floor)
+    if not ok:
+        return [], f"разбор цены не подтверждён: {note}"
+
+    # Кандидат — лот, который САМ задаёт пол своей модели. Если пол модели
+    # ниже нашей цены, значит кто-то уже стоит дешевле, и чтобы уйти, нам
+    # пришлось бы встать под него — то есть ниже своей же покупки.
+    cands = []
+    for gift in gifts:
+        price = _seetg_price_ton(gift)
+        model = ((gift.get("model") or {}).get("name") or "")
+        floor = model_floor.get(model)
+        if price is None or not model or floor is None:
+            continue
+        if floor < price * Decimal("0.995"):
+            continue
+        cands.append((price, model, gift))
+
+    finds = []
+    for price, model, gift in cands[:SEETG_PROBE_TOP]:
+        # ТОЧНЫЙ конкурент: два самых дешёвых лота ЭТОЙ модели по всем
+        # маркетам. Второй и есть тот, под кого придётся вставать. Брать
+        # его из общего окна нельзя: модель может не встретиться там дважды,
+        # и «конкурента нет» означало бы не «его нет», а «мы не видели».
+        pair = _seetg_rows(seetg_get("/gifts", {
+            "collection": slug, "model": model, "on_sale": "true",
+            "sort": "price", "limit": 2}))
+        prices = [p for p in (_seetg_price_ton(g) for g in pair) if p]
+        rival = next((p for p in prices if p > price), None)
+        if rival is None:
+            continue
+        profit = compute_net_profit(rival, price)
+        roi = (profit / price * 100) if price > 0 else Decimal("0")
+        finds.append({
+            "address": gift.get("giftAddress") or "",
+            "num": gift.get("num"),
+            "model": model,
+            "price": price,
+            "rival": rival,
+            "market": (gift.get("saleInfo") or {}).get("market"),
+            "rival_market": model_market.get(model),
+            "profit": profit,
+            "roi": roi.quantize(Decimal("0.1")),
+            "mono": gift.get("monoScore"),
+        })
+    finds.sort(key=lambda f: f["roi"], reverse=True)
+    return finds, note
+
+
+def seetg_find_report(limit_collections: int = 0):
+    """
+    `--seetg-find`: что сейчас дёшево по данным see.tg. Ничего не покупает.
+
+    Прибыль считается `compute_net_profit()` — ТОЙ ЖЕ функцией, что принимает
+    торговое решение. Второй формулы прибыли в проекте нет и быть не должно.
+
+    Что здесь ПРИНЦИПИАЛЬНО иначе, чем в нашем сегментном наблюдении: цена
+    конкурента взята из метода, который отвечает про ВСЮ витрину и все
+    маркеты. Поэтому воротам `exhausted` тут нечего сторожить — неполной
+    выборки по устройству нет.
+    """
+    if not SEETG_TOKEN:
+        log.error("SEETG_TOKEN не задан. Токен: мини-апп see.tg -> Полезное "
+                  "-> API. Вписать в deploy\\my-secrets.bat.")
+        return False
+
+    colls = TARGET_COLLECTIONS[:limit_collections] if limit_collections \
+        else TARGET_COLLECTIONS
+    log.info(f"{_Color.BOLD}Поиск через see.tg по {len(colls)} коллекциям. "
+             f"Бюджет: осталось {seetg_budget_left()} из "
+             f"{SEETG_DAILY_BUDGET} на сутки.{_Color.RESET}")
+
+    total, skipped = 0, []
+    for coll in colls:
+        log.info("")
+        log.info(f"{_Color.BOLD}{_short(coll)}{_Color.RESET}")
+        snap = get_market_snapshot(coll)
+        items = snap.get("on_sale") or []
+        if not items:
+            skipped.append((coll, "у нас нет выставленных лотов для сверки"))
+            continue
+        name = items[0].get("collection_name") or ""
+        try:
+            finds, note = seetg_scan_collection(coll, name, items)
+        except RateLimited as e:
+            log.error(f"  {e}")
+            break
+        except Exception as e:  # noqa: BLE001 — сбой одной коллекции не роняет остальные
+            log.error(f"  сбой: {e}")
+            continue
+
+        if not finds:
+            # Молчание ОБЪЯСНЕНО: «не нашлось» и «не смогли посмотреть» это
+            # разные состояния, и решения у них разные.
+            log.info(f"  ничего не прошло — {note}")
+            skipped.append((coll, note))
+            continue
+
+        log.info(f"  {note}")
+        for f in finds:
+            total += 1
+            sign = "📈" if f["profit"] > 0 else "📉"
+            log.info(
+                f"  #{f['num']} «{f['model']}»: купить {f['price']} "
+                f"({f['market'] or '—'}) -> конкурент {f['rival']} "
+                f"({f['rival_market'] or '—'}) -> {sign} {f['profit']:+} TON, "
+                f"ROI {f['roi']}%")
+            if f["roi"] < SEGMENT_MIN_ROI_PCT:
+                log.info(f"      ниже порога показа {SEGMENT_MIN_ROI_PCT}%")
+            elif f["roi"] > SEGMENT_MAX_ROI_PCT:
+                log.info(f"      ВЫШЕ потолка правдоподобия "
+                         f"{SEGMENT_MAX_ROI_PCT}% — все разобранные случаи "
+                         f"такого размера оказывались ошибкой данных")
+            if f["address"]:
+                log.info(f"      {friendly_ton_address(f['address'])}")
+
+    log.info("")
+    log.info(f"{_Color.BOLD}Кандидатов: {total}. Потрачено запросов see.tg "
+             f"за сутки: {seetg_budget_load()}/{SEETG_DAILY_BUDGET}."
+             f"{_Color.RESET}")
+    if skipped:
+        log.info(f"Коллекций без результата: {len(skipped)} — причины выше.")
+    log.info("Покупок бот не делает: решение ручное, отметить покупку — "
+             "--bought АДРЕС ЦЕНА [ЦЕНА_КОНКУРЕНТА].")
+    return True
 
 
 # =============================================================================
@@ -7106,6 +7422,9 @@ def parse_args(argv=None):
     parser.add_argument("--seetg-check", action="store_true",
                         help="сверить floor и площадки see.tg с нашими "
                              "(нужен SEETG_TOKEN); ничего не меняет")
+    parser.add_argument("--seetg-find", action="store_true",
+                        help="искать через see.tg: лоты дешевле всех в своей "
+                             "модели ПО ВСЕМ маркетам; ничего не покупает")
     parser.add_argument("--numbers", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="просят ли больше за красивый НОМЕР "
                              "(почему в уведомлении стоит +0%%)")
@@ -7167,6 +7486,9 @@ if __name__ == "__main__":
             sys.exit(0 if flip_report(args.flip) else 1)
         if getattr(args, "seetg_check", False):
             sys.exit(0 if seetg_check() else 1)
+        if getattr(args, "seetg_find", False):
+            # Ходит в сеть, НИЧЕГО не покупает и в запись не пишет.
+            sys.exit(0 if seetg_find_report() else 1)
         if args.bought:
             if not 2 <= len(args.bought) <= 3:
                 log.error("Нужно: --bought АДРЕС ЦЕНА [FLOOR_КОНКУРЕНТА]")
