@@ -2136,6 +2136,17 @@ def _slug_candidates(row) -> list:
     return out
 
 
+def _singular(key: str) -> str:
+    """Грубое единственное число: posies -> posy, boards -> board."""
+    if key.endswith("ies") and len(key) > 4:
+        return key[:-3] + "y"
+    if key.endswith("ses") or key.endswith("xes") or key.endswith("ches"):
+        return key[:-2]
+    if key.endswith("s") and not key.endswith("ss") and len(key) > 3:
+        return key[:-1]
+    return key
+
+
 def _name_match(ours: str, theirs: str):
     """
     Насколько близки наши имена к их слагам. None — не похожи.
@@ -2158,6 +2169,11 @@ def _name_match(ours: str, theirs: str):
         return None
     if a == b:
         return 0
+    # «Pretty Posies» против их «PrettyPosy»: английское множественное меняет
+    # не только окончание, но и основу (y -> ies), поэтому приставочного
+    # сравнения мало — прогон 06.10.2026 на этой коллекции промахнулся.
+    if _singular(a) == _singular(b):
+        return 1
     if len(a) < 5 or len(b) < 5:
         return None
     if a.startswith(b) or b.startswith(a):
@@ -2559,35 +2575,50 @@ SEETG_SCAN_LIMIT = int(os.getenv("SEETG_SCAN_LIMIT", "50"))
 SEETG_PROBE_TOP = int(os.getenv("SEETG_PROBE_TOP", "3"))
 
 
-def _seetg_price_ton(gift: dict):
+def _seetg_best_offer(gift: dict):
     """
-    Цена лота в TON из их карточки. None — не разобрана.
+    Лучшее предложение по лоту: цена в TON, маркет и ссылка. None — нет.
 
-    ПОЧЕМУ СТРОГО ВНУТРИ `saleInfo`, а не поиском числа по всему ответу.
-    Рядом лежит `estimate.ton` — ИХ ОЦЕНКА, у PlushPepe это 5279 при floor
-    5497. Вольный поиск «первого похожего на цену числа» однажды схватил бы
-    оценку вместо цены, и бот посчитал бы прибыль от суммы, которую никто не
-    просит. Это прямо запрещено правилом про расчётную прибыль.
+    ФОРМА СНЯТА С ЖИВОГО ОТВЕТА 06.10.2026, а не угадана:
 
-    Форма `saleInfo` на момент написания НЕ СНЯТА: в пробе она пришла пустой
-    (у того лота не было продажи). Поэтому ключи не угадываются жёстко —
-    берётся числовой лист под именем, оканчивающимся на «ton», и результат
-    ПРОВЕРЯЕТСЯ сходимостью (см. `seetg_price_trusted`).
+        saleInfo: [{'amount': '6381750000', 'currency': 'gram',
+                    'market': 'tonnel',
+                    'link': 'https://t.me/tonnel_network_bot/gift?...'}]
+
+    Это СПИСОК предложений — по одному на маркет, — а не словарь. Первая
+    версия ждала словарь и возвращала None на каждом лоте; поиск честно
+    отказывался работать и печатал сырьё, по которому форма и опозналась.
+
+    БЕРУТСЯ ТОЛЬКО `currency == "gram"`. Рядом бывают цены в звёздах и USDT,
+    а наша экономика считает в TON: 10 000 звёзд это не 10 000 TON, и
+    подставить их в `compute_net_profit()` значило бы придумать прибыль.
+    Поэтому чужая валюта пропускается, а не пересчитывается по курсу —
+    курса у нас нет, и выдумывать его нельзя.
     """
-    info = gift.get("saleInfo")
-    if not isinstance(info, dict):
+    offers = gift.get("saleInfo")
+    if isinstance(offers, dict):
+        offers = [offers]
+    if not isinstance(offers, list):
         return None
     best = None
-    for key, value in info.items():
-        if not key.lower().endswith("ton"):
+    for offer in offers:
+        if not isinstance(offer, dict):
             continue
-        try:
-            price = Decimal(str(value))
-        except (InvalidOperation, ValueError, TypeError):
+        if str(offer.get("currency", "")).lower() not in ("gram", "ton"):
             continue
-        if price > 0 and (best is None or price < best):
-            best = price
+        price = _nano_to_ton(offer.get("amount"))
+        if price is None or price <= 0:
+            continue
+        if best is None or price < best["price"]:
+            best = {"price": price, "market": offer.get("market"),
+                    "link": offer.get("link")}
     return best
+
+
+def _seetg_price_ton(gift: dict):
+    """Цена лота в TON. None — не разобрана."""
+    offer = _seetg_best_offer(gift)
+    return offer["price"] if offer else None
 
 
 def seetg_price_trusted(gifts, board_floor):
@@ -2687,17 +2718,18 @@ def seetg_scan_collection(collection: str, name: str, items):
     # пришлось бы встать под него — то есть ниже своей же покупки.
     cands = []
     for gift in gifts:
-        price = _seetg_price_ton(gift)
+        offer = _seetg_best_offer(gift)
         model = ((gift.get("model") or {}).get("name") or "")
         floor = model_floor.get(model)
-        if price is None or not model or floor is None:
+        if offer is None or not model or floor is None:
             continue
-        if floor < price * Decimal("0.995"):
+        if floor < offer["price"] * Decimal("0.995"):
             continue
-        cands.append((price, model, gift))
+        cands.append((offer, model, gift))
 
     finds = []
-    for price, model, gift in cands[:SEETG_PROBE_TOP]:
+    for offer, model, gift in cands[:SEETG_PROBE_TOP]:
+        price = offer["price"]
         # ТОЧНЫЙ конкурент: два самых дешёвых лота ЭТОЙ модели по всем
         # маркетам. Второй и есть тот, под кого придётся вставать. Брать
         # его из общего окна нельзя: модель может не встретиться там дважды,
@@ -2717,7 +2749,8 @@ def seetg_scan_collection(collection: str, name: str, items):
             "model": model,
             "price": price,
             "rival": rival,
-            "market": (gift.get("saleInfo") or {}).get("market"),
+            "market": offer.get("market"),
+            "link": offer.get("link"),
             "rival_market": model_market.get(model),
             "profit": profit,
             "roi": roi.quantize(Decimal("0.1")),
@@ -2754,12 +2787,21 @@ def seetg_find_report(limit_collections: int = 0):
     for coll in colls:
         log.info("")
         log.info(f"{_Color.BOLD}{_short(coll)}{_Color.RESET}")
-        snap = get_market_snapshot(coll)
-        items = snap.get("on_sale") or []
-        if not items:
-            skipped.append((coll, "у нас нет выставленных лотов для сверки"))
-            continue
-        name = items[0].get("collection_name") or ""
+        # ОБХОД TonAPI НУЖЕН ТОЛЬКО ДЛЯ ДОКАЗАТЕЛЬСТВА СЛАГА. Когда слаг уже
+        # доказан и лежит в БД, тянуть 12 000 предметов незачем: прогон
+        # 06.10.2026 потратил на это восемь минут и упёрся в потолок страниц
+        # на двух коллекциях — при том, что ответ на вопрос решения берётся
+        # у see.tg, а не из нашей выборки.
+        key = f"seetg_slug:{normalize_ton_address(coll) or coll}"
+        items, name = [], ""
+        if not meta_get(key):
+            snap = get_market_snapshot(coll)
+            items = snap.get("on_sale") or []
+            if not items:
+                skipped.append((coll, "слаг не доказан, а выставленных лотов "
+                                      "в нашей выборке нет"))
+                continue
+            name = items[0].get("collection_name") or ""
         try:
             finds, note = seetg_scan_collection(coll, name, items)
         except RateLimited as e:
@@ -2791,6 +2833,11 @@ def seetg_find_report(limit_collections: int = 0):
                 log.info(f"      ВЫШЕ потолка правдоподобия "
                          f"{SEGMENT_MAX_ROI_PCT}% — все разобранные случаи "
                          f"такого размера оказывались ошибкой данных")
+            if f.get("link"):
+                # Ссылка приходит ОТ НИХ и ведёт прямо в бота маркета. Своя
+                # собранная ссылка уже один раз открывалась пустой страницей
+                # (форма адреса), а эта проверена их же данными.
+                log.info(f"      {f['link']}")
             if f["address"]:
                 log.info(f"      {friendly_ton_address(f['address'])}")
 

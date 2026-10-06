@@ -4566,24 +4566,50 @@ check("имя и слаг сводятся к одному ключу",
 # ГЛАВНОЕ: цена берётся ТОЛЬКО из saleInfo. Рядом лежит estimate.ton — ИХ
 # ОЦЕНКА (5279 при floor 5497), и схватить её вместо цены значит посчитать
 # прибыль от суммы, которую никто не просит.
-_gift63 = {"saleInfo": {"priceTon": "7.19", "market": "tonnel"},
+# ФОРМА СНЯТА С ЖИВОГО ОТВЕТА: saleInfo это СПИСОК предложений по маркетам,
+# amount в нанотонах. Первая версия ждала словарь и возвращала None на каждом
+# лоте — поиск отказывался работать на всех 12 коллекциях.
+_gift63 = {"saleInfo": [{"amount": "6381750000", "currency": "gram",
+                         "market": "tonnel", "link": "https://t.me/x"}],
            "estimate": {"ton": 5279.05, "low": 3959.29},
            "resellAmountTon": "0"}
-check("цена берётся из saleInfo", gs._seetg_price_ton(_gift63) == Decimal("7.19"))
+check("цена берётся из saleInfo-списка в нанотонах",
+      gs._seetg_price_ton(_gift63) == Decimal("6.381750000"),
+      gs._seetg_price_ton(_gift63))
+check("маркет и ссылка берутся оттуда же",
+      gs._seetg_best_offer(_gift63)["market"] == "tonnel"
+      and gs._seetg_best_offer(_gift63)["link"] == "https://t.me/x")
+# Звёзды и USDT — не TON. Пересчитать их нечем: курса у нас нет, и выдумать
+# его значит придумать прибыль.
+check("цена в звёздах за TON НЕ выдаётся",
+      gs._seetg_price_ton({"saleInfo": [{"amount": "10000", "currency": "xtr"}]})
+      is None)
+check("из нескольких предложений берётся самое дешёвое",
+      gs._seetg_price_ton({"saleInfo": [
+          {"amount": "9000000000", "currency": "gram"},
+          {"amount": "6000000000", "currency": "gram"}]}) == Decimal("6"))
+# «Pretty Posies» против их «PrettyPosy»: y -> ies меняет основу, приставки
+# мало. Прогон 06.10.2026 на этой коллекции промахнулся.
+check("множественное с заменой основы тоже ловится",
+      gs._name_match("Pretty Posies", "PrettyPosy") is not None)
 check("оценка за цену НЕ выдаётся",
       gs._seetg_price_ton({"estimate": {"ton": 5279.05}}) is None)
 check("пустой saleInfo даёт None, а не ноль",
       gs._seetg_price_ton({"saleInfo": None}) is None)
+# Обход TonAPI нужен ТОЛЬКО чтобы доказать слаг. Прогон потратил на него
+# восемь минут при том, что ответ берётся у see.tg.
+check("при доказанном слаге обход TonAPI пропускается",
+      "if not meta_get(key):" in _src63)
 
 # Разбор цены ПРОВЕРЯЕТСЯ сходимостью: первый лот из sort=price обязан
 # совпасть с floorTon коллекции — это одно утверждение, посчитанное двумя
 # их же методами. Не сошлось — читаем не то поле, считать нельзя.
-_ok63f, _why63f = gs.seetg_price_trusted([_gift63], Decimal("7.19"))
+_ok63f, _why63f = gs.seetg_price_trusted([_gift63], Decimal("6.38"))
 check("совпадение с floor подтверждает разбор цены", _ok63f, _why63f)
 _bad63f, _whybad63f = gs.seetg_price_trusted([_gift63], Decimal("3.00"))
 check("расхождение с floor разбор цены отвергает", not _bad63f, _whybad63f)
 check("в причине названы оба числа",
-      "7.19" in _whybad63f and "3.00" in _whybad63f, _whybad63f)
+      "6.38" in _whybad63f and "3.00" in _whybad63f, _whybad63f)
 _none63f, _whynone = gs.seetg_price_trusted([{"saleInfo": {}}], Decimal("5"))
 check("неразобранная цена печатает сырьё, а не молчит",
       not _none63f and "saleInfo" in _whynone, _whynone)
