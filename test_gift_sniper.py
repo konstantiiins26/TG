@@ -4273,6 +4273,118 @@ finally:
 _src62 = open("gift_sniper.py", encoding="utf-8").read()
 check("в лог печатается, ЧЕМ кончился обход", "конец:" in _src62)
 
+
+# =============================================================================
+# [63] ИСТОЧНИК see.tg: токен не течёт, суточная квота отличается от частотной
+# =============================================================================
+# Чужой API принимается только после схождения с нашим измерением — поэтому
+# первым написан не источник floor, а режим сверки. Здесь проверяется ровно
+# то, на чём проект уже обжигался: утечка секрета в лог и путаница между
+# «слишком часто» (секунды) и «кончилась суточная квота» (часы).
+print("\n[63] see.tg: токен, суточная квота, порядок принятия источника")
+
+_src63 = open("gift_sniper.py", encoding="utf-8").read()
+
+# Токен уходит ЗАГОЛОВКОМ. В URL он попал бы в трейсбеки и логи - ровно та
+# причина, по которой у Telegram мы логируем только description.
+check("токен передаётся заголовком Authorization",
+      'f"Bearer {SEETG_TOKEN}"' in _src63)
+check("токен не подставляется в строку запроса",
+      "token=" not in _src63.split("def seetg_get")[1].split("def ")[0])
+
+
+class _Resp63:
+    def __init__(self, code, payload=None, headers=None):
+        self.status_code = code
+        self._payload = payload or {}
+        self.headers = headers or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _Req63:
+    def __init__(self, resp):
+        self.resp = resp
+        self.seen = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.seen.append((url, params or {}, headers or {}))
+        return self.resp
+
+
+_oreq63, _otok63, _oint63 = gs.requests, gs.SEETG_TOKEN, gs.SEETG_MIN_INTERVAL
+gs.SEETG_TOKEN = "12:SeCrEtToKeN"
+gs.SEETG_MIN_INTERVAL = Decimal("0")
+try:
+    _ok = _Req63(_Resp63(200, {"ok": True, "result": {"id": 12}}))
+    gs.requests = _ok
+    check("разобран успешный ответ", gs.seetg_get("/ping") == {"id": 12})
+    _url, _params, _headers = _ok.seen[0]
+    check("секрет ушёл в заголовок", gs.SEETG_TOKEN in str(_headers))
+    check("секрета НЕТ в url и параметрах",
+          gs.SEETG_TOKEN not in _url and gs.SEETG_TOKEN not in str(_params),
+          (_url, _params))
+
+    # Два разных 429. Путать их нельзя: суточную ждут часами, обычную секунды.
+    gs.requests = _Req63(_Resp63(429, {"ok": False, "window": "day"}))
+    try:
+        gs.seetg_get("/floors")
+        check("суточная квота распознана", False)
+    except gs.RateLimited as e:
+        check("суточная квота распознана по телу", "уточная" in str(e), str(e))
+
+    gs.requests = _Req63(_Resp63(429, {"ok": False}, {"Retry-After": "7"}))
+    try:
+        gs.seetg_get("/floors")
+        check("обычный лимит распознан", False)
+    except gs.RateLimited as e:
+        check("обычный лимит назван отдельно и со сроком",
+              "уточная" not in str(e) and "7" in str(e), str(e))
+
+    # ok:false это ОТКАЗ, а не пустой результат: молча вернуть None значило бы
+    # выдать «данных нет» там, где API сказал «ошибка».
+    gs.requests = _Req63(_Resp63(200, {"ok": False, "description": "Gift not found"}))
+    try:
+        gs.seetg_get("/resolve")
+        check("ok:false не проходит молча", False)
+    except RuntimeError as e:
+        check("ok:false поднимает ошибку с описанием", "not found" in str(e))
+
+    # Без токена — понятная ошибка с тем, где его взять, а не NameError.
+    gs.SEETG_TOKEN = ""
+    try:
+        gs.seetg_get("/ping")
+        check("без токена запрос не уходит", False)
+    except RuntimeError as e:
+        check("без токена сказано, где его взять", "see.tg" in str(e))
+finally:
+    gs.requests, gs.SEETG_TOKEN, gs.SEETG_MIN_INTERVAL = _oreq63, _otok63, _oint63
+
+# Нанотоны -> TON ТОЙ ЖЕ функцией, что и у TonAPI. Второй конвертер рядом с
+# первым молча перекрыл его и вернул None там, где парсер ждал Decimal —
+# поймано секцией [20] в первом же прогоне. Поэтому конвертер один.
+check("цена из наименьшей единицы", gs._nano_to_ton("3500000000") == Decimal("3.5"))
+check("конвертер нанотонов в файле ОДИН",
+      _src63.count("def _nano_to_ton") == 1, _src63.count("def _nano_to_ton"))
+
+# ГЛАВНОЕ: источник ещё НЕ подключён к оценке. Решение владельца «показывать,
+# но не покупать» и правило «чужой API — утверждение» требуют сначала сверки.
+check("evaluate_trade про see.tg не знает",
+      "seetg" not in _src63.split("def evaluate_trade")[1].split("\ndef ")[0])
+check("источник floor пока TonAPI", "seetg" not in
+      _src63.split("def get_market_snapshot")[1].split("\ndef ")[0])
+
+# Комиссия 2% применяется ко ВСЕМ площадкам - прямое решение владельца
+# 06.10.2026. Проверяем, что формула одна и площадку не различает.
+check("в формуле прибыли одна ставка комиссии на все площадки",
+      "sale * (Decimal(\"1\") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)" in _src63)
+check("ставка по умолчанию 2%", source_default("MARKETPLACE_FEE_PCT") == "0.02")
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:

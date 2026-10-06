@@ -1776,6 +1776,215 @@ def _collect_sample(collection: str):
 
 
 # =============================================================================
+# 4b. ИСТОЧНИК see.tg (kartoshka.free) — ПОКА ТОЛЬКО ПРОВЕРКА СХОДИМОСТИ
+# =============================================================================
+#
+# Документация прочитана 06.10.2026 (страница сохранена владельцем, из среды
+# разработки хост закрыт прокси). Что он даёт и почему это важно для нас:
+#
+#   /v1/gifts?...&on_sale=true&sort=price  — СОРТИРОВКА ПО ЦЕНЕ. У TonAPI её
+#       нет, и весь класс наших ошибок (floor по 12% коллекции, «Leonardo по
+#       12 лотам», обрезанные обходы) родился именно отсюда: мы брали первые
+#       N страниц ПО ИНДЕКСУ и выдавали их за рынок.
+#   /v1/floors?by=model  — самый дешёвый активный листинг по КАЖДОЙ модели,
+#       с разбивкой по маркетам. Это ровно `cheapest_rival()`, но измеренный.
+#   маркеты telegram, portals, tonnel, getgems, mrkt — MRKT наконец видно.
+#
+# НО ЭТО ЧУЖОЕ УТВЕРЖДЕНИЕ, А НЕ ФАКТ О БЛОКЧЕЙНЕ. По правилу проекта такой
+# источник принимается только после СХОЖДЕНИЯ с тем, что мы проверили сами, —
+# тем же критерием, по которому был принят исходник Getgems. Поэтому первым
+# написан не «новый источник floor», а `--seetg-check`: он ставит их числа
+# рядом с нашими из TonAPI и молчит про выводы, пока числа не сойдутся.
+#
+# Токен в лог НЕ ПОПАДАЕТ ни одним путём — он уходит заголовком, а не в URL.
+
+SEETG_BASE = os.getenv("SEETG_BASE", "https://kartoshka.free/v1")
+SEETG_TOKEN = os.getenv("SEETG_TOKEN", "").strip()
+# Free: 1 запрос/с, 60/мин, 1000/сутки. Берём паузу С ЗАПАСОМ, а не впритык —
+# ровно та ошибка, которая на TonAPI стоила нам оборванных обходов.
+SEETG_MIN_INTERVAL = Decimal(os.getenv("SEETG_MIN_INTERVAL", "1.2"))
+_seetg_last_call = 0.0
+
+
+def seetg_get(path: str, params: dict = None):
+    """
+    GET к see.tg. Возвращает `result` из {"ok":true,"result":…} или бросает.
+
+    Форма ответа как у Telegram Bot API, коды свои: 401 — токен не передан или
+    сброшен, 429 — лимит (в теле `window: "day"`, если кончилась суточная
+    квота), 404 — объекта нет. Их надо различать: суточную квоту ждать часами,
+    обычный 429 — секунды. Это тот же урок, что с анонимной квотой TonAPI.
+    """
+    global _seetg_last_call
+    if not SEETG_TOKEN:
+        raise RuntimeError(
+            "SEETG_TOKEN не задан. Токен создаётся в мини-аппе see.tg: "
+            "Полезное -> API -> создать приложение. Положите его в "
+            "deploy\\my-secrets.bat строкой set SEETG_TOKEN=id:secret")
+
+    wait = float(SEETG_MIN_INTERVAL) - (time.time() - _seetg_last_call)
+    if wait > 0:
+        time.sleep(wait)
+    _seetg_last_call = time.time()
+
+    url = f"{SEETG_BASE}{path}"
+    # Токен ЗАГОЛОВКОМ, не параметром: в URL он попал бы в логи и трейсбеки.
+    resp = requests.get(url, params=params or {},
+                        headers={"Authorization": f"Bearer {SEETG_TOKEN}"},
+                        timeout=HTTP_TIMEOUT_SEC)
+
+    if resp.status_code == 429:
+        body = {}
+        try:
+            body = resp.json()
+        except Exception:  # noqa: BLE001 — тело может быть не JSON
+            pass
+        if str(body.get("window", "")) == "day":
+            raise RateLimited(
+                "Суточная квота see.tg исчерпана (1000 запросов на бесплатном "
+                "тарифе). Она восстанавливается в течение суток, ждать "
+                "полуночи не нужно. Тариф Plus снимает суточный лимит.")
+        raise RateLimited(f"Лимит see.tg, повторить через "
+                          f"{resp.headers.get('Retry-After', '?')}с")
+    if resp.status_code == 401:
+        raise RuntimeError("see.tg: токен не принят (401). Проверьте, что "
+                           "скопирован целиком в виде id:secret.")
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"see.tg: {data.get('description') or data}")
+    return data.get("result")
+
+
+def _seetg_rows(result):
+    """Список строк из ответа: ключ у разных методов называется по-разному."""
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in ("items", "floors", "results", "data", "rows"):
+            if isinstance(result.get(key), list):
+                return result[key]
+    return []
+
+
+def seetg_check(limit_collections: int = 3):
+    """
+    СХОДИТСЯ ЛИ see.tg С ТЕМ, ЧТО МЫ ВИДИМ САМИ. Ничего не меняет и не пишет.
+
+    Зачем отдельный режим, а не сразу новый источник floor: чужой API — это
+    утверждение, а не измерение. Проект уже дважды обжигался на выводах,
+    сделанных по симптому («GraphQL мёртв», «форма URL неверна»), и один раз
+    принял чужой исходник ПРАВИЛЬНО — потому что тот сошёлся с разобранным
+    живым листингом. Здесь тот же порядок.
+
+    Что сравнивается по каждой коллекции:
+      - наш САМЫЙ ДЕШЁВЫЙ лот из выборки TonAPI против их floorTon;
+      - наш состав площадок против их разбивки markets.
+
+    Слаг коллекции не угадывается: берётся наш реальный лот и скармливается
+    /v1/resolve — он отвечает карточкой подарка, где слаг уже есть. Решить,
+    что коллекция «называется так же», значило бы выдумать факт.
+    """
+    if not SEETG_TOKEN:
+        log.error("SEETG_TOKEN не задан — проверять нечем. Токен: мини-апп "
+                  "see.tg -> Полезное -> API.")
+        return None
+
+    try:
+        me = seetg_get("/ping")
+        log.info(f"{_Color.GREEN}Токен принят: {me}{_Color.RESET}")
+    except Exception as e:  # noqa: BLE001
+        log.error(f"{_Color.RED}see.tg недоступен: {e}{_Color.RESET}")
+        return None
+
+    agree = disagree = 0
+    for coll in TARGET_COLLECTIONS[:limit_collections]:
+        log.info("")
+        log.info(f"{_Color.BOLD}{_short(coll)}{_Color.RESET}")
+
+        snap = get_market_snapshot(coll)
+        ours_cheapest = snap.get("cheapest") or Decimal("0")
+        on_sale = snap.get("on_sale") or []
+        if not on_sale or ours_cheapest <= 0:
+            log.warning("  у нас по этой коллекции нет выставленных лотов — "
+                        "сравнивать нечего")
+            continue
+
+        # Слаг добываем из НАШЕГО лота, а не из названия коллекции.
+        probe = min(on_sale, key=lambda it: it["sale_price_ton"])
+        friendly = friendly_ton_address(probe["address"])
+        try:
+            card = seetg_get("/resolve", {"q": friendly})
+        except Exception as e:  # noqa: BLE001
+            log.error(f"  resolve не удался ({e}) — слаг коллекции неизвестен")
+            disagree += 1
+            continue
+
+        gift = (card or {}).get("gift") or card or {}
+        slug = gift.get("slug") or gift.get("collection") or ""
+        if not slug:
+            log.error(f"  в ответе resolve нет слага. Сырой ответ: {card}")
+            disagree += 1
+            continue
+        log.info(f"  слаг коллекции: {slug} (по нашему лоту {_short(friendly)})")
+
+        try:
+            rows = _seetg_rows(seetg_get("/floors", {"collection": slug,
+                                                     "by": "collection"}))
+        except Exception as e:  # noqa: BLE001
+            log.error(f"  floors не удался: {e}")
+            disagree += 1
+            continue
+        if not rows:
+            log.error("  floors вернул пусто — сравнивать не с чем")
+            disagree += 1
+            continue
+
+        row = rows[0]
+        theirs = row.get("floorTon")
+        try:
+            theirs = Decimal(str(theirs))
+        except (InvalidOperation, ValueError, TypeError):
+            log.error(f"  floorTon не разобран. Сырая строка: {row}")
+            disagree += 1
+            continue
+
+        log.info(f"  floor: наш самый дешёвый {ours_cheapest} | "
+                 f"see.tg {theirs} (маркет {row.get('floorMarket')})")
+
+        # Их floor — МИНИМУМ по всем маркетам, наш — минимум по нашей выборке
+        # с одного только TonAPI. Их число может быть НИЖЕ законно: мы не
+        # видим ни MRKT, ни Portals, ни Tonnel. ВЫШЕ нашего оно быть не должно
+        # — это значило бы, что они не видят лот, который видим мы.
+        if theirs > ours_cheapest:
+            log.warning(f"{_Color.YELLOW}  их floor ВЫШЕ нашего — они не видят "
+                        f"наш лот за {ours_cheapest}. Расхождение, разбираемся."
+                        f"{_Color.RESET}")
+            disagree += 1
+        else:
+            gap = ((ours_cheapest - theirs) / ours_cheapest * 100
+                   ).quantize(Decimal("0.1")) if ours_cheapest else 0
+            log.info(f"{_Color.GREEN}  сходится: их минимум ниже нашего на "
+                     f"{gap}% — ожидаемо, они видят маркеты, которых у нас "
+                     f"нет{_Color.RESET}")
+            agree += 1
+
+        ours_markets = sorted((snap.get("market_floors") or {}).keys())
+        log.info(f"  площадки у нас:    {', '.join(ours_markets) or '—'}")
+        theirs_markets = row.get("markets")
+        if isinstance(theirs_markets, dict):
+            log.info(f"  площадки у see.tg: {', '.join(sorted(theirs_markets))}")
+        else:
+            log.info(f"  разбивка markets: {theirs_markets}")
+
+    log.info("")
+    log.info(f"{_Color.BOLD}Сошлось {agree}, разошлось {disagree}.{_Color.RESET}")
+    log.info("Пока не сошлось — источником floor see.tg НЕ становится. "
+             "Чужой API это утверждение, а не факт о блокчейне.")
+    return disagree == 0 and agree > 0
+
+
+# =============================================================================
 # 5. ЛОКАЛЬНАЯ ЭКОНОМИКА (быстрая проверка до вызова ИИ)
 # =============================================================================
 
@@ -6389,6 +6598,9 @@ def parse_args(argv=None):
     parser.add_argument("--premium", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="во сколько раз дороже floor просят за редкие "
                              "трейты (калибровка PREMIUM_MULT)")
+    parser.add_argument("--seetg-check", action="store_true",
+                        help="сверить floor и площадки see.tg с нашими "
+                             "(нужен SEETG_TOKEN); ничего не меняет")
     parser.add_argument("--numbers", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="просят ли больше за красивый НОМЕР "
                              "(почему в уведомлении стоит +0%%)")
@@ -6448,6 +6660,8 @@ if __name__ == "__main__":
         if args.flip:
             # Ходит в сеть за витриной, но НИЧЕГО не покупает и не пишет.
             sys.exit(0 if flip_report(args.flip) else 1)
+        if getattr(args, "seetg_check", False):
+            sys.exit(0 if seetg_check() else 1)
         if args.bought:
             if not 2 <= len(args.bought) <= 3:
                 log.error("Нужно: --bought АДРЕС ЦЕНА [FLOOR_КОНКУРЕНТА]")

@@ -73,6 +73,11 @@ echo === Sozdayu deploy\my-secrets.bat ===
 >> "%~dp0my-secrets.bat" echo REM Bez nih nahodki nekuda slat - bot budet rabotat molcha.
 >> "%~dp0my-secrets.bat" echo set TELEGRAM_BOT_TOKEN=
 >> "%~dp0my-secrets.bat" echo set TELEGRAM_CHAT_ID=
+>> "%~dp0my-secrets.bat" echo REM.
+>> "%~dp0my-secrets.bat" echo REM SEETG_TOKEN - API see.tg ^(kartoshka.free^). Gde vzyat:
+>> "%~dp0my-secrets.bat" echo REM   mini-app see.tg -^> Poleznoe -^> API -^> sozdat prilozhenie.
+>> "%~dp0my-secrets.bat" echo REM Vid tokena: id:secret. Bez nego rabotaet tolko TonAPI.
+>> "%~dp0my-secrets.bat" echo set SEETG_TOKEN=
 echo Fail sozdan. Vpishite v nego klyuchi i zapustite etot bat zanovo.
 echo.
 
