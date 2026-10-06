@@ -2073,6 +2073,10 @@ def _slug_candidates(row) -> list:
             continue
         if not any(ch.isalnum() for ch in value):
             continue
+        # Чисто числовые строки — это giftId, а не слаг. Прогон 06.10.2026
+        # потратил на них по запросу с коллекции впустую.
+        if value.isdigit():
+            continue
         if value not in seen:
             seen.add(value)
             out.append(value)
@@ -2136,8 +2140,51 @@ def _seetg_all_addresses(obj, depth: int = 0, out=None):
     return out
 
 
+def seetg_prove_slug(slug: str, items):
+    """
+    ТОЧНАЯ сверка слага: наш номер минта -> их карточка -> их адрес.
+
+    ПОЧЕМУ НЕ ПЕРЕСЕЧЕНИЕ СЛУЧАЙНЫХ ВЫБОРОК. Первая версия брала у них 20
+    произвольных подарков и искала совпадение с нашей выборкой. Прогон
+    06.10.2026 дал ноль пересечений на всех трёх коллекциях при верном слаге
+    (`SurgeBoard` нашёлся, и всё равно «не подтверждён»). Причина видна в
+    сырье: наша выборка — это ВЫСТАВЛЕННЫЕ лоты, примерно 12% коллекции, а
+    их 20 подарков берутся из всей коллекции. Пересечение стало делом случая,
+    то есть проверка отвечала на вопрос «повезло ли», а не «та ли коллекция».
+
+    Здесь связь ДЕТЕРМИНИРОВАННАЯ. `/v1/gift/{ref}` принимает `Slug-N`, где
+    N — номер подарка; номер минта у нас есть в каждом лоте. Спрашиваем ИХ
+    карточку по НАШЕМУ номеру и сверяем `giftAddress` с адресом НАШЕГО лота.
+    Совпал — это тот же предмет в том же блокчейне, и значит та же коллекция.
+    Не совпал — слаг чужой, и принимать его нельзя.
+
+    Один-два запроса вместо двадцати, и ответ не зависит от удачи.
+    """
+    tried = []
+    for item in sorted(items, key=lambda it: it["sale_price_ton"])[:2]:
+        num = item.get("mint_index")
+        ours = normalize_ton_address(item.get("address"))
+        if not num or not ours:
+            continue
+        ref = f"{slug}-{num}"
+        try:
+            card = seetg_get(f"/gift/{ref}")
+        except RateLimited:
+            raise
+        except Exception as e:  # noqa: BLE001
+            tried.append(f"{ref}: {e}")
+            continue
+        gift = (card or {}).get("gift") or card or {}
+        theirs = normalize_ton_address(gift.get("giftAddress") or "")
+        if theirs and theirs == ours:
+            return True, f"{ref}: их giftAddress совпал с адресом нашего лота"
+        tried.append(f"{ref}: их адрес {_short(theirs or '—')} != наш "
+                     f"{_short(ours)}")
+    return False, "; ".join(tried or ["номера минта не нашлось"])
+
+
 def seetg_slug_by_census(our_name: str, our_addresses: set,
-                         collection_address: str = ""):
+                         collection_address: str = "", items_for_proof=None):
     """
     Слаг БЕЗ resolve: кандидат по борде, ДОКАЗАТЕЛЬСТВО — по адресам.
 
@@ -2201,6 +2248,16 @@ def seetg_slug_by_census(our_name: str, our_addresses: set,
     tried = []
     for row in cands[:2]:
         for slug in _slug_candidates(row)[:3]:
+            # Сначала ТОЧНАЯ сверка по номеру минта: она не зависит от того,
+            # пересеклись ли случайные выборки.
+            try:
+                proved, why = seetg_prove_slug(slug, items_for_proof or [])
+            except RateLimited:
+                raise
+            if proved:
+                return slug, f"кандидат найден {how}, подтверждён: {why}"
+            if why:
+                tried.append(f"{slug}: {why}")
             try:
                 gifts = _seetg_rows(seetg_get("/gifts", {"collection": slug,
                                                          "was_on_chain": "true",
@@ -2269,6 +2326,18 @@ def seetg_probe_shapes():
         if isinstance(sample, dict):
             log.info(f"    ключи: {', '.join(sorted(sample.keys()))}")
         log.info(f"    сырьё: {raw[:700]}")
+        # Прогон 06.10.2026 обрезался ровно на saleInfo — а это ЦЕНА, то есть
+        # единственное поле, ради которого поиск и пишется. Вложенные узлы
+        # печатаются отдельно, а не надеждой на длину строки.
+        for key in ("saleInfo", "estimate", "details", "price", "sale"):
+            node = sample.get(key) if isinstance(sample, dict) else None
+            if node in (None, "", [], {}):
+                continue
+            try:
+                node_raw = _json.dumps(node, ensure_ascii=False)
+            except Exception:  # noqa: BLE001
+                node_raw = str(node)
+            log.info(f"    {key}: {node_raw[:500]}")
 
 
 def seetg_check(limit_collections: int = 3):
@@ -2341,7 +2410,8 @@ def seetg_check(limit_collections: int = 3):
             ours_addrs.discard(None)
             try:
                 slug, why = seetg_slug_by_census(ours_name, ours_addrs,
-                                                 collection_address=coll)
+                                                 collection_address=coll,
+                                                 items_for_proof=on_sale)
             except RateLimited as e:
                 log.error(f"  {e}")
                 return None

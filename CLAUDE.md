@@ -2307,6 +2307,66 @@ getgems, telegram, с числом листингов. То есть **MRKT и P
 TonAPI нет вовсе, здесь видны с ценами.** Разброс на ChillFlame: 3.32 у
 tonnel против 4.89 у telegram — 47%.
 
+**ФОРМЫ ОТВЕТОВ see.tg СНЯТЫ** (06.10.2026, прогон владельца). Дословно:
+
+```
+/v1/floors?by=model
+ключи: actualPermille, change24h, change30d, change7d, floorMarket, floorTon,
+       floorUsd, giftId, issued, key, markets, modelCount, rarityPermille,
+       slug, title, total
+сырьё: {"key":"Spectrum","slug":"PlushPepe","title":"Plush Pepe",
+        "floorTon":5409.36,"floorMarket":"getgems","rarityPermille":30,
+        "actualPermille":31.5,"modelCount":89,
+        "markets":[{"market":"getgems","floorTon":5409.36,"listings":6},
+                   {"market":"mrkt","floorTon":6120,"listings":1},
+                   {"market":"tonnel","floorTon":6281.25,"listings":1},
+                   {"market":"portals","floorTon":10000,"listings":1}]}
+
+/v1/gifts?sort=price
+ключи: availabilityIssued, availabilityTotal, backdrop, burned, commentDeleted,
+       details, estimate, giftAddress, giftId, host, id, minted, model,
+       monoScore, num, onSale, owner, ownerAddress, pattern, recipient,
+       resaleTonOnly, resellAmountStars, resellAmountTon, saleInfo, slug,
+       title, transferredAt
+сырьё: {"id":"6032669999779283437","slug":"PlushPepe","num":2017,
+        "model":{"name":"Spectrum","rarityPermille":30},
+        "backdrop":{"name":"Chestnut","rarityPermille":15},
+        "pattern":{"name":"Golden Scarab","rarityPermille":4},
+        "owner":{"address":"UQBxIGH0ey7EdAH-..."}}
+```
+
+ЭТО ЗАКРЫВАЕТ ТРИ ДЫРЫ СРАЗУ, и ни одна из них не лечилась кодом:
+
+- `by=model` даёт `key` (модель), `floorTon` и `markets` с числом листингов —
+  это `cheapest_rival()`, только ИЗМЕРЕННЫЙ по всей витрине, а не по нашему
+  куску. Весь класс ошибок «конкурент по трети сегмента» отсюда исчезает;
+- `giftAddress` у лота есть, значит их предмет и наш можно сверить ПОИМЁННО;
+- `monoScore` — монохром числом. Наш `color_of()` угадывает его по словам
+  названия, и в CLAUDE.md записано, что это лексическая догадка.
+
+**ДОКАЗАТЕЛЬСТВО СЛАГА ПЕРЕПИСАНО: НОМЕР МИНТА ВМЕСТО ПЕРЕСЕЧЕНИЯ ВЫБОРОК.**
+Прогон дал ноль пересечений на всех трёх коллекциях ПРИ ВЕРНОМ СЛАГЕ
+(`SurgeBoard` нашёлся по имени и всё равно был отвергнут):
+
+```
+слаг коллекции неизвестен — ни один кандидат не подтверждён адресами.
+Пробовали: SurgeBoard: их 34 адресов, пересечения нет
+```
+
+Причина видна в сырье: наша выборка — это ВЫСТАВЛЕННЫЕ лоты, около 12%
+коллекции, а их 20 подарков берутся из ВСЕЙ. Пересечение стало делом случая,
+то есть проверка отвечала на вопрос «повезло ли», а не «та ли коллекция».
+Это тот же класс ошибки, что и пять предыдущих: утверждение о целом по
+случайной части.
+
+`seetg_prove_slug()` связывает выборки ДЕТЕРМИНИРОВАННО: `/v1/gift/{ref}`
+принимает `Slug-N`, номер минта у нас есть в каждом лоте, и их `giftAddress`
+сверяется с адресом НАШЕГО лота. Совпал — это тот же предмет в том же
+блокчейне. Один-два запроса вместо двадцати, и ответ не зависит от удачи.
+
+Мелочь оттуда же: числовые строки (`giftId`) больше не идут в кандидаты
+слага — прогон тратил на каждую по запросу впустую.
+
 ## Правила работы с этим репозиторием
 
 - Секреты только через окружение/файл с правами 0600. Ключ не логировать,

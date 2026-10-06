@@ -4521,6 +4521,43 @@ check("из ответа берутся все адреса, а не первы�
       gs._seetg_all_addresses({"owner": {"address": _a1},
                                "nft": {"address": _a2}}) == {_a1, _a2})
 
+# ТОЧНОЕ доказательство слага: наш номер минта -> их карточка -> их адрес.
+# Пересечение случайных выборок не годится: наша выборка это ВЫСТАВЛЕННЫЕ
+# лоты (12% коллекции), их 20 подарков берутся из всей — ноль пересечений
+# при верном слаге, что и случилось 06.10.2026 на всех трёх коллекциях.
+_PROVE_ADDR = "0:" + "7f" * 32
+_prove_items = [{"address": _PROVE_ADDR, "mint_index": 20176,
+                 "sale_price_ton": Decimal("7.86")}]
+_oget63c = gs.seetg_get
+try:
+    _asked = []
+
+    def _gift_ok(path, params=None):
+        _asked.append(path)
+        return {"giftAddress": gs.friendly_ton_address(_PROVE_ADDR)}
+
+    gs.seetg_get = _gift_ok
+    _ok63, _why63 = gs.seetg_prove_slug("SurgeBoard", _prove_items)
+    check("совпадение giftAddress доказывает слаг", _ok63, _why63)
+    check("спрошена карточка по НАШЕМУ номеру минта",
+          _asked == ["/gift/SurgeBoard-20176"], _asked)
+
+    # Чужая коллекция с тем же номером — адрес другой, слаг не принимается.
+    gs.seetg_get = lambda path, params=None: {"giftAddress": "0:" + "11" * 32}
+    _bad63, _whybad = gs.seetg_prove_slug("PoolFloat", _prove_items)
+    check("несовпадение адреса слаг отвергает", not _bad63, _whybad)
+    check("в причине названы оба адреса", "!=" in _whybad, _whybad)
+finally:
+    gs.seetg_get = _oget63c
+
+# Числовые строки — это giftId, а не слаг: прогон тратил на них запросы.
+check("числовой id в кандидаты слага не идёт",
+      "5936013938331222567" not in gs._slug_candidates(
+          {"slug": "PlushPepe", "giftId": "5936013938331222567"}))
+# Цена лежит в saleInfo, и прогон обрезался ровно на нём.
+check("вложенные узлы ответа печатаются отдельно от обрезанного сырья",
+      '"saleInfo"' in _src63)
+
 check("имя и слаг сводятся к одному ключу",
       gs._slug_key("Spring Baskets") == gs._slug_key("SpringBaskets")
       == gs._slug_key("spring-baskets"))
