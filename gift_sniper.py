@@ -2048,28 +2048,60 @@ def seetg_collection_board():
     return _seetg_board_cache
 
 
-def _row_slug(row: dict) -> str:
-    for key in ("slug", "collectionSlug", "collection_slug", "collection"):
-        value = row.get(key)
-        if isinstance(value, str) and value:
-            return value
-        if isinstance(value, dict):
-            inner = value.get("slug") or value.get("name")
-            if isinstance(inner, str) and inner:
-                return inner
-    return ""
+def _row_strings(row, depth: int = 0):
+    """Все строковые листья строки борды. Ключи НЕ угадываем."""
+    out = []
+    if depth > 4:
+        return out
+    if isinstance(row, str):
+        return [row]
+    if isinstance(row, dict):
+        for value in row.values():
+            out.extend(_row_strings(value, depth + 1))
+    elif isinstance(row, list):
+        for value in row:
+            out.extend(_row_strings(value, depth + 1))
+    return out
 
 
-def seetg_slug_by_census(our_name: str, our_addresses: set):
+def _slug_candidates(row) -> list:
+    """Из строки борды — значения, которые МОГУТ быть слагом."""
+    seen, out = set(), []
+    for value in _row_strings(row):
+        value = value.strip()
+        if not value or len(value) > 64 or " " in value:
+            continue
+        if not any(ch.isalnum() for ch in value):
+            continue
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def seetg_slug_by_census(our_name: str, our_addresses: set,
+                         collection_address: str = ""):
     """
-    Слаг БЕЗ resolve: кандидат по имени, ДОКАЗАТЕЛЬСТВО — по адресам.
+    Слаг БЕЗ resolve: кандидат по борде, ДОКАЗАТЕЛЬСТВО — по адресам.
 
-    Совпадение названий — это догадка («коллекция называется так же»), и
-    принимать по ней решение запрещено правилом проекта. Поэтому имя только
-    СУЖАЕТ круг, а решает измерение: у кандидата спрашиваются несколько
-    предметов, и их TON-адреса сверяются с нашей собственной выборкой по этой
-    коллекции. Пересеклись — это та же коллекция, и это факт о блокчейне, а не
-    о названиях. Не пересеклись — слаг не принимается, и так и говорится.
+    ПОЧЕМУ ЗАПАСНОЙ ПУТЬ ВООБЩЕ ПОНАДОБИЛСЯ: контрольная проверка 06.10.2026
+    показала ИЗМЕРЕНИЕМ, что `/v1/resolve` не принимает адреса предметов — не
+    распознался даже адрес из ИХ СОБСТВЕННОЙ карточки. Документация говорит
+    обратное, но сошедшийся круг сильнее документации.
+
+    ПОЧЕМУ ИМЕНИ МАЛО. Совпадение названий — догадка, и решать по ней
+    запрещено правилом проекта. Имя (и адрес контракта коллекции, если он в
+    борде есть) только СУЖАЮТ круг. Принимается слаг ТОЛЬКО после сверки: у
+    кандидата запрашиваются предметы, и их TON-адреса сверяются с нашей
+    собственной выборкой. Пересеклись — это та же коллекция, и это факт о
+    блокчейне, а не о названиях.
+
+    КЛЮЧИ БОРДЫ НЕ УГАДЫВАЮТСЯ. Первая версия искала `slug`/`title`/`name`
+    поимённо и не нашла НИ ОДНОЙ коллекции из 121 — то есть отвечала «у них
+    такой коллекции нет» там, где на самом деле «мы не знаем, как у них
+    называется поле». Это ровно та ошибка, за которой в проекте закреплено
+    правило: не путать «измерено» и «предположено». Теперь сравниваются ВСЕ
+    строковые значения строки, а при промахе печатается сырая строка.
 
     Возвращает (слаг, пояснение) или (None, причина).
     """
@@ -2081,37 +2113,104 @@ def seetg_slug_by_census(our_name: str, our_addresses: set):
         return None, "борда коллекций пуста"
 
     key = _slug_key(our_name)
-    cands = [r for r in board
-             if key and key in (_slug_key(_row_slug(r)),
-                                _slug_key(str(r.get("title") or r.get("name") or "")))]
-    if not cands:
-        return None, (f"в борде see.tg нет коллекции с именем «{our_name}» "
-                      f"(строк в борде {len(board)})")
+    our_coll = normalize_ton_address(collection_address) if collection_address else None
 
-    for row in cands[:3]:
-        slug = _row_slug(row)
-        if not slug:
-            continue
+    by_addr, by_name = [], []
+    for row in board:
+        values = _row_strings(row)
+        if our_coll and any(normalize_ton_address(v) == our_coll for v in values):
+            by_addr.append(row)
+        elif key and any(_slug_key(v) == key for v in values):
+            by_name.append(row)
+
+    cands = by_addr + by_name
+    if not cands:
+        # Промах печатается СЫРЬЁМ: «не нашли» и «не знаем, где искать» —
+        # разные вещи, и по пустому отказу их не различить.
+        log.warning(f"    в борде {len(board)} коллекций, «{our_name}» среди "
+                    f"них не опознана. Сырая первая строка борды:")
+        log.warning(f"    {board[0]}")
+        names = []
+        for row in board[:60]:
+            names.extend(_slug_candidates(row)[:1])
+        log.warning(f"    первые имена из борды: {', '.join(names[:40])}")
+        return None, f"в борде see.tg не опознана коллекция «{our_name}»"
+
+    how = "по адресу контракта" if by_addr else "по имени"
+    tried = []
+    for row in cands[:2]:
+        for slug in _slug_candidates(row)[:3]:
+            try:
+                gifts = _seetg_rows(seetg_get("/gifts", {"collection": slug,
+                                                         "was_on_chain": "true",
+                                                         "limit": 20}))
+            except RateLimited:
+                raise
+            except Exception as e:  # noqa: BLE001
+                tried.append(f"{slug}: {e}")
+                continue
+            theirs = set()
+            for gift in gifts:
+                addr = _seetg_find_address(gift)
+                norm = normalize_ton_address(addr) if addr else None
+                if norm:
+                    theirs.add(norm)
+            hit = theirs & our_addresses
+            if hit:
+                return slug, (f"кандидат найден {how}, подтверждён адресами: "
+                              f"из {len(theirs)} их предметов {len(hit)} есть "
+                              f"в нашей выборке")
+            tried.append(f"{slug}: их {len(theirs)} адресов, пересечения нет")
+    return None, ("ни один кандидат не подтверждён адресами — принимать нельзя, "
+                  "это могла бы быть чужая коллекция. Пробовали: "
+                  + "; ".join(tried or ["нечего"]))
+
+
+def seetg_probe_shapes():
+    """
+    ФОРМА ОТВЕТОВ ИЗМЕРЯЕТСЯ, А НЕ УГАДЫВАЕТСЯ.
+
+    Поиск через see.tg упирается не в логику, а в ИМЕНА ПОЛЕЙ: где лежат
+    модель, цена, маркет и TON-адрес лота. Написать парсер по памяти — это
+    ровно то, на чём уже один раз сломался запасной путь к слагу: он искал
+    ключи `slug`/`title`/`name` поимённо и не опознал НИ ОДНОЙ коллекции из
+    121, отвечая «такой коллекции нет» вместо «не знаю, как называется поле».
+
+    Поэтому три запроса печатают сырые ответы ДОСЛОВНО. Берётся их же
+    документированный пример PlushPepe — наш слаг для этого ещё не нужен.
+    Это те самые три метода, на которых будет стоять поиск: карточка лота,
+    пол по моделям и лоты по возрастанию цены.
+
+    Правилам see.tg это не противоречит: три запроса за прогон диагностики,
+    результат идёт в разработку парсера, а не в архив.
+    """
+    import json as _json
+
+    probes = [
+        ("карточка лота    /v1/gift/{ref}", "/gift/PlushPepe-1", None),
+        ("пол по моделям   /v1/floors?by=model", "/floors",
+         {"by": "model", "collection": "PlushPepe", "limit": 2}),
+        ("лоты по цене     /v1/gifts?sort=price", "/gifts",
+         {"collection": "PlushPepe", "on_sale": "true", "sort": "price",
+          "limit": 2}),
+    ]
+    for title, path, params in probes:
+        log.info("")
+        log.info(f"  {title}")
         try:
-            gifts = _seetg_rows(seetg_get("/gifts", {"collection": slug,
-                                                     "was_on_chain": "true",
-                                                     "limit": 20}))
+            result = seetg_get(path, params)
         except Exception as e:  # noqa: BLE001
-            return None, f"проверка слага «{slug}» не удалась: {e}"
-        theirs = set()
-        for gift in gifts:
-            addr = _seetg_find_address(gift)
-            norm = normalize_ton_address(addr) if addr else None
-            if norm:
-                theirs.add(norm)
-        hit = theirs & our_addresses
-        if hit:
-            return slug, (f"подтверждено адресами: из {len(theirs)} их "
-                          f"предметов {len(hit)} есть в нашей выборке")
-        return None, (f"кандидат «{slug}» НЕ подтверждён: ни один из "
-                      f"{len(theirs)} их адресов не найден в нашей выборке — "
-                      f"принимать нельзя, это могла бы быть чужая коллекция")
-    return None, "у кандидатов нет слага"
+            log.error(f"    не удалось: {e}")
+            continue
+        rows = _seetg_rows(result)
+        sample = rows[0] if rows else result
+        try:
+            raw = _json.dumps(sample, ensure_ascii=False)
+        except Exception:  # noqa: BLE001
+            raw = str(sample)
+        if isinstance(sample, dict):
+            log.info(f"    ключи: {', '.join(sorted(sample.keys()))}")
+        log.info(f"    сырьё: {raw[:700]}")
 
 
 def seetg_check(limit_collections: int = 3):
@@ -2148,6 +2247,10 @@ def seetg_check(limit_collections: int = 3):
     log.info(f"{_Color.BOLD}Контрольная проверка /v1/resolve{_Color.RESET}")
     seetg_probe_resolve()
 
+    log.info("")
+    log.info(f"{_Color.BOLD}Форма ответов (имена полей для поиска){_Color.RESET}")
+    seetg_probe_shapes()
+
     agree = disagree = 0
     for coll in TARGET_COLLECTIONS[:limit_collections]:
         log.info("")
@@ -2179,7 +2282,8 @@ def seetg_check(limit_collections: int = 3):
                           for it in on_sale}
             ours_addrs.discard(None)
             try:
-                slug, why = seetg_slug_by_census(ours_name, ours_addrs)
+                slug, why = seetg_slug_by_census(ours_name, ours_addrs,
+                                                 collection_address=coll)
             except RateLimited as e:
                 log.error(f"  {e}")
                 return None
