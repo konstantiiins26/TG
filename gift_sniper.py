@@ -4548,6 +4548,12 @@ def scan_seetg_arbitrage(snap: dict) -> int:
 SEETG_WS_URL = os.getenv("SEETG_WS_URL", "wss://live.see.tg/v1/ws")
 SEETG_WS_SECONDS = int(os.getenv("SEETG_WS_SECONDS", "60"))
 SEETG_WS_SHOW = int(os.getenv("SEETG_WS_SHOW", "10"))
+# Кадры, которые НЕ являются событиями рынка. `hello` измерен живым прогоном
+# 07.10.2026; остальные типичны для WebSocket и стоят здесь на случай, если
+# придут, — лишнее имя тут безопасно, а пропущенное служебное имя завысило
+# бы счёт событий.
+_WS_SERVICE_KINDS = ("type=hello", "type=pong", "type=ping", "type=ack",
+                     "type=error", "type=subscribed")
 
 
 def _ws_connect(url: str, headers: list, timeout: float):
@@ -4622,7 +4628,13 @@ def seetg_stream_probe(seconds: int = 0) -> bool:
 
     log.info(f"{_Color.GREEN}Соединение открыто.{_Color.RESET} Печатаю сырые "
              f"кадры как есть — разбора здесь нет намеренно.")
-    seen, kinds, started = 0, {}, time.time()
+    # СЛУЖЕБНЫЙ КАДР — НЕ СОБЫТИЕ, и считать их вместе нельзя. Первый же
+    # живой прогон (07.10.2026) прислал ровно один кадр `type: hello`, и
+    # старый счётчик объявил бы «форма снята»: рукопожатие — это ответ на
+    # подключение, а не поток событий. Ровно тот класс ошибки, от которого в
+    # проекте есть правило: утверждение о ЦЕЛОМ по наблюдению за ЧАСТЬЮ.
+    seen, events, kinds, started = 0, 0, {}, time.time()
+    hello = None
     try:
         while time.time() - started < seconds:
             try:
@@ -4640,7 +4652,7 @@ def seetg_stream_probe(seconds: int = 0) -> bool:
             # Тип события берётся ТОЛЬКО для счёта, и если ключа нет — так и
             # написано. Подставить «sale» по догадке значило бы выдумать
             # статистику потока.
-            kind = "(тип не найден)"
+            kind, obj = "(тип не найден)", None
             try:
                 obj = json.loads(frame)
                 if isinstance(obj, dict):
@@ -4651,6 +4663,10 @@ def seetg_stream_probe(seconds: int = 0) -> bool:
             except Exception:                         # noqa: BLE001
                 kind = "(не JSON)"
             kinds[kind] = kinds.get(kind, 0) + 1
+            if kind == "type=hello":
+                hello = obj if isinstance(obj, dict) else None
+            elif kind not in _WS_SERVICE_KINDS:
+                events += 1
             if seen <= SEETG_WS_SHOW:
                 log.info(f"  кадр {seen}: {str(frame)[:1200]}")
     finally:
@@ -4659,13 +4675,38 @@ def seetg_stream_probe(seconds: int = 0) -> bool:
         except Exception:                             # noqa: BLE001
             pass
 
-    log.info(f"Кадров за {seconds}с: {seen}")
+    log.info(f"Кадров за {seconds}с: {seen}, из них СОБЫТИЙ: {events}")
     for k, n in sorted(kinds.items(), key=lambda x: -x[1]):
         log.info(f"  {k}: {n}")
-    if not seen:
+
+    # РУКОПОЖАТИЕ — ИХ СОБСТВЕННЫЕ СЛОВА о том, что поток умеет. Это
+    # измерение (они прислали), а не наша догадка об именах событий, и
+    # печатается отдельно от счёта: по нему будет писаться парсер.
+    if isinstance(hello, dict):
+        evs = hello.get("events")
+        if isinstance(evs, list):
+            log.info(f"Поток называет события сам ({len(evs)}): "
+                     f"{', '.join(str(e) for e in evs)}")
+            log.info("  цены сделок — это «sale»" if "sale" in evs else
+                     "  события «sale» в списке НЕТ — цены сделок отсюда не "
+                     "возьмутся")
+        mode = hello.get("mode")
+        if mode is not None:
+            log.info(f"Режим соединения: {mode!r}; авторизация: "
+                     f"{hello.get('auth')!r}")
+            if mode == "anon":
+                # НЕ УТВЕРЖДАЕМ, что дело в режиме: мы не измеряли, шлёт ли
+                # «anon» события вообще. Названо как то, что стоит проверить.
+                log.info("  «anon» значит, что поток считает соединение "
+                         "анонимным. Влияет ли это на доставку событий, мы "
+                         "НЕ измеряли — проверяется только их документацией "
+                         "или прогоном подольше.")
+
+    if not events:
         # МОЛЧАНИЕ НАЗВАНО ВСЛУХ и не объявлено поломкой: по пустому потоку
         # нельзя отличить «нужна подписка» от «сейчас нет событий».
-        log.warning("Соединение держалось, но ни одного кадра не пришло. "
+        log.warning("Соединение держалось, но НИ ОДНОГО СОБЫТИЯ не пришло "
+                    f"(служебных кадров {seen}). "
                     "Два разных объяснения, и по молчанию они неразличимы: "
                     "(1) поток ждёт КОМАНДУ ПОДПИСКИ, формат которой у нас "
                     "не измерен — её надо взять из их документации, а не "
@@ -4673,7 +4714,8 @@ def seetg_stream_probe(seconds: int = 0) -> bool:
                     "событий. Пришлите страницу про поток — тогда подписка "
                     "будет написана по их словам, а не по догадке.")
     else:
-        log.info(f"{_Color.GREEN}Форма снята.{_Color.RESET} Следующий шаг — "
+        log.info(f"{_Color.GREEN}Форма снята по {events} событиям."
+                 f"{_Color.RESET} Следующий шаг — "
                  f"копить из кадров `sale` ЦЕНЫ СДЕЛОК по нашим коллекциям: "
                  f"это ответ на «сколько ПЛАТЯТ», которого в проекте не было "
                  f"никогда. Парсер пишется по этим кадрам, а не по памяти.")
