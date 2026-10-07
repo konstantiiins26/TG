@@ -4414,8 +4414,25 @@ def seetg_sales_probe(ref: str = ""):
                   "-> API. Вписать в deploy\\my-secrets.bat.")
         return False
     ref = ref or "PlushPepe-1"
-    log.info(f"{_Color.BOLD}История сделок see.tg по {ref} — один запрос, "
-             f"сырой ответ.{_Color.RESET}")
+    # МОЖНО ДАТЬ ПРОСТО СЛАГ. Номер минта угадывать не надо и вредно: первый
+    # прогон пришёлся на PlushPepe-1, у которого истории нет вовсе («записей:
+    # 0» при живом ответе `{hasMore, items}`), и по такому ответу нельзя
+    # отличить «эндпоинт пустой» от «этот предмет не торговался». Берём
+    # ЖИВОЙ ВЫСТАВЛЕННЫЙ лот: он как минимум однажды кому-то достался.
+    if "-" not in ref:
+        rows = _seetg_rows(seetg_get("/gifts", {
+            "collection": ref, "on_sale": "true", "sort": "price",
+            "limit": 1}))
+        num = (rows[0] or {}).get("num") if rows else None
+        if not num:
+            log.error(f"  по слагу «{ref}» выставленных лотов не отдали — "
+                      f"проверьте слаг (он в единственном числе: CandyCane, "
+                      f"а не Candy Canes)")
+            return False
+        ref = f"{ref}-{num}"
+        log.info(f"  взят живой лот {ref} (самый дешёвый выставленный)")
+    log.info(f"{_Color.BOLD}История сделок see.tg по {ref} — сырой ответ."
+             f"{_Color.RESET}")
     try:
         data = seetg_get(f"/gift/{ref}/history")
     except Exception as e:                                  # noqa: BLE001
@@ -4434,8 +4451,37 @@ def seetg_sales_probe(ref: str = ""):
             log.info(f"  ключи записи: {sorted(row.keys())}")
         log.info(f"  сырьё: {str(row)[:400]}")
     if not rows:
-        log.info("  пусто — по этому предмету истории нет; это НЕ значит, "
-                 "что эндпоинта нет: проверьте на лоте, который продавался.")
+        # ЭНДПОИНТ ЖИВ — это уже измерено: он ответил `{hasMore, items}`, а не
+        # 404. Пустой список говорит только о ЭТОМ предмете.
+        log.info("  пусто — по ЭТОМУ предмету истории нет. Сам эндпоинт "
+                 "работает (ответ с ключами hasMore/items), значит вопрос "
+                 "только в выборе лота: дайте слаг коллекции без номера, и "
+                 "бот возьмёт живой выставленный лот сам.")
+    # Поля с ценой ищутся ПО ЗНАЧЕНИЮ, а не по имени: имена мы уже один раз
+    # угадывали (ключи борды), и это стоило вывода «у see.tg нет наших
+    # коллекций». Нанотоны узнаются по порядку величины.
+    hits = set()
+    def _scan(obj, path=""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                _scan(v, f"{path}.{k}" if path else k)
+        elif isinstance(obj, list):
+            for v in obj[:5]:
+                _scan(v, f"{path}[]")
+        elif isinstance(obj, (int, float, str)):
+            txt = str(obj)
+            if txt.isdigit() and 6 <= len(txt) <= 15:
+                hits.add(f"{path} = {txt} (похоже на нанотоны)")
+            elif isinstance(obj, (int, float)) and not isinstance(obj, bool) \
+                    and 0 < float(obj) < 100000 and "." in txt:
+                hits.add(f"{path} = {txt}")
+    for row in rows[:5]:
+        _scan(row)
+    if hits:
+        log.info("")
+        log.info("  ЧИСЛА, ПОХОЖИЕ НА ЦЕНУ:")
+        for h in sorted(hits)[:20]:
+            log.info(f"    {h}")
     log.info("")
     log.info("Что искать в сырье: поле с ЦЕНОЙ и типом события «продажа». "
              "Если оно есть — средняя цена сделок считается по нему и идёт "
