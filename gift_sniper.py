@@ -4629,6 +4629,138 @@ def _ws_is_error(frame: str) -> str:
     return ""
 
 
+SEETG_FRAMES_FILE = os.getenv("SEETG_FRAMES_FILE", "seetg-frames.jsonl")
+# ИЗМЕРЕННЫЙ формат подписки (живой прогон 07.10.2026):
+#   -> {"type":"subscribe","events":[...]}
+#   <- {"type":"subscribed","events":[...],"stats":false}
+#   <- {"type":"event","event":"sale","at":...,"market":...,"gift":{...}}
+# Это не догадка и не документация: так ответил сервер.
+_WS_SUBSCRIBE = {"type": "subscribe", "events": ["sale"]}
+
+
+def seetg_listen_capture(seconds: int = 0, events: str = "") -> bool:
+    """
+    `--seetg-listen [СЕК]` — записать кадры ЦЕЛИКОМ, чтобы найти цену сделки.
+
+    Зачем отдельный режим после того, как подписка найдена. В пробе кадры
+    печатались обрезанными до 1200 символов, и у событий `sale` с mrkt и
+    tonnel видимая часть несла `resellAmountTon: "0"` — то есть ЦЕНА СДЕЛКИ
+    лежит дальше в кадре, за обрезкой. Писать парсер к полю, которого не
+    видел, — это ровно то, что в проекте запрещено: имена полей мы уже
+    угадывали (ключи борды), и это стоило вывода «у see.tg нет наших
+    коллекций».
+
+    Поэтому здесь кадры пишутся В ФАЙЛ БЕЗ УРЕЗАНИЯ (по одному JSON на
+    строку), а на экран идёт короткая строка. Разбора цены НЕТ НИ ОДНОГО:
+    этот режим отвечает на вопрос «как называется поле», а не «сколько
+    заплатили».
+
+    ПРАВИЛА see.tg НЕ НАРУШАЮТСЯ: поток — это подписка, а не выгрузка их
+    базы. Режим слушает заданные секунды и останавливается сам; никакого
+    обхода курсором и никакой истории пачками здесь нет.
+
+    Файл в `.gitignore`: это результат прогона на машине владельца, а
+    отслеживаемый файл, который бот перезаписывает, ломается на первом же
+    `git pull` — так уже было с ключами в `start-windows.bat`.
+    """
+    if not SEETG_TOKEN:
+        log.error(f"{_Color.RED}SEETG_TOKEN не задан{_Color.RESET}")
+        return False
+    seconds = int(seconds or 60)
+    want = [e.strip() for e in (events or "sale").split(",") if e.strip()]
+    sub = dict(_WS_SUBSCRIBE, events=want)
+
+    ws, why = _ws_connect(SEETG_WS_URL,
+                          [f"Authorization: Bearer {SEETG_TOKEN}"], timeout=20)
+    if ws is None:
+        log.error(f"{_Color.RED}Поток не открылся: {why}{_Color.RESET}")
+        return False
+
+    log.info(f"Подписываюсь ИЗМЕРЕННЫМ кадром: "
+             f"{json.dumps(sub, ensure_ascii=False)}")
+    log.info(f"Пишу кадры ЦЕЛИКОМ в {SEETG_FRAMES_FILE} на {seconds}с. "
+             f"Разбора цены здесь нет — сначала надо увидеть поле.")
+    saved, events_n, kinds, started = 0, 0, {}, time.time()
+    ticked = 0.0
+    try:
+        ws.send(json.dumps(sub))
+        with open(SEETG_FRAMES_FILE, "a", encoding="utf-8") as fh:
+            while time.time() - started < seconds:
+                try:
+                    left = started + seconds - time.time()
+                    if left <= 0:
+                        break
+                    ws.settimeout(min(_WS_TICK_SEC, max(1.0, left)))
+                    frame = ws.recv()
+                except Exception as e:                 # noqa: BLE001
+                    if "timeout" in type(e).__name__.lower():
+                        # Тик ТРОТТЛИТСЯ: если сокет возвращает управление
+                        # сразу (сбой, подделка в тесте), иначе получилась бы
+                        # простыня одинаковых строк вместо одной в полминуты.
+                        now = time.time()
+                        if now - max(ticked, started) >= _WS_TICK_SEC:
+                            ticked = now
+                            log.info(f"  …жду, прошло {now - started:.0f}с из "
+                                     f"{seconds}, событий {events_n}")
+                        continue
+                    log.warning(f"Соединение прервалось: "
+                                f"{type(e).__name__}: {e}")
+                    break
+                if not frame:
+                    continue
+                # ЦЕЛИКОМ и БЕЗ ПЕРЕСБОРКИ: строка пишется как пришла.
+                # Пересобирать JSON нельзя — числа ушли бы через float, а
+                # цены у них приходят строками именно поэтому.
+                fh.write(str(frame).replace("\n", " ") + "\n")
+                saved += 1
+                try:
+                    obj = json.loads(frame)
+                except Exception:                      # noqa: BLE001
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                kind = str(obj.get("event") or obj.get("type") or "?")
+                kinds[kind] = kinds.get(kind, 0) + 1
+                if obj.get("type") != "event":
+                    log.info(f"  служебный кадр: {str(frame)[:300]}")
+                    continue
+                events_n += 1
+                gift = obj.get("gift") if isinstance(obj.get("gift"), dict) else {}
+                det = gift.get("details") if isinstance(
+                    gift.get("details"), dict) else {}
+                model = det.get("model")
+                log.info(f"  {kind} | {obj.get('market')} | "
+                         f"{det.get('slug')}-{det.get('num')} | "
+                         f"{model.get('name') if isinstance(model, dict) else ''}"
+                         f" | ключи gift: {sorted(gift)}")
+        fh_ok = True
+    except Exception as e:                             # noqa: BLE001
+        log.error(f"{_Color.RED}Запись прервалась: {type(e).__name__}: {e}"
+                  f"{_Color.RESET}")
+        fh_ok = False
+    finally:
+        try:
+            ws.close()
+        except Exception:                              # noqa: BLE001
+            pass
+
+    log.info(f"Кадров записано: {saved}, из них событий {events_n}")
+    for k, n in sorted(kinds.items(), key=lambda x: -x[1]):
+        log.info(f"  {k}: {n}")
+    if events_n:
+        log.info(f"{_Color.GREEN}Файл {SEETG_FRAMES_FILE} готов.{_Color.RESET} "
+                 f"Пришлите его — по НЕМУ будет написан разбор цены сделки. "
+                 f"Сейчас известно только, что у mrkt и tonnel поле "
+                 f"resellAmountTon равно нулю, то есть цена лежит в другом "
+                 f"месте кадра.")
+    else:
+        log.warning("Событий не было. Это не поломка: подписка подтверждена "
+                    "сервером, просто за это время на выбранные события "
+                    "ничего не происходило. Попробуйте дольше или добавьте "
+                    "события: --seetg-listen 120 sale,listing,price")
+    return fh_ok
+
+
 def seetg_subscribe_probe(wait_sec: int = 0) -> bool:
     """
     `--seetg-subscribe` — УЗНАТЬ формат команды подписки, спросив сервер.
@@ -9182,6 +9314,10 @@ def parse_args(argv=None):
                         help="арбитраж маркетов по МОДЕЛЯМ по данным see.tg: "
                              "где модель дешевле и где дороже; ничего не "
                              "покупает")
+    parser.add_argument("--seetg-listen", nargs="*", metavar="SEC EVENTS",
+                        help="слушать поток и писать кадры ЦЕЛИКОМ в файл "
+                             "(ищем, где лежит цена сделки); ничего не "
+                             "разбирает и не покупает")
     parser.add_argument("--seetg-subscribe", nargs="?", const=0, type=int,
                         metavar="SEC",
                         help="узнать формат команды подписки, спросив сервер: "
@@ -9258,6 +9394,12 @@ if __name__ == "__main__":
         if getattr(args, "seetg_find", False):
             # Ходит в сеть, НИЧЕГО не покупает и в запись не пишет.
             sys.exit(0 if seetg_find_report() else 1)
+        if getattr(args, "seetg_listen", None) is not None:
+            _a = list(args.seetg_listen or [])
+            _sec = int(_a[0]) if _a and _a[0].isdigit() else 0
+            _ev = _a[1] if len(_a) > 1 else ("" if _sec else
+                                             (_a[0] if _a else ""))
+            sys.exit(0 if seetg_listen_capture(_sec, _ev) else 1)
         if getattr(args, "seetg_subscribe", None) is not None:
             sys.exit(0 if seetg_subscribe_probe(args.seetg_subscribe) else 1)
         if getattr(args, "seetg_stream", None) is not None:

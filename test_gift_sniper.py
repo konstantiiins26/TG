@@ -5737,6 +5737,70 @@ try:
 finally:
     gs._ws_connect, gs.SEETG_TOKEN = _ows70, _otok70
 
+# --- ПОДПИСКА ИЗМЕРЕНА, ЦЕНА СДЕЛКИ — ЕЩЁ НЕТ ------------------------------
+# Живой ответ 07.10.2026:
+#   -> {"type":"subscribe","events":["listing","price","sale"]}
+#   <- {"type":"subscribed","events":[...],"stats":false}
+#   <- {"type":"event","event":"sale","at":...,"market":...,"gift":{...}}
+print("\n[70] Поток: подписка измерена, кадры пишем целиком")
+
+_src71 = open("gift_sniper.py", encoding="utf-8").read()
+check("формат подписки взят из ответа сервера, а не из документации",
+      gs._WS_SUBSCRIBE["type"] == "subscribe"
+      and isinstance(gs._WS_SUBSCRIBE.get("events"), list), gs._WS_SUBSCRIBE)
+_lc = _src71.split("def seetg_listen_capture")[1].split("\ndef ")[0]
+# Кадры режутся до 1200 символов в пробе, и у sale с mrkt/tonnel видимая
+# часть несла resellAmountTon=0 — значит цена дальше. Поле, которого не
+# видел, парсить нельзя.
+check("кадры пишутся ЦЕЛИКОМ, без обрезки", "[:1200]" not in _lc)
+check("строка пишется как пришла, без пересборки JSON",
+      "json.dumps(frame" not in _lc and "str(frame)" in _lc)
+check("разбора цены сделки здесь НЕТ",
+      "compute_net_profit" not in _lc and "amountTon" not in _lc)
+check("файл кадров — настройка",
+      gs.source_default("SEETG_FRAMES_FILE") == "seetg-frames.jsonl"
+      if hasattr(gs, "source_default") else
+      source_default("SEETG_FRAMES_FILE") == "seetg-frames.jsonl")
+check("файл кадров в .gitignore — его перезаписывает бот",
+      "seetg-frames.jsonl" in open(".gitignore", encoding="utf-8").read())
+# Пустой поток — не поломка: подписка подтверждена сервером.
+check("отсутствие событий названо НЕ поломкой", "не поломка" in _lc)
+
+_ofile71, _otok71, _ows71 = gs.SEETG_FRAMES_FILE, gs.SEETG_TOKEN, gs._ws_connect
+try:
+    gs.SEETG_FRAMES_FILE = os.path.join(_tmpdir, "frames71.jsonl")
+    gs.SEETG_TOKEN = "407:x"
+    _long71 = ('{"type":"event","event":"sale","market":"tonnel","gift":{"x":"'
+               + "9" * 3000 + '"}}')
+    class _FakeWS71:
+        def __init__(self):
+            self.sent, self.queue, self.closed = [], [], False
+        def settimeout(self, t):
+            pass
+        def send(self, data):
+            self.sent.append(data)
+            self.queue += ['{"type":"subscribed","events":["sale"]}', _long71]
+        def recv(self):
+            if not self.queue:
+                raise TimeoutError("timed out")
+            return self.queue.pop(0)
+        def close(self):
+            self.closed = True
+    _f71 = _FakeWS71()
+    gs._ws_connect = lambda url, headers, timeout: (_f71, None)
+    check("захват отработал", gs.seetg_listen_capture(1, "sale") is True)
+    check("подписка ушла измеренным кадром",
+          json.loads(_f71.sent[0]) == {"type": "subscribe", "events": ["sale"]},
+          _f71.sent)
+    _lines71 = open(gs.SEETG_FRAMES_FILE, encoding="utf-8").read().splitlines()
+    check("длинный кадр записан целиком, а не обрезан",
+          any(len(ln) > 3000 for ln in _lines71), [len(x) for x in _lines71])
+    check("служебный кадр тоже сохранён — он часть протокола",
+          any("subscribed" in ln for ln in _lines71))
+finally:
+    gs.SEETG_FRAMES_FILE, gs.SEETG_TOKEN, gs._ws_connect = (
+        _ofile71, _otok71, _ows71)
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:

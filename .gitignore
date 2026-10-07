@@ -21,3 +21,4 @@ deploy/my-secrets.sh
 # Otchet rezhima --flip: rezultat progona, ne ishodnik
 flip-report.txt
 model_colors.json
+seetg-frames.jsonl
