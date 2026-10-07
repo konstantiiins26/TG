@@ -4548,6 +4548,7 @@ def scan_seetg_arbitrage(snap: dict) -> int:
 SEETG_WS_URL = os.getenv("SEETG_WS_URL", "wss://live.see.tg/v1/ws")
 SEETG_WS_SECONDS = int(os.getenv("SEETG_WS_SECONDS", "60"))
 SEETG_WS_SHOW = int(os.getenv("SEETG_WS_SHOW", "10"))
+_WS_TICK_SEC = 30.0        # как часто говорить «жду» при тихом потоке
 # Кадры, которые НЕ являются событиями рынка. `hello` измерен живым прогоном
 # 07.10.2026; остальные типичны для WebSocket и стоят здесь на случай, если
 # придут, — лишнее имя тут безопасно, а пропущенное служебное имя завысило
@@ -4634,18 +4635,37 @@ def seetg_stream_probe(seconds: int = 0) -> bool:
     # подключение, а не поток событий. Ровно тот класс ошибки, от которого в
     # проекте есть правило: утверждение о ЦЕЛОМ по наблюдению за ЧАСТЬЮ.
     seen, events, kinds, started = 0, 0, {}, time.time()
-    hello = None
+    hello, ticked = None, 0.0
     try:
         while time.time() - started < seconds:
             try:
-                ws.settimeout(max(1.0, started + seconds - time.time()))
+                # Таймаут recv КОРОТКИЙ: с длинным поток висел бы молча до
+                # самого конца, и тик ожидания было бы некуда напечатать.
+                left = started + seconds - time.time()
+                if left <= 0:
+                    break
+                ws.settimeout(min(_WS_TICK_SEC, max(1.0, left)))
                 frame = ws.recv()
             except Exception as e:                    # noqa: BLE001
                 low = type(e).__name__.lower()
                 if "timeout" in low:
+                    # Это таймаут ОДНОГО recv, а не конец срока: тишина в
+                    # потоке — обычное дело, события приходят рывками.
+                    # Выходить по ней значило бы объявить поток пустым,
+                    # не дождавшись отведённого времени.
+                    frame = ""
+                else:
+                    log.warning(f"Соединение прервалось: "
+                                f"{type(e).__name__}: {e}")
                     break
-                log.warning(f"Соединение прервалось: {type(e).__name__}: {e}")
-                break
+            # МОЛЧАЩАЯ КОНСОЛЬ НЕОТЛИЧИМА ОТ ЗАВИСШЕЙ — тот же довод, что у
+            # номеров этапов в go.bat и у HEARTBEAT_MIN. Тик печатает, что
+            # соединение живо и сколько осталось, и НЕ выдумывает событий.
+            now = time.time()
+            if now - max(ticked, started) >= _WS_TICK_SEC:
+                ticked = now
+                log.info(f"  …жду, прошло {now - started:.0f}с из {seconds}, "
+                         f"событий пока {events}")
             if not frame:
                 continue
             seen += 1

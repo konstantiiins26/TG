@@ -5601,6 +5601,55 @@ check("отсутствие «sale» в их списке названо пря�
 check("режим «anon» назван, но причиной молчания не объявлен",
       "НЕ измеряли" in _p69b)
 
+# --- ТИШИНА В ПОТОКЕ НЕ ЗАКАНЧИВАЕТ ПРОГОН --------------------------------
+# События приходят рывками, и первый же тихий промежуток не должен означать
+# «поток пуст»: выйти по нему значит не дождаться отведённого времени.
+class _FakeWS69:
+    def __init__(self, script):
+        self.script, self.closed = list(script), False
+    def settimeout(self, t):
+        pass
+    def recv(self):
+        if not self.script:
+            raise TimeoutError("timed out")
+        item = self.script.pop(0)
+        if item is None:
+            raise TimeoutError("timed out")   # тихий промежуток
+        return item
+    def close(self):
+        self.closed = True
+
+_hello69 = ('{"auth":{"admin":false,"via":"app"},"events":["listing","sale"],'
+            '"mode":"anon","type":"hello"}')
+_sale69 = '{"type":"sale","slug":"CandyCane","num":1,"amount":"3410000000"}'
+_ows69, _otok69, _otick69 = gs._ws_connect, gs.SEETG_TOKEN, gs._WS_TICK_SEC
+try:
+    gs.SEETG_TOKEN, gs._WS_TICK_SEC = "407:x", 0.01
+    _fake69 = _FakeWS69([_hello69, None, None, _sale69, _sale69])
+    gs._ws_connect = lambda url, headers, timeout: (_fake69, None)
+    check("проба отработала", gs.seetg_stream_probe(2) is True)
+    check("тихий промежуток не оборвал прогон — события после него учтены",
+          not _fake69.script, _fake69.script)
+    check("соединение закрыто", _fake69.closed is True)
+
+    # Один hello и ничего больше — это НЕ «форма снята».
+    _only69 = _FakeWS69([_hello69])
+    gs._ws_connect = lambda url, headers, timeout: (_only69, None)
+    _logged69 = []
+    _olog69 = gs.log.info
+    gs.log.info = lambda msg, *a, **k: _logged69.append(str(msg))
+    try:
+        gs.seetg_stream_probe(1)
+    finally:
+        gs.log.info = _olog69
+    check("на одном рукопожатии форма НЕ объявляется снятой",
+          not any("Форма снята" in m for m in _logged69),
+          [m for m in _logged69 if "Форма" in m])
+    check("их список событий при этом напечатан",
+          any("Поток называет события сам" in m for m in _logged69))
+finally:
+    gs._ws_connect, gs.SEETG_TOKEN, gs._WS_TICK_SEC = _ows69, _otok69, _otick69
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:
