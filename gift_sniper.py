@@ -4127,6 +4127,85 @@ def seetg_confirm_pair(slug: str, model: str, pair: dict):
     return out, None
 
 
+# Сколько ПОСЛЕДНИХ продаж предмета показывать. Это ОДИН запрос на лот и
+# ОДНА страница: у ответа есть `nextCursor`, и ходить по нему запрещено —
+# их правила называют выгрузку историй отдельным основанием для блокировки
+# аккаунта целиком. Здесь живой вопрос про конкретный лот, а не архив.
+SEETG_SALES_SHOW = int(os.getenv("SEETG_SALES_SHOW", "3"))
+
+
+def seetg_gift_sales(slug: str, num):
+    """
+    ФАКТИЧЕСКИЕ ПРОДАЖИ ЭТОГО ПРЕДМЕТА. Список {price, market, time}, свежие
+    первыми. Пусто — значит продаж в отданной странице нет.
+
+    ЭТО ЕДИНСТВЕННОЕ МЕСТО ВО ВСЁМ ПРОЕКТЕ, ГДЕ ВИДНО, СКОЛЬКО ПЛАТЯТ, А НЕ
+    СКОЛЬКО ПРОСЯТ. Форма снята с живого ответа 07.10.2026 (CandyCane-86892):
+
+        {'id': 'sale:2026-10-07T17:25:38...', 'kind': 'GIFT',
+         'time': '2026-10-07T17:25:38.069345Z',
+         'saleAction': {'market': 'portals', 'kind': 'purchase',
+                        'amount': '3410000000', 'currency': 'gram',
+                        'amountTon': '3410000000', 'model': 'Polka Pop',
+                        'backdrop': 'Light Olive', 'symbol': 'Smartphone'}}
+
+    Тот прогон сразу дал цену вопроса: этот Candy Cane дважды за час
+    уходил по 3.40 и 3.41 на portals — при том, что бот в уведомлении
+    предлагал продать такой же за 7.08 на getgems.
+
+    БЕРУТСЯ ТОЛЬКО ПРОДАЖИ ЗА НАТИВНУЮ МОНЕТУ. Рядом есть `amountTon` и для
+    других валют, но что он там означает — пересчёт по какому курсу и на
+    какой момент — НЕ ИЗМЕРЕНО, а курс из воздуха в этом проекте уже
+    запрещён. Записи в звёздах просто считаются отдельно и называются.
+    """
+    rows = _seetg_rows(seetg_get(f"/gift/{slug}-{num}/history"))
+    out, skipped = [], 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        act = row.get("saleAction")
+        if not isinstance(act, dict):
+            continue                      # листинг/снятие/передача — не сделка
+        if str(act.get("currency", "")).lower() not in ("gram", "ton"):
+            skipped += 1
+            continue
+        price = _nano_to_ton(act.get("amountTon") or act.get("amount"))
+        if price is None or price <= 0:
+            continue
+        out.append({"price": price, "market": act.get("market"),
+                    "time": str(row.get("time") or "")[:16].replace("T", " "),
+                    "kind": act.get("kind")})
+    return out, skipped
+
+
+def _seetg_sales_lines(sales, skipped, planned_sale):
+    """
+    Блок «за сколько реально уходил» + честное предупреждение.
+
+    Предупреждение НЕ БЛОКИРУЕТ отправку: одна старая дешёвая продажа не
+    доказывает, что дороже не возьмут, а владелец покупает руками и решает
+    сам. Но молчать о ней нельзя — это ровно то число, которого ему не
+    хватало, когда он сверял уведомление с графиком продаж Getgems.
+    """
+    q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
+    if not sales:
+        return ["💸 Продаж этого предмета в отданной истории нет — "
+                "сколько за него ПЛАТИЛИ, неизвестно"]
+    lines = ["💸 За сколько этот предмет РЕАЛЬНО уходил:"]
+    for s in sales[:SEETG_SALES_SHOW]:
+        lines.append(f"  {q(s['price'])} ({s.get('market') or '—'}, "
+                     f"{s.get('time')})")
+    if skipped:
+        lines.append(f"  (ещё {skipped} сделок не в TON — курса у нас нет, "
+                     f"не считаем)")
+    top = max(s["price"] for s in sales)
+    if planned_sale > top:
+        lines.append(f"⚠️ ВЫ СОБИРАЕТЕСЬ ВЫСТАВИТЬ ЗА {q(planned_sale)}, а "
+                     f"дороже {q(top)} этот предмет не уходил ни разу в "
+                     f"отданной истории")
+    return lines
+
+
 def _seetg_arb_already_seen(slug: str, pair: dict) -> bool:
     """
     Выдержка повтора. Ключ несёт ЦЕНЫ, поэтому подешевевшая пара приходит
@@ -4268,6 +4347,17 @@ def notify_seetg_arb(name: str, slug: str, pair: dict) -> bool:
             f"бы {q(pair['top_profit']):+} TON. Это ПОТОЛОК, а не ожидание: "
             f"рядом та же модель за {q(sell_floor)}.")
 
+    # ЦЕНЫ СДЕЛОК ЭТОГО ПРЕДМЕТА — один запрос, одна страница. Сбой здесь
+    # уведомление не роняет: без них оно просто беднее, но не выдумано.
+    lines.append("")
+    try:
+        _sales, _skipped = seetg_gift_sales(slug, buy.get("num"))
+        lines += _seetg_sales_lines(_sales, _skipped, sale)
+    except RateLimited as e:
+        log.warning(f"see.tg: {e}")
+    except Exception as e:                              # noqa: BLE001
+        log.warning(f"see.tg: история сделок не получена: {e}")
+
     lines.append("")
     if buy.get("link"):
         lines.append(f"🛒 КУПИТЬ {q(buy['price'])} на «{buy.get('market')}»:")
@@ -4286,9 +4376,9 @@ def notify_seetg_arb(name: str, slug: str, pair: dict) -> bool:
 
     lines += [
         "",
-        "⚠️ ЭТО ЦЕНЫ ПРОСЬБЫ, А НЕ СДЕЛОК. Сколько за эту модель реально "
-        "платят, бот не знает: истории сделок у нас нет ни по одному "
-        "источнику. Сверьтесь со средней ценой на витрине.",
+        "⚠️ ЦЕНЫ ЛЕСТНИЦЫ — ЭТО ПРОСЬБЫ, А НЕ СДЕЛКИ. Сделки известны только "
+        "по ЭТОМУ предмету (блок выше); сколько платят за модель в целом, "
+        "бот пока не знает — сверьтесь со средней ценой на витрине.",
         "⚠️ БОТ ЭТО НЕ КУПИТ: вне Getgems у него нет ни протокола маркета, "
         "ни адреса контракта продажи. Сделка РУЧНАЯ, отметить: "
         "--bought АДРЕС ЦЕНА",
