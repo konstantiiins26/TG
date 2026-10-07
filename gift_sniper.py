@@ -4583,29 +4583,35 @@ def _ws_connect(url: str, headers: list, timeout: float):
 
 def _ws_candidate_frames(events: list) -> list:
     """
-    Кадры-кандидаты подписки. ОБЁРТКА ИЗМЕРЕНА, перебирается ЗНАЧЕНИЕ.
+    Кадры-кандидаты. Тройка: (имя, кадр, ЭТО ЛИ ПОПЫТКА ПОДПИСКИ).
 
-    Живой ответ сервера 07.10.2026 на заведомо неверный кадр:
+    Третье поле появилось не для порядка. Живой прогон 07.10.2026:
 
-        {"code":"bad_request","message":"unknown message type","type":"error"}
+        -> {"type":"__unknown_probe__"}   <- {"code":"bad_request",
+                                              "message":"unknown message type"}
+        -> {"type":"ping"}                <- {"type":"pong"}
 
-    Отсюда ДВА факта, и оба добыты одним кадром: сервер читает наши сообщения
-    и разбирает их как JSON, и ключ он смотрит именно `type` («unknown message
-    TYPE»). Значит угадывать надо не форму конверта, а слово внутри него.
+    Первый кадр дал ключ конверта (`type` назван в самом отказе), второй —
+    что СЛОВАРЬ РАБОТАЕТ: на известное слово сервер отвечает по делу. Оба
+    кадра ДИАГНОСТИЧЕСКИЕ: ни один не подписывает ни на что, и остановка
+    перебора на их ответе означала бы «нашли команду», не найдя её.
 
-    Имена событий по-прежнему берутся из `hello.events` — из памяти тут не
-    берётся ничего. `ping` стоит первым не ради вежливости: это слово,
-    которое есть почти у любого потока, и ответ на него отделяет «моё слово
-    не то» от «сервер вообще не отвечает ничем, кроме ошибок».
+    Поэтому останавливать перебор может ТОЛЬКО кадр, который и был попыткой
+    подписки. Диагностические свой ответ печатают и уступают дорогу.
+
+    Имена событий берутся из `hello.events`; из памяти — только слово
+    конверта, и оно здесь предмет измерения.
     """
     want = [e for e in events if e in ("sale", "listing", "price")] or ["sale"]
     return [
-        ("type=ping", {"type": "ping"}),
-        ("type=subscribe + events", {"type": "subscribe", "events": want}),
-        ("type=subscribe + channels", {"type": "subscribe", "channels": want}),
-        ("type=sub + events", {"type": "sub", "events": want}),
-        ("type=listen + events", {"type": "listen", "events": want}),
-        ("type=watch + events", {"type": "watch", "events": want}),
+        ("type=ping (проверка словаря)", {"type": "ping"}, False),
+        ("type=subscribe + events", {"type": "subscribe", "events": want}, True),
+        ("type=subscribe + channels",
+         {"type": "subscribe", "channels": want}, True),
+        ("type=subscribe + topics", {"type": "subscribe", "topics": want}, True),
+        ("type=sub + events", {"type": "sub", "events": want}, True),
+        ("type=listen + events", {"type": "listen", "events": want}, True),
+        ("type=watch + events", {"type": "watch", "events": want}, True),
     ]
 
 
@@ -4690,7 +4696,7 @@ def seetg_subscribe_probe(wait_sec: int = 0) -> bool:
                         "соберу по умолчанию («sale»).")
 
         refusals = []
-        for name, frame in _ws_candidate_frames(events):
+        for name, frame, is_sub in _ws_candidate_frames(events):
             log.info(f"{_Color.GREY}→ пробую {name}: "
                      f"{json.dumps(frame, ensure_ascii=False)}{_Color.RESET}")
             try:
@@ -4714,6 +4720,14 @@ def seetg_subscribe_probe(wait_sec: int = 0) -> bool:
                         refusals.append(e)
                 log.info(f"{_Color.GREY}  это отказ — слово не то, пробую "
                          f"дальше{_Color.RESET}")
+                continue
+            if not is_sub:
+                # ДИАГНОСТИЧЕСКИЙ кадр ответ получил, но ни на что не
+                # подписал. Остановиться здесь значило бы объявить команду
+                # найденной, не найдя её.
+                log.info(f"{_Color.GREEN}  словарь работает{_Color.RESET} — "
+                         f"сервер отвечает по делу на известное слово. Это не "
+                         f"подписка, иду дальше.")
                 continue
             log.info(f"{_Color.GREEN}Сервер ПРИНЯЛ «{name}».{_Color.RESET} "
                      f"Перебор прекращаю — лишний трафик к ним не нужен. "

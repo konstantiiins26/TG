@@ -5656,17 +5656,22 @@ finally:
 # догадка — тот же приём, что круговая проверка /v1/resolve.
 _cands = gs._ws_candidate_frames(["transfer", "sale", "listing", "stats"])
 check("кандидаты подписки собираются из ИХ списка событий",
-      all("sale" in str(f) for _n, f in _cands[1:]), _cands)
+      all("sale" in str(f) for _n, f, _s in _cands[1:]), _cands)
 check("имя события не выдумано: взято из рукопожатия",
-      all("stats" not in str(f) for _n, f in _cands))
+      all("stats" not in str(f) for _n, f, _s in _cands))
 # ОБЁРТКА ИЗМЕРЕНА живым ответом «unknown message TYPE»: сервер смотрит
 # именно `type`. Значит перебирать надо значение, а не ключ — иначе кадры
 # тратятся на то, что уже известно.
 check("все кандидаты идут с измеренным ключом type",
-      all("type" in f for _n, f in _cands), _cands)
+      all("type" in f for _n, f, _s in _cands), _cands)
 check("кандидатов немного — это не перебор ради перебора", len(_cands) <= 8)
 check("ping стоит первым: он отделяет «слово не то» от «молчит на всё»",
       _cands[0][1] == {"type": "ping"}, _cands[0])
+# ping ОТВЕТ ПОЛУЧАЕТ (измерено: pong), но ни на что не подписывает.
+# Остановка на нём объявила бы команду найденной, не найдя её.
+check("ping помечен как НЕ попытка подписки", _cands[0][2] is False)
+check("остальные кандидаты — попытки подписки",
+      all(_s for _n, _f, _s in _cands[1:]))
 
 # Отказ опознаётся по их же форме ответа (живая строка 07.10.2026).
 check("отказ опознан и его текст извлечён",
@@ -5681,6 +5686,8 @@ _sp70 = _src70.split("def seetg_subscribe_probe")[1].split("\ndef ")[0]
 # правилами, а ответ любого рода — уже измерение.
 check("перебор прекращается на ПРИНЯТОМ кадре, а не на отказе",
       "Сервер ПРИНЯЛ" in _sp70 and "это отказ — слово не то" in _sp70)
+check("ответ на диагностический кадр перебор не останавливает",
+      "словарь работает" in _sp70 and "иду дальше" in _sp70)
 check("слова отказов собираются и печатаются — это их словарь",
       "refusals" in _sp70 and "Сервер отказал так" in _sp70)
 check("молчание на все кандидаты названо НЕ доказательством отсутствия",
@@ -5700,7 +5707,9 @@ class _FakeWS70:
         pass
     def send(self, data):
         self.sent.append(data)
-        if "channels" in data:
+        if '"ping"' in data:                      # живой случай: pong
+            self.queue.append('{"type":"pong"}')
+        elif "channels" in data:
             self.queue.append('{"type":"subscribed","events":["sale"]}')
         else:
             self.queue.append('{"code":"bad_request",'
@@ -5720,7 +5729,9 @@ try:
     check("проба подписки отработала", gs.seetg_subscribe_probe(1) is True)
     # ОТКАЗЫ перебор не останавливают, а ПРИНЯТЫЙ кадр — останавливает:
     # после него ни одного лишнего.
-    check("отказы не останавливают перебор, принятый кадр останавливает",
+    # pong на ping и отказ на subscribe+events перебор НЕ останавливают,
+    # а принятый subscribe+channels — останавливает.
+    check("ни pong, ни отказ перебор не останавливают",
           len(_f70.sent) == 3 and "channels" in _f70.sent[-1], _f70.sent)
     check("соединение закрыто", _f70.closed is True)
 finally:
