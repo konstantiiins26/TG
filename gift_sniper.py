@@ -3808,6 +3808,9 @@ _seetg_arb_suppressed = 0
 _seetg_arb_implausible = 0
 _seetg_arb_unconfirmed = 0
 _seetg_paced_skips = 0
+_unaffordable_skips = 0
+_unaffordable_why = ""
+_bankroll_unset_warned = False
 _seetg_scan_at: dict = {}
 
 # Расход на один прогон по одной коллекции. ИЗМЕРЯЕТСЯ (максимум виденного),
@@ -4251,7 +4254,8 @@ def _seetg_ladder_line(ladder, limit: int = 6) -> str:
                      for x in (ladder or [])[:limit])
 
 
-def notify_seetg_arb(name: str, slug: str, pair: dict) -> bool:
+def notify_seetg_arb(name: str, slug: str, pair: dict,
+                     collection: str = "") -> bool:
     """
     Уведомление о паре «купить — продать». True, если отправлено.
 
@@ -4388,9 +4392,57 @@ def notify_seetg_arb(name: str, slug: str, pair: dict) -> bool:
     if not conf["same_market"]:
         lines.append("⚠️ внутри одной модели фон и узор разные — цена на "
                      "чужом маркете может отличаться составом лотов")
-    return bool(_tg_call("sendMessage", {
-        "chat_id": TELEGRAM_CHAT_ID, "text": "\n".join(lines),
-        "disable_web_page_preview": True}))
+
+    # КНОПКА «КУПИЛ» ЕСТЬ И ЗДЕСЬ. Без неё купленный по связке лот не
+    # попадал в БД ВООБЩЕ: ни PnL, ни риск-лимиты про него не знают, то
+    # есть учёт становится фикцией — ровно тем, от чего кнопки заводились
+    # для находок. Руками остаётся «--bought АДРЕС ЦЕНА», но набирать
+    # 66-символьный адрес с телефона никто не станет.
+    #
+    # Без адреса кнопки НЕ ставятся: записать позицию, не зная предмета,
+    # значит завести в учёте лот, который нельзя ни найти, ни закрыть.
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": "\n".join(lines),
+               "disable_web_page_preview": True}
+    action_id = None
+    if buy.get("address"):
+        action_id = tg_action_create(
+            {"address": buy["address"], "collection_address": collection},
+            {"buy_price": Decimal(str(buy["price"])), "sale_price": sale,
+             "eff_floor": sell_floor})
+        payload["reply_markup"] = _find_buttons(action_id)
+    else:
+        lines.append("⚠️ адреса предмета в ответе see.tg нет — кнопки "
+                     "«Купил» не будет, отметить: --bought АДРЕС ЦЕНА")
+        payload["text"] = "\n".join(lines)
+    body = _tg_call("sendMessage", payload)
+    if body and action_id:
+        mid = ((body.get("result") or {}) if isinstance(body, dict) else {}).get(
+            "message_id")
+        if mid:
+            tg_action_update(action_id, message_id=int(mid))
+    return bool(body)
+
+
+def _affordable(price, what: str) -> bool:
+    """
+    Пускать ли это в телефон по деньгам. Считает отсеянное для сводки.
+
+    ОДНА ТОЧКА НА ВСЕ ПУТИ УВЕДОМЛЕНИЙ. Урок проекта: исправление в одной
+    точке не закрывает класс ошибки, если у значения несколько потребителей
+    (так дважды выжил арбитраж по безымянной корзине и арбитраж по TonAPI).
+    Поэтому и арбитраж see.tg, и «дешевле своих» спрашивают ЗДЕСЬ.
+
+    Отсеянное НЕ теряется молча: в лог — причина, в часовую сводку — число.
+    Тишина без объяснения неотличима от поломки.
+    """
+    global _unaffordable_skips, _unaffordable_why
+    ok, why = owner_can_pay(price)
+    if why:
+        log.info(f"{_Color.GREY}  {what}: {why}{_Color.RESET}")
+    if not ok:
+        _unaffordable_skips += 1
+        _unaffordable_why = why
+    return ok
 
 
 def scan_seetg_arbitrage(snap: dict) -> int:
@@ -4457,7 +4509,11 @@ def scan_seetg_arbitrage(snap: dict) -> int:
     for pair in pairs[:max(SEETG_ARB_LOG_TOP, SEETG_ARB_MAX_PER_COLLECTION)]:
         top = (f" | потолок: {pair['top_market']} {pair['top_floor']} "
                f"-> {pair['top_profit']:+.4f}" if pair.get("top_market") else "")
-        log.info(f"  «{pair['model']}»: купить на {pair['buy_market']} "
+        # ПРЕДВАРИТЕЛЬНО: это floor'ы борды, а решение принимается по
+        # лестнице живых лотов — она часто уводит число ВНИЗ (см.
+        # `seetg_confirm_pair`). Строка без оговорки читалась бы находкой.
+        log.info(f"  предварительно «{pair['model']}»: купить на "
+                 f"{pair['buy_market']} "
                  f"{pair['buy_floor']} (лотов {pair['buy_n']}) → встать под "
                  f"{pair['sell_market']} {pair['sell_floor']} (лотов "
                  f"{pair['sell_n']}) → {pair['profit']:+.4f} TON, "
@@ -4474,9 +4530,11 @@ def scan_seetg_arbitrage(snap: dict) -> int:
             continue
         if notified >= SEETG_ARB_MAX_PER_COLLECTION:
             continue
+        if not _affordable(pair["buy_floor"], f"«{pair['model']}»"):
+            continue
         if _seetg_arb_already_seen(slug, pair):
             continue
-        if notify_seetg_arb(name or slug, slug, pair):
+        if notify_seetg_arb(name or slug, slug, pair, collection):
             notified += 1
     return len(pairs)
 
@@ -4814,6 +4872,8 @@ def scan_segment_bargains(snap: dict) -> int:
                  f"профит {b['profit']:.4f} TON, ROI {b['roi']}% | "
                  f"{_Color.YELLOW}бот это НЕ купит{_Color.RESET}")
         if notified < SEGMENT_MAX_PER_COLLECTION:
+            if not _affordable(b["buy"], f"«{b['model']}»"):
+                continue
             if notify_segment_bargain(b):
                 notified += 1
     return found
@@ -5463,6 +5523,57 @@ def available_bankroll() -> Decimal:
     return BANKROLL_TON - deployed_capital() - RESERVE_TON
 
 
+def owner_can_pay(price) -> tuple:
+    """
+    Хватает ли банка, чтобы КУПИТЬ этот лот РУКАМИ. (можно, пояснение).
+
+    Зачем отдельно от `max_position_size()`: тот считает риск-лимит БОТА
+    (процент банка на сделку), а здесь вопрос физический — есть ли вообще
+    такие деньги. Первый живой прогон арбитража прислал в телефон пару
+    «Death Note»: купить за 499.8 TON при банке около 19. Совет, который
+    невозможно выполнить, не отличается от шума, а шум перестают читать —
+    тот же довод, что у `HEARTBEAT_MIN`.
+
+    ГАЗ ВХОДИТ В ЦЕНУ ВОПРОСА: заплатить надо цену плюс `PURCHASE_GAS_TON`,
+    иначе покупка не доисполнится. Резерв не трогается никогда — он уже
+    вычтен в `available_bankroll()`.
+
+    БАНК НЕ ЗАДАН — НЕ ФИЛЬТРУЕМ. `BANKROLL_TON = 0` означает «не знаю», а
+    «не знаю» и «не хватает» это разные вещи: молча заглушить всё при пустой
+    настройке значило бы объяснять тишину поломкой. Сказано вслух.
+
+    РИСК-ЛИМИТ БОТА НЕ БЛОКИРУЕТ показ: бот по этим парам всё равно не
+    покупает (вне Getgems у него нет ни протокола, ни адреса контракта), а
+    владелец покупает руками и не обязан держать свои же 10% банка. Но
+    превышение НАЗЫВАЕТСЯ — иначе находка выглядела бы как то, что бот
+    когда-нибудь возьмёт сам.
+    """
+    try:
+        need = Decimal(str(price)) + PURCHASE_GAS_TON
+    except (InvalidOperation, ValueError):
+        return True, ""
+    global _bankroll_unset_warned
+    if BANKROLL_TON <= 0:
+        if not _bankroll_unset_warned:
+            _bankroll_unset_warned = True
+            log.warning("BANKROLL_TON не задан — по карману не отсеиваю "
+                        "ничего. Впишите фактический баланс кошелька в "
+                        "deploy/my-secrets.bat, иначе в телефон будут "
+                        "приходить лоты, которые не купить.")
+        return True, ""
+    free = available_bankroll()
+    if need > free:
+        return False, (f"нужно {need:.2f} TON (цена + газ), свободно "
+                       f"{free:.2f} из банка {BANKROLL_TON:.2f} "
+                       f"(резерв {RESERVE_TON:.2f} не тратится)")
+    cap = max_position_size()
+    if cap > 0 and Decimal(str(price)) > cap:
+        return True, (f"по карману, но выше риск-лимита бота "
+                      f"{cap:.2f} TON ({MAX_POSITION_PCT:.0f}% банка) — "
+                      f"сам бы он столько не поставил")
+    return True, ""
+
+
 def position_pct_for(roi_pct=None) -> Decimal:
     """
     Какая доля банка разрешена этой сделке.
@@ -5885,6 +5996,11 @@ def notify_heartbeat(snapshots: list, force: bool = False):
                          f"{n['sell']} ({n['sell_m']}): {n['profit']:+.2f} TON "
                          f"({n['roi']}%)")
         _seetg_near.clear()
+    global _unaffordable_skips, _unaffordable_why
+    if _unaffordable_skips:
+        lines.append(f"💳 не по банку, не отправлено: {_unaffordable_skips} "
+                     f"({_unaffordable_why})")
+        _unaffordable_skips, _unaffordable_why = 0, ""
     if _seetg_arb_unconfirmed:
         lines.append(f"⚠️ арбитраж не подтверждён живым лотом: "
                      f"{_seetg_arb_unconfirmed} — борда обещала цену, по "

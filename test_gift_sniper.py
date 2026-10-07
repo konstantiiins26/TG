@@ -5400,6 +5400,115 @@ check("отсутствие сделок названо неизвестност
       any("неизвестно" in ln for ln in gs._seetg_sales_lines([], 0, Decimal("5"))))
 
 # =============================================================================
+# [68] ПО КАРМАНУ ЛИ ЭТО ВООБЩЕ. Первый живой прогон арбитража прислал в
+# телефон «Death Note»: купить за 499.8 TON при банке около 19. Совет,
+# который невозможно выполнить, не отличается от шума, а шум перестают
+# читать — тот же довод, что у HEARTBEAT_MIN и FIND_NOTIFY_MAX_PER_HOUR.
+# =============================================================================
+print("\n[68] Проверка по банку: показываем то, что можно купить")
+
+_obank68 = (gs.BANKROLL_TON, gs.RESERVE_TON, gs.DB_PATH)
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "afford68.db")
+    gs.db_init()
+    # «Банк не задан» и «не хватает» — РАЗНЫЕ вещи. Молча заглушить всё при
+    # пустой настройке значило бы объяснять тишину поломкой.
+    gs.BANKROLL_TON = Decimal("0")
+    _ok68, _why68 = gs.owner_can_pay(Decimal("499.8"))
+    check("банк не задан — по карману НЕ отсеиваем", _ok68 is True, _why68)
+
+    gs.BANKROLL_TON, gs.RESERVE_TON = Decimal("19"), Decimal("5")
+    check("лот за 499.8 при банке 19 в телефон не идёт",
+          gs.owner_can_pay(Decimal("499.8"))[0] is False)
+    check("лот за 3.5 при банке 19 проходит",
+          gs.owner_can_pay(Decimal("3.5"))[0] is True)
+    # Резерв не тратится никогда: иначе не на что продать купленное.
+    # Свободно 19 − 5 = 14, а заплатить надо цену ПЛЮС газ.
+    check("резерв вычтен, газ прибавлен",
+          gs.owner_can_pay(Decimal("13.9"))[0] is False
+          and gs.owner_can_pay(Decimal("13.5"))[0] is True)
+    _why68b = gs.owner_can_pay(Decimal("499.8"))[1]
+    check("в причине названы и нужная сумма (с газом), и свободная",
+          "500.10" in _why68b and "14.00" in _why68b, _why68b)
+    # РИСК-ЛИМИТ БОТА (10% банка = 1.9 TON) показ НЕ блокирует: бот по этим
+    # парам всё равно не покупает, а владелец покупает руками. Но
+    # превышение называется — иначе находка выглядела бы как то, что бот
+    # когда-нибудь возьмёт сам.
+    _ok68c, _why68c = gs.owner_can_pay(Decimal("3.5"))
+    check("риск-лимит бота не блокирует, но назван",
+          _ok68c is True and "риск-лимит" in _why68c, _why68c)
+
+    # Отсеянное НЕ теряется молча: число уходит в часовую сводку.
+    gs._unaffordable_skips, gs._unaffordable_why = 0, ""
+    check("отсеянное считается", gs._affordable(Decimal("499.8"), "«X»") is False
+          and gs._unaffordable_skips == 1, gs._unaffordable_skips)
+    check("прошедшее не считается", gs._affordable(Decimal("3.5"), "«X»") is True
+          and gs._unaffordable_skips == 1)
+finally:
+    gs.BANKROLL_TON, gs.RESERVE_TON, gs.DB_PATH = _obank68
+
+_src68 = open("gift_sniper.py", encoding="utf-8").read()
+# ОДНА ПРОВЕРКА НА ВСЕ ПУТИ В ТЕЛЕФОН. Урок проекта: исправление в одной
+# точке не закрывает класс ошибки, если у значения несколько потребителей —
+# так дважды выжила безымянная корзина маркета и арбитраж по TonAPI.
+_arb68 = _src68.split("def scan_seetg_arbitrage")[1].split("\ndef ")[0]
+_seg68 = _src68.split("def scan_segment_bargains")[1].split("\ndef ")[0]
+check("арбитраж спрашивает про банк", "_affordable(" in _arb68)
+check("«дешевле своих» спрашивает про банк", "_affordable(" in _seg68)
+_sum68 = _src68.split("def _seetg_summary_lines")[1].split("\ndef ")[0] \
+    if "def _seetg_summary_lines" in _src68 else _src68
+check("число отсеянного попадает в сводку", "не по банку" in _src68)
+
+# --- КНОПКА «КУПИЛ» ЕСТЬ И У СВЯЗКИ ---------------------------------------
+# Без неё купленный по связке лот не попадал в БД ВООБЩЕ: ни PnL, ни
+# риск-лимиты про него не знают, то есть учёт становится фикцией — ровно то,
+# от чего кнопки заводились для находок.
+_sent68 = []
+_o68 = (gs._tg_call, gs.SEETG_TOKEN, gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN,
+        gs.seetg_get, gs.DB_PATH)
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "btn68.db")
+    gs.db_init()
+    gs._tg_call = lambda method, payload: (
+        _sent68.append((method, payload)) or {"ok": True, "result": {"message_id": 42}})
+    gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN = "1", "t"
+    gs.SEETG_TOKEN = "12:tok"
+    gs.seetg_get = lambda path, params=None: {"items": [_gift64, _sellgift64]}
+    gs._seetg_arb_sent_ts.clear()
+    check("связка отправлена",
+          gs.notify_seetg_arb("Surge Boards", "SurgeBoard", _pair64, "0:coll")
+          is True)
+    _pay68 = _sent68[-1][1]
+    check("у связки есть кнопки «Купил / Продал»",
+          "reply_markup" in _pay68, list(_pay68))
+    _cb68 = _pay68["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    _row68 = gs.tg_action_get(int(_cb68.split(":")[1]))
+    check("в кнопке лежит id строки, а адрес в таблице",
+          _row68 is not None and _row68["address"] == "EQD4cq", _cb68)
+    check("цена покупки взята из живого лота, а не из борды",
+          Decimal(_row68["buy_price_ton"]) == Decimal("8.8"),
+          _row68["buy_price_ton"])
+    check("коллекция записана — без неё позицию не с чем связать",
+          _row68["collection"] == "0:coll")
+    check("message_id сохранён, иначе галочку некуда поставить",
+          _row68["message_id"] == 42)
+
+    # Без адреса предмета кнопок НЕТ: записать позицию, не зная предмета,
+    # значит завести в учёте лот, который нельзя ни найти, ни закрыть.
+    _noaddr68 = dict(_gift64)
+    _noaddr68.pop("giftAddress")
+    gs.seetg_get = lambda path, params=None: {"items": [_noaddr68, _sellgift64]}
+    gs._seetg_arb_sent_ts.clear()
+    _sent68.clear()
+    gs.notify_seetg_arb("Surge Boards", "SurgeBoard", _pair64, "0:coll")
+    check("без адреса кнопок нет, и об этом сказано",
+          "reply_markup" not in _sent68[-1][1]
+          and "--bought" in _sent68[-1][1]["text"], list(_sent68[-1][1]))
+finally:
+    (gs._tg_call, gs.SEETG_TOKEN, gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN,
+     gs.seetg_get, gs.DB_PATH) = _o68
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
