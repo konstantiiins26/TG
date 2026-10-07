@@ -4759,17 +4759,36 @@ check("путь по TonAPI сохранён и включается SEETG_ONLY=
 _row64 = {"key": "Love Shard", "floorTon": 8.8, "floorMarket": "portals",
           "markets": [
               {"market": "portals", "floorTon": 8.8, "listings": 40},
-              {"market": "tonnel", "floorTon": 9.0, "listings": 30},
-              {"market": "getgems", "floorTon": 11.0, "listings": 20},
               {"market": "telegram", "floorTon": 12.4, "listings": 900}]}
 _pair64 = gs._seetg_market_pair(_row64)
 _pair64["model"] = "Love Shard"        # модель подставляет seetg_cross_market
 check("купить — там, где дешевле всего",
       _pair64["buy_market"] == "portals" and _pair64["buy_floor"] == Decimal("8.8"),
       _pair64)
-check("продать — там, где дороже всего",
+check("продавать — ПРОТИВ БЛИЖАЙШЕГО конкурента, а не дорогого маркета",
       _pair64["sell_market"] == "telegram" and _pair64["sell_floor"] == Decimal("12.4"),
       _pair64)
+
+# ЖИВОЙ СЛУЧАЙ, РАДИ КОТОРОГО ПРАВИЛО И ПОМЕНЯЛОСЬ (07.10.2026, Candy Canes
+# «New Layer», уведомление у владельца на экране). Бот предлагал купить на
+# mrkt 3.50 и продать на getgems 7.08 = +3.29 TON. Но рядом стоит portals
+# 3.66, и покупателю незачем платить вдвое: честное число −0.17 TON.
+_cc64 = {"key": "New Layer", "markets": [
+    {"market": "mrkt", "floorTon": 3.50, "listings": 36},
+    {"market": "portals", "floorTon": 3.66, "listings": 59},
+    {"market": "tonnel", "floorTon": 5.43, "listings": 25},
+    {"market": "telegram", "floorTon": 6.24, "listings": 267},
+    {"market": "getgems", "floorTon": 7.30, "listings": 16}]}
+_ccp64 = gs._seetg_market_pair(_cc64)
+check("конкурент — portals 3.66, а не getgems 7.30",
+      _ccp64["sell_market"] == "portals", _ccp64["sell_market"])
+check("на том лоте связки НЕТ: честная прибыль отрицательная",
+      _ccp64["profit"] < 0, _ccp64["profit"])
+check("дорогой маркет остаётся, но только как ПОТОЛОК",
+      _ccp64["top_market"] == "getgems" and _ccp64["top_profit"] > 0,
+      _ccp64.get("top_market"))
+check("потолок не подменяет решение: решает осторожное число",
+      _ccp64["profit"] < _ccp64["top_profit"])
 # Прибыль считает ТА ЖЕ функция, что принимает торговое решение. Вторая
 # формула прибыли разошлась бы с первой в первый же день.
 check("прибыль считает compute_net_profit, а не своя формула",
@@ -4784,8 +4803,16 @@ check("ROI считает compute_roi_pct",
 # тонком маркете; отчёт --markets чинили ровно так.
 _thin = dict(_row64, markets=_row64["markets"] + [
     {"market": "mrkt", "floorTon": 99.0, "listings": 2}])
-check("тонкий маркет не становится стороной ПРОДАЖИ",
-      gs._seetg_market_pair(_thin)["sell_market"] == "telegram")
+check("тонкий маркет не становится ПОТОЛКОМ: floor по двум лотам не рынок",
+      gs._seetg_market_pair(_thin).get("top_market") == "telegram",
+      gs._seetg_market_pair(_thin).get("top_market"))
+# А вот КОНКУРЕНТОМ один дешёвый лот становится: он уводит покупателя, и
+# отбрасывать его значило бы завышать нашу цену продажи.
+_cheap_rival = dict(_row64, markets=_row64["markets"] + [
+    {"market": "mrkt", "floorTon": 9.0, "listings": 1}])
+check("один дешёвый лот рядом — это конкурент, порога листингов тут нет",
+      gs._seetg_market_pair(_cheap_rival)["sell_market"] == "mrkt",
+      gs._seetg_market_pair(_cheap_rival)["sell_market"])
 _cheap1 = dict(_row64, markets=_row64["markets"] + [
     {"market": "mrkt", "floorTon": 4.0, "listings": 1}])
 check("один листинг годится как сторона ПОКУПКИ: это наблюдённая цена лота",
@@ -4801,6 +4828,8 @@ _anon = dict(_row64, markets=_row64["markets"] + [
 _panon = gs._seetg_market_pair(_anon)
 check("безымянный маркет не сторона покупки", _panon["buy_market"] == "portals")
 check("безымянный маркет не сторона продажи", _panon["sell_market"] == "telegram")
+check("безымянный маркет не становится и потолком",
+      _panon.get("top_market") in (None, "telegram"), _panon.get("top_market"))
 
 check("одного маркета для арбитража не хватает",
       gs._seetg_market_pair({"markets": [
@@ -4966,7 +4995,9 @@ try:
         "S", "Love Shard", dict(_pair64, sell_floor=Decimal("10")))
     check("живой конкурент дороже борды — оценка НЕ растёт",
           _up64["sell_floor"] == Decimal("10")
-          and _up64["profit"] == _pair64["profit"], _up64["sell_floor"])
+          and _up64["profit"] == gs.compute_net_profit(Decimal("10"),
+                                                       Decimal("8.8")),
+          _up64["sell_floor"])
 
     gs.seetg_get = lambda path, params=None: {"items": []}
     _none64, _whynone64 = gs.seetg_confirm_pair("S", "M", _pair64)
@@ -5052,8 +5083,14 @@ try:
     # маркетов мы не знаем, а выдуманная ссылка в этом проекте уже один раз
     # открывалась пустой страницей.
     check("ссылка КУПИТЬ взята ОТ них", "t.me/portals/x" in _txt64, _txt64)
-    check("ссылка ГДЕ ПРОДАВАТЬ — такой же лот на дорогом маркете",
-          "ГДЕ ПРОДАВАТЬ" in _txt64 and "t.me/nft/x" in _txt64, _txt64)
+    check("ссылка на КОНКУРЕНТА — того, под кого вставать ценой",
+          "КОНКУРЕНТ" in _txt64 and "t.me/nft/x" in _txt64, _txt64)
+    # Главная оговорка: всё это ЦЕНЫ ПРОСЬБЫ. Владелец сверил сообщение с
+    # историей продаж Getgems (средняя 4-5 GRAM) и справедливо усомнился.
+    check("сказано, что это цены просьбы, а не сделок",
+          "ЦЕНЫ ПРОСЬБЫ" in _txt64 and "истории сделок" in _txt64, _txt64)
+    check("лестница цен напечатана: видно, кто стоит рядом",
+          "Лестница цен" in _txt64, _txt64)
     check("у ссылки продажи названа цена конкурента",
           "12.40" in _txt64, _txt64)
 
@@ -5217,6 +5254,71 @@ _src65 = open("gift_sniper.py", encoding="utf-8").read()
 # Цвет — не оформление: зелёная строка в логе читается как сигнал.
 check("в логе арбитраж TonAPI при SEETG_ONLY не зелёный и назван по имени",
       "арбитраж TonAPI (2 маркета из 5)" in _src65)
+
+
+# --- СВЯЗКА НА ОДНОМ МАРКЕТЕ И ЦЕНЫ ПРОСЬБЫ -----------------------------
+# «купить на mrkt и продать на нём же» — прямая просьба владельца. Отдельного
+# кода это не требует: конкурент берётся из ЛЕСТНИЦЫ цен по всем маркетам, и
+# если вторая ступень стоит на том же маркете, связка внутри маркета
+# получается сама. Это самый сравнимый случай: обе цены на одной витрине.
+_lad66 = [
+    {"price": Decimal("3.50"), "market": "mrkt", "link": "https://t.me/mrkt/1",
+     "num": 1, "giftAddress": ""},
+    {"price": Decimal("4.60"), "market": "mrkt", "link": "https://t.me/mrkt/2",
+     "num": 2, "giftAddress": ""}]
+_oget66 = gs.seetg_get
+try:
+    gs.seetg_get = lambda path, params=None: {"items": [
+        {"num": 1, "giftAddress": "EQa", "saleInfo": [
+            {"amount": "3500000000", "currency": "gram", "market": "mrkt",
+             "link": "https://t.me/mrkt/1"}]},
+        {"num": 2, "giftAddress": "EQb", "saleInfo": [
+            {"amount": "4600000000", "currency": "gram", "market": "mrkt",
+             "link": "https://t.me/mrkt/2"}]}]}
+    _same66 = {"model": "New Layer", "buy_market": "mrkt",
+               "buy_floor": Decimal("3.50"), "buy_n": 36,
+               "sell_market": "portals", "sell_floor": Decimal("6.00"),
+               "sell_n": 59, "markets": [], "profit": Decimal("0"),
+               "roi": Decimal("0")}
+    _conf66, _why66 = gs.seetg_confirm_pair("S", "New Layer", _same66)
+    check("вторая ступень лестницы — конкурент, даже на СВОЁМ маркете",
+          _conf66 and _conf66["same_market"] is True, _why66)
+    check("прибыль считается по НЕМУ, а не по чужому маркету",
+          _conf66["sell_floor"] == Decimal("4.60")
+          and _conf66["profit"] == gs.compute_net_profit(Decimal("4.60"),
+                                                         Decimal("3.50")),
+          _conf66["sell_floor"])
+    # Лестница из одинаковых цен — вставать не под кого, и это отказ, а не
+    # «продам по своей же цене».
+    gs.seetg_get = lambda path, params=None: {"items": [
+        {"num": 1, "saleInfo": [{"amount": "3500000000", "currency": "gram",
+                                 "market": "mrkt"}]},
+        {"num": 2, "saleInfo": [{"amount": "3500000000", "currency": "gram",
+                                 "market": "mrkt"}]}]}
+    _none66, _whynone66 = gs.seetg_confirm_pair("S", "New Layer", _same66)
+    check("все лоты по одной цене — связки нет, а не нулевая прибыль",
+          _none66 is None and "вставать не под кого" in _whynone66, _whynone66)
+finally:
+    gs.seetg_get = _oget66
+
+_src66 = open("gift_sniper.py", encoding="utf-8").read()
+# Порог показа связки НИЖЕ сегментного — по просьбе «хоть и на мало
+# процентов». Это законно: число теперь считается против ближайшего
+# конкурента, а не против floor дорогого маркета.
+check("порог показа связки ниже сегментного",
+      Decimal(source_default("SEETG_ARB_MIN_ROI_PCT"))
+      < Decimal(source_default("SEGMENT_MIN_ROI_PCT")),
+      source_default("SEETG_ARB_MIN_ROI_PCT"))
+# Не прошедшие связки не теряются молча: молчание без причины неотличимо от
+# поломки — тот же довод, что у «находок не было».
+check("лучшие не прошедшие связки идут в сводку",
+      "Ближе всего к связке" in _src66)
+# Источник цен СДЕЛОК не выдумывается: он измеряется одним запросом, и до
+# тех пор уведомление обязано говорить, что его числа — цены просьбы.
+check("режим проверки истории сделок существует",
+      "def seetg_sales_probe" in _src66)
+check("историю сделок НЕ качаем пачками (их правила)",
+      "ПАЧКАМИ ЭТО КАЧАТЬ НЕЛЬЗЯ" in _src66)
 
 # =============================================================================
 print("\n" + "=" * 60)
