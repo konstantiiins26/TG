@@ -3676,6 +3676,74 @@ def find_segment_bargains(snap: dict):
     return out
 
 
+_seetg_model_floors = {}          # слаг -> (время, {модель: строка борды})
+_SEETG_MODEL_TTL = 180            # борда у них пересобирается раз в минуты
+
+
+def seetg_model_board(slug: str):
+    """Пол КАЖДОЙ модели коллекции по ВСЕМ маркетам. Один запрос, кеш на 3 мин."""
+    now = time.time()
+    cached = _seetg_model_floors.get(slug)
+    if cached and now - cached[0] < _SEETG_MODEL_TTL:
+        return cached[1]
+    rows = _seetg_rows(seetg_get("/floors", {"by": "model",
+                                             "collection": slug, "limit": 500}))
+    board = {r.get("key"): r for r in rows if r.get("key")}
+    _seetg_model_floors[slug] = (now, board)
+    return board
+
+
+def seetg_rival_check(collection: str, model: str, our_rival: Decimal):
+    """
+    СВЕРКА КОНКУРЕНТА ПО ВСЕМ МАРКЕТАМ. None — проверить нечем.
+
+    ЗАЧЕМ ЭТО ВООБЩЕ. Уведомление «дешевле своих» считает конкурента по НАШЕЙ
+    выборке из TonAPI, а TonAPI читает блокчейн и видит только те площадки,
+    что торгуют через контракт продажи: у владельца это Getgems и Marketapp.
+    MRKT, Portals, Tonnel и ресейл Telegram там НЕ ВИДНЫ ВОВСЕ — перепись
+    `--probe` показала это прямо: 121 лот Getgems, 2 Marketapp, MRKT ноль.
+
+    Значит «следующий лот этой модели стоит 30» — утверждение о ДВУХ
+    площадках из пяти. Сверка 06.10.2026 показала, в какую сторону это врёт:
+    у SurgeBoard наш минимум 7.19, а tonnel 6.38 — чужие маркеты оказались
+    ДЕШЕВЛЕ на всех трёх проверенных коллекциях. То есть настоящий конкурент
+    ниже нашего, и прибыль завышена.
+
+    Возвращает их floor по модели, маркет и ссылку на самый дешёвый лот.
+    """
+    if not SEETG_TOKEN or not model:
+        return None
+    key = f"seetg_slug:{normalize_ton_address(collection) or collection}"
+    slug = meta_get(key)
+    if not slug:
+        return None                      # слаг не доказан — не угадываем
+    try:
+        row = seetg_model_board(slug).get(model)
+        if not row:
+            return None
+        theirs = Decimal(str(row.get("floorTon")))
+        out = {"floor": theirs, "market": row.get("floorMarket"),
+               "markets": row.get("markets") or [], "link": None}
+        # Ссылка на САМЫЙ ДЕШЁВЫЙ лот этой модели — вторым запросом, и только
+        # когда он реально дешевле нашего конкурента: платить квотой за
+        # ссылку, которая ничего не меняет, незачем.
+        if theirs < our_rival:
+            pair = _seetg_rows(seetg_get("/gifts", {
+                "collection": slug, "model": model, "on_sale": "true",
+                "sort": "price", "limit": 1}))
+            offer = _seetg_best_offer(pair[0]) if pair else None
+            if offer:
+                out["link"] = offer.get("link")
+                out["market"] = offer.get("market") or out["market"]
+        return out
+    except RateLimited as e:
+        log.warning(f"see.tg: {e}")
+        return None
+    except Exception as e:  # noqa: BLE001 — сверка не обязана ронять уведомление
+        log.warning(f"see.tg: сверка конкурента не удалась: {e}")
+        return None
+
+
 def notify_segment_bargain(b: dict) -> bool:
     """
     Сообщает о таком лоте. True, если отправлено.
@@ -3701,6 +3769,41 @@ def notify_segment_bargain(b: dict) -> bool:
     q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
     mint = item.get("mint_index")
     name = item.get("collection_name") or "лот"
+
+    # СВЕРКА С ОСТАЛЬНЫМИ МАРКЕТАМИ ДО ОТПРАВКИ. Наш конкурент посчитан по
+    # TonAPI, то есть по Getgems и Marketapp; MRKT, Portals и Tonnel там не
+    # видны. Если у них та же модель стоит дешевле — прибыль была завышена,
+    # и считать надо по ИХ числу.
+    seetg = seetg_rival_check(item.get("collection_address", ""),
+                              b.get("model") or "", b["seg_floor"])
+    if seetg and seetg["floor"] < b["seg_floor"]:
+        if seetg["floor"] <= b["buy"]:
+            # Лот не дёшев вовсе: на другом маркете такой же стоит столько же
+            # или меньше. Отправить это значит предложить сделку, которой нет.
+            log.warning(
+                f"{_Color.YELLOW}ДЕШЕВЛЕ СВОИХ отменено по see.tg: "
+                f"{_short(item.get('address', ''))} «{b['model']}» — у нас "
+                f"конкурент {b['seg_floor']}, а по всем маркетам "
+                f"{seetg['floor']} ({seetg['market']}), это не выше нашей "
+                f"цены {b['buy']}. TonAPI не видит MRKT/Portals/Tonnel."
+                f"{_Color.RESET}")
+            _segment_sent_ts.pop()         # лимит часа не тратим на отказ
+            return False
+        log.info(f"{_Color.GREY}see.tg поправил конкурента: было "
+                 f"{b['seg_floor']}, стало {seetg['floor']} "
+                 f"({seetg['market']}){_Color.RESET}")
+        b = dict(b)
+        b["seg_floor"] = seetg["floor"]
+        b["profit"] = compute_net_profit(seetg["floor"], b["buy"])
+        b["roi"] = compute_roi_pct(b["profit"], b["buy"])
+        b["discount_pct"] = ((Decimal("1") - b["buy"] / seetg["floor"])
+                             * Decimal("100")).quantize(Decimal("0.1"))
+        if b["profit"] <= 0 or b["roi"] < SEGMENT_MIN_ROI_PCT:
+            log.info(f"{_Color.GREY}  после поправки ROI {b['roi']}% ниже "
+                     f"порога показа — не отправляю{_Color.RESET}")
+            _segment_sent_ts.pop()
+            return False
+
     sale_price = target_sale_price(b["seg_floor"])
     lines = [
         # Первая строка — сразу «почему», а не название лота.
@@ -3757,8 +3860,25 @@ def notify_segment_bargain(b: dict) -> bool:
         "⚠️ БОТ ЭТО НЕ КУПИТ. Оценка по floor СЕГМЕНТА, а торговля считает по "
         "минимуму из двух полов — намеренно, пока премия за сегмент не "
         "измерена. Решение ваше и покупка руками.",
-        f"🔗 {GIFT_URL_TEMPLATE.format(address=friendly_ton_address(item['address']))}",
+        f"🔗 Getgems: "
+        f"{GIFT_URL_TEMPLATE.format(address=friendly_ton_address(item['address']))}",
     ]
+    # ВТОРАЯ ССЫЛКА — на маркет, где эта модель дешевле. Владелец прямо
+    # сказал: «покупаю на Getgems, я плачу больше, на MRKT меньше стоит».
+    # Ссылка приходит ОТ see.tg и ведёт в бота маркета; своя собранная
+    # ссылка в этом проекте уже один раз открывалась пустой страницей.
+    if seetg:
+        by_market = ", ".join(
+            f"{m.get('market')} {q(Decimal(str(m.get('floorTon'))))}"
+            for m in (seetg.get("markets") or [])
+            if m.get("floorTon") is not None)
+        if by_market:
+            lines.insert(-1, f"🌐 «{b['model']}» по маркетам: {by_market}")
+        if seetg.get("link"):
+            lines.append(f"🔗 {seetg['market']} (дешевле): {seetg['link']}")
+        lines.append("ℹ️ Маркеты кроме Getgems и Marketapp бот НЕ ВИДИТ через "
+                     "TonAPI — числа по ним взяты у see.tg, комиссии там не "
+                     "проверены.")
     if b["buy"] > 0 and GAS_FEE_TON / b["buy"] > Decimal("0.05"):
         share = (GAS_FEE_TON / b["buy"] * Decimal("100")).quantize(Decimal("0.1"))
         lines.insert(-1, f"ℹ️ лот дешёвый: газ {GAS_FEE_TON} = {share}% от цены, "
