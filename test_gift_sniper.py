@@ -5650,6 +5650,65 @@ try:
 finally:
     gs._ws_connect, gs.SEETG_TOKEN, gs._WS_TICK_SEC = _ows69, _otok69, _otick69
 
+# --- КАК УЗНАТЬ ФОРМУ ПОДПИСКИ, НЕ ВЫДУМЫВАЯ ЕЁ ---------------------------
+# Правило запрещает ДЕЙСТВОВАТЬ по догадке, а не спрашивать. Кадр
+# отправляется, чтобы измерить ОТВЕТ сервера; решает ответ, а не наша
+# догадка — тот же приём, что круговая проверка /v1/resolve.
+_cands = gs._ws_candidate_frames(["transfer", "sale", "listing", "stats"])
+check("кандидаты подписки собираются из ИХ списка событий",
+      all("sale" in str(f) for _n, f in _cands[1:]), _cands)
+check("имя события не выдумано: взято из рукопожатия",
+      all("stats" not in str(f) for _n, f in _cands))
+# Самый информативный кадр — заведомо неверный: отказ часто называет форму.
+check("первым идёт проба ошибкой", "__unknown_probe__" in str(_cands[0][1]))
+check("кандидатов немного — это не перебор ради перебора", len(_cands) <= 6)
+check("перебираются разные обёртки ключа",
+      {k for _n, f in _cands for k in f} >= {"type", "action", "op"})
+
+_src70 = open("gift_sniper.py", encoding="utf-8").read()
+_sp70 = _src70.split("def seetg_subscribe_probe")[1].split("\ndef ")[0]
+# Перебор прекращается на первом ответе: лишний трафик к ним запрещён их же
+# правилами, а ответ любого рода — уже измерение.
+check("перебор прекращается на первом ответе", "return True" in _sp70
+      and "Перебор прекращаю" in _sp70)
+check("молчание на все кандидаты названо НЕ доказательством отсутствия",
+      "не «подписки нет»" in _sp70)
+check("ответы печатаются сырыми, парсер по ним здесь не пишется",
+      "ОТВЕТ:" in _sp70 and "saleAction" not in _sp70)
+check("токен и здесь уходит заголовком",
+      "Authorization: Bearer" in _sp70 and "token=" not in _sp70)
+check("режим доступен как --seetg-subscribe", "--seetg-subscribe" in _src70)
+
+# Проба на поддельном соединении: сервер отвечает на второй кандидат.
+class _FakeWS70:
+    def __init__(self):
+        self.sent, self.queue, self.closed = [], [_hello69], False
+    def settimeout(self, t):
+        pass
+    def send(self, data):
+        self.sent.append(data)
+        if '"action": "subscribe"' in data or '"action":"subscribe"' in data:
+            self.queue.append('{"type":"subscribed","events":["sale"]}')
+    def recv(self):
+        if not self.queue:
+            raise TimeoutError("timed out")
+        return self.queue.pop(0)
+    def close(self):
+        self.closed = True
+
+_ows70, _otok70 = gs._ws_connect, gs.SEETG_TOKEN
+try:
+    gs.SEETG_TOKEN = "407:x"
+    _f70 = _FakeWS70()
+    gs._ws_connect = lambda url, headers, timeout: (_f70, None)
+    check("проба подписки отработала", gs.seetg_subscribe_probe(1) is True)
+    # Остановились НА ответившем кандидате: после него ни одного кадра.
+    check("после ответа лишние кадры НЕ шлются",
+          len(_f70.sent) == 3 and "action" in _f70.sent[-1], _f70.sent)
+    check("соединение закрыто", _f70.closed is True)
+finally:
+    gs._ws_connect, gs.SEETG_TOKEN = _ows70, _otok70
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:

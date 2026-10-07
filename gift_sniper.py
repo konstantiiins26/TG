@@ -4581,6 +4581,128 @@ def _ws_connect(url: str, headers: list, timeout: float):
         return None, f"{type(e).__name__}: {e}"
 
 
+def _ws_candidate_frames(events: list) -> list:
+    """
+    Кадры-кандидаты для подписки. СОБИРАЮТСЯ ИЗ ИХ ЖЕ РУКОПОЖАТИЯ.
+
+    Имена событий берутся из `hello.events` — то есть из того, что сервер
+    назвал сам. Из памяти тут не берётся НИЧЕГО, кроме обёртки ключа
+    (`type`/`action`/`op`), а она и есть предмет измерения: какую именно
+    сервер поймёт, покажет ЕГО ОТВЕТ.
+
+    Первым идёт заведомо НЕВЕРНЫЙ кадр, и это не шутка, а самый
+    информативный запрос из всех: сервер на неизвестную команду часто
+    отвечает ошибкой, в которой называет правильную форму. Один кадр
+    экономит перебор.
+    """
+    want = [e for e in events if e in ("sale", "listing", "price")] or ["sale"]
+    return [
+        ('проба ошибкой (что сервер скажет о неизвестной команде)',
+         {"type": "__unknown_probe__"}),
+        ('type/subscribe', {"type": "subscribe", "events": want}),
+        ('action/subscribe', {"action": "subscribe", "events": want}),
+        ('op/subscribe', {"op": "subscribe", "events": want}),
+        ('type/sub', {"type": "sub", "events": want}),
+    ]
+
+
+def seetg_subscribe_probe(wait_sec: int = 0) -> bool:
+    """
+    `--seetg-subscribe` — УЗНАТЬ формат команды подписки, спросив сервер.
+
+    Зачем это не нарушает правило «команду выдумывать нельзя». Правило
+    запрещает ДЕЙСТВОВАТЬ по догадке — например, отправить кадр, не получить
+    ничего и объявить «подписка работает» или «поток пуст». Здесь наоборот:
+    кадр отправляется, чтобы ИЗМЕРИТЬ ОТВЕТ, и решает именно ответ сервера.
+    Это тот же приём, что круговая проверка `/v1/resolve`: их собственный
+    ответ сильнее и нашей догадки, и их документации.
+
+    Повод измеренный: три минуты открытого соединения дали ОДНО рукопожатие
+    и ноль событий. Значит поток либо ждёт команду, либо не шлёт нам события
+    вовсе — а по молчанию эти случаи неразличимы.
+
+    ПОЧЕМУ ЭТО НЕ НАРУШАЕТ ИХ ПРАВИЛА: запрещён массовый парсинг и обход
+    лимитов. Здесь несколько кадров в одном соединении, по одному за раз.
+
+    Кадры собираются ИЗ ИХ ЖЕ рукопожатия (`hello.events`), а не из памяти.
+    Перебор ПРЕКРАЩАЕТСЯ на первом, который дал ответ или события: лишний
+    трафик к ним не нужен.
+    """
+    if not SEETG_TOKEN:
+        log.error(f"{_Color.RED}SEETG_TOKEN не задан{_Color.RESET}")
+        return False
+    wait = int(wait_sec or 10)
+    ws, why = _ws_connect(SEETG_WS_URL,
+                          [f"Authorization: Bearer {SEETG_TOKEN}"], timeout=20)
+    if ws is None:
+        log.error(f"{_Color.RED}Поток не открылся: {why}{_Color.RESET}")
+        return False
+
+    def _drain(seconds: float) -> list:
+        """Собирает всё, что пришло за `seconds`. Ничего не разбирает."""
+        out, until = [], time.time() + seconds
+        while time.time() < until:
+            try:
+                ws.settimeout(max(0.5, until - time.time()))
+                frame = ws.recv()
+            except Exception as e:                     # noqa: BLE001
+                if "timeout" in type(e).__name__.lower():
+                    break
+                out.append(f"(соединение прервалось: {type(e).__name__}: {e})")
+                break
+            if frame:
+                out.append(str(frame))
+        return out
+
+    try:
+        log.info("Жду рукопожатие…")
+        hello_frames = _drain(wait)
+        for f in hello_frames:
+            log.info(f"  {f[:900]}")
+        events = []
+        for f in hello_frames:
+            try:
+                obj = json.loads(f)
+            except Exception:                          # noqa: BLE001
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("events"), list):
+                events = [str(e) for e in obj["events"]]
+                break
+        if not events:
+            log.warning("Рукопожатия со списком событий не было — кандидаты "
+                        "соберу по умолчанию («sale»).")
+
+        for name, frame in _ws_candidate_frames(events):
+            log.info(f"{_Color.GREY}→ пробую {name}: "
+                     f"{json.dumps(frame, ensure_ascii=False)}{_Color.RESET}")
+            try:
+                ws.send(json.dumps(frame))
+            except Exception as e:                     # noqa: BLE001
+                log.warning(f"  отправить не удалось: {type(e).__name__}: {e}")
+                break
+            got = _drain(wait)
+            if not got:
+                log.info(f"  ответа за {wait}с нет")
+                continue
+            for f in got:
+                log.info(f"  {_Color.GREEN}ОТВЕТ:{_Color.RESET} {f[:1200]}")
+            # ОТВЕТ ЛЮБОГО РОДА — уже измерение: даже отказ называет форму.
+            log.info(f"{_Color.GREEN}Сервер ответил на «{name}».{_Color.RESET} "
+                     f"Перебор прекращаю — лишний трафик к ним не нужен. "
+                     f"Пришлите эти строки: по НИМ будет написана подписка.")
+            return True
+        log.warning("Ни один кадр ответа не вызвал. Это ТОЖЕ результат, и он "
+                    "означает не «подписки нет», а что её форма не угадана и "
+                    "сервер молчит на неизвестное. Нужна их страница про "
+                    "поток — писать подписку по догадке запрещено.")
+        return True
+    finally:
+        try:
+            ws.close()
+        except Exception:                              # noqa: BLE001
+            pass
+
+
 def seetg_stream_probe(seconds: int = 0) -> bool:
     """
     `--seetg-stream [СЕКУНД]`: СНЯТЬ ФОРМУ живого потока see.tg.
@@ -9007,6 +9129,10 @@ def parse_args(argv=None):
                         help="арбитраж маркетов по МОДЕЛЯМ по данным see.tg: "
                              "где модель дешевле и где дороже; ничего не "
                              "покупает")
+    parser.add_argument("--seetg-subscribe", nargs="?", const=0, type=int,
+                        metavar="SEC",
+                        help="узнать формат команды подписки, спросив сервер: "
+                             "шлёт кандидатов по одному и печатает ОТВЕТЫ")
     parser.add_argument("--seetg-stream", nargs="?", const=0, type=int,
                         metavar="SEC",
                         help="послушать живой поток see.tg и напечатать "
@@ -9079,6 +9205,8 @@ if __name__ == "__main__":
         if getattr(args, "seetg_find", False):
             # Ходит в сеть, НИЧЕГО не покупает и в запись не пишет.
             sys.exit(0 if seetg_find_report() else 1)
+        if getattr(args, "seetg_subscribe", None) is not None:
+            sys.exit(0 if seetg_subscribe_probe(args.seetg_subscribe) else 1)
         if getattr(args, "seetg_stream", None) is not None:
             # Только слушает и печатает: ни БД, ни записи, ни покупок.
             sys.exit(0 if seetg_stream_probe(args.seetg_stream) else 1)
