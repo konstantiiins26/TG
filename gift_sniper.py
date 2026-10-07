@@ -3792,7 +3792,9 @@ _seetg_scan_at: dict = {}
 
 # Расход на один прогон по одной коллекции. ИЗМЕРЯЕТСЯ (максимум виденного),
 # догадка нужна только до первого замера.
-_SEETG_COST_GUESS = 2
+# 3 = борда коллекции + два лота (купить / где продавать) у пары, которая
+# реально уходит в телефон. Догадка нужна только до первого замера.
+_SEETG_COST_GUESS = 3
 _seetg_cost_seen = 0
 
 
@@ -3933,49 +3935,106 @@ def _seetg_offer_on(gift: dict, market: str):
     return None
 
 
-def seetg_confirm_lot(slug: str, model: str, market: str, buy_floor: Decimal):
+# Сколько самых дешёвых лотов модели просматривать в поисках предложения на
+# нужном маркете. Это ОДИН запрос; больше лотов — больше шансов встретить
+# маркет продажи, который по определению дороже маркета покупки.
+SEETG_LOT_SCAN = int(os.getenv("SEETG_LOT_SCAN", "20"))
+
+
+def seetg_cheapest_on(slug: str, model: str, market: str):
     """
-    ПОДТВЕРЖДЕНИЕ, ЧТО ПО ЭТОЙ ЦЕНЕ ЕСТЬ ЧТО КУПИТЬ. (лот, причина).
+    Самый дешёвый ЖИВОЙ лот этой модели НА ЗАДАННОМ МАРКЕТЕ. (лот, причина).
 
-    Борда `by=model` пересобирается у них раз в несколько минут, то есть её
-    floor — утверждение о недавнем прошлом. Отправить в телефон цену, по
-    которой лота уже нет, значит послать владельца за сделкой, которой не
-    существует: это ровно та ошибка, из-за которой ссылка в уведомлении
-    однажды открывалась пустой страницей.
+    Один запрос. Параметр `market` передаётся, но решает НЕ ОН: поддерживает
+    ли его их API, мы не знаем, а гадать в этом проекте запрещено. Поэтому
+    маркет проверяется ПО ОТВЕТУ — берётся предложение, у которого
+    `saleInfo.market` равен нужному. Работает параметр или игнорируется, лот
+    в обоих случаях будет с того маркета, который назван.
 
-    ПРОВЕРКА ОДНОСТОРОННЯЯ, и асимметрия тут не косметика:
-      • цена лота ВЫШЕ борда-floor более чем на процент — отказ: значит по
-        названной цене купить нечего (или мы читаем не то поле);
-      • цена НИЖЕ — допускается и только НАЗЫВАЕТСЯ. Прибыль всё равно
-        считается по борда-floor, то есть по БОЛЕЕ ДОРОГОЙ покупке, и
-        расхождение работает в безопасную сторону.
-
-    Ссылка берётся ИЗ ИХ ОТВЕТА (`saleInfo.link`, ведёт в бота маркета), а
-    не собирается нами: своя собранная ссылка в этом проекте уже один раз
+    Ссылка приходит ИЗ ИХ ОТВЕТА (`saleInfo.link`, ведёт в бота маркета) и
+    НЕ собирается нами: своя собранная ссылка в этом проекте уже один раз
     открывалась пустой страницей из-за формы адреса.
     """
     rows = _seetg_rows(seetg_get("/gifts", {
         "collection": slug, "model": model, "on_sale": "true",
-        "sort": "price", "limit": 1}))
+        "market": market, "sort": "price", "limit": SEETG_LOT_SCAN}))
     if not rows:
         return None, "лотов этой модели не отдали"
-    gift = rows[0]
-    offer = _seetg_offer_on(gift, market)
-    if offer is None:
-        raw = str(gift.get("saleInfo"))[:200]
-        return None, (f"на «{market}» цена лота не разобрана. "
-                      f"Сырьё saleInfo: {raw}")
-    price = offer["price"]
-    if buy_floor > 0 and price / buy_floor > Decimal("1.01"):
-        return None, (f"самый дешёвый лот «{model}» стоит {price}, а борда "
-                      f"обещала {buy_floor} — по названной цене купить нечего")
-    note = "лот подтверждён"
-    if buy_floor > 0 and price < buy_floor:
-        note = (f"лот сейчас дешевле борды ({price} против {buy_floor}) — "
-                f"считаем по борде, то есть по дорогой покупке")
-    return {"price": price, "market": offer.get("market") or market,
-            "link": offer.get("link"), "num": gift.get("num"),
-            "address": gift.get("giftAddress") or ""}, note
+    best, seen = None, 0
+    for gift in rows:
+        offer = _seetg_offer_on(gift, market)
+        if offer is None:
+            continue
+        seen += 1
+        if best is None or offer["price"] < best["price"]:
+            best = {"price": offer["price"],
+                    "market": offer.get("market") or market,
+                    "link": offer.get("link"), "num": gift.get("num"),
+                    "address": gift.get("giftAddress") or ""}
+    if best is None:
+        raw = str((rows[0] or {}).get("saleInfo"))[:200]
+        return None, (f"среди {len(rows)} самых дешёвых «{model}» нет ни "
+                      f"одного лота на «{market}». Сырьё saleInfo: {raw}")
+    return best, f"лотов на «{market}» в выборке: {seen} из {len(rows)}"
+
+
+def seetg_confirm_pair(slug: str, model: str, pair: dict):
+    """
+    ЖИВЫЕ ЛОТЫ ПОД ОБЕ СТОРОНЫ ПАРЫ: что купить и чему мы будем конкурировать
+    при продаже. Возвращает (данные, причина отказа или None).
+
+    ЗАЧЕМ ОБЕ СТОРОНЫ. Борда `by=model` пересобирается у них раз в несколько
+    минут, то есть её floor — утверждение о недавнем прошлом. Отправить в
+    телефон цену, по которой лота уже нет, значит послать владельца за
+    сделкой, которой не существует.
+
+    СТОРОНА ПОКУПКИ — проверка односторонняя, и асимметрия тут не косметика:
+      • лот ДОРОЖЕ борда-floor больше чем на процент — отказ: по названной
+        цене купить нечего (или мы читаем не то поле);
+      • лот ДЕШЕВЛЕ — допускается и только НАЗЫВАЕТСЯ: прибыль считается по
+        борде, то есть по БОЛЕЕ ДОРОГОЙ покупке, и расхождение работает в
+        безопасную сторону.
+
+    СТОРОНА ПРОДАЖИ — ровно наоборот, и это закрывает единственное место, где
+    ошибка шла в ОПАСНУЮ сторону. Раньше floor маркета продажи не
+    подтверждался ничем, кроме числа листингов: если борда там отстала вверх,
+    прибыль была завышена. Теперь берётся живой лот, и если он ДЕШЕВЛЕ борды,
+    пара пересчитывается ПО НЕМУ — вниз. Выше борды оценка не поднимается
+    никогда.
+    """
+    buy, why_buy = seetg_cheapest_on(slug, model, pair["buy_market"])
+    if buy is None:
+        return None, why_buy
+    floor = pair["buy_floor"]
+    if floor > 0 and buy["price"] / floor > Decimal("1.01"):
+        return None, (f"самый дешёвый «{model}» на «{pair['buy_market']}» "
+                      f"стоит {buy['price']}, а борда обещала {floor} — по "
+                      f"названной цене купить нечего")
+    out = {"buy": buy, "sell": None, "note": why_buy,
+           "profit": pair["profit"], "roi": pair["roi"],
+           "sell_floor": pair["sell_floor"]}
+    if floor > 0 and buy["price"] < floor:
+        out["note"] += (f"; лот сейчас дешевле борды ({buy['price']} против "
+                        f"{floor}) — считаем по борде")
+
+    # Сторона продажи. Сбой здесь уведомление НЕ роняет: ссылка «где
+    # продавать» полезна, но её отсутствие не делает пару выдуманной.
+    try:
+        sell, why_sell = seetg_cheapest_on(slug, model, pair["sell_market"])
+    except RateLimited:
+        raise
+    except Exception as e:                                  # noqa: BLE001
+        sell, why_sell = None, str(e)
+    out["sell"], out["sell_note"] = sell, why_sell
+    if sell is not None and sell["price"] < pair["sell_floor"]:
+        # Конкурент на маркете продажи ДЕШЕВЛЕ, чем обещала борда: продавать
+        # придётся против него, а не против борды. Движение вниз, то есть в
+        # безопасную сторону — правило «изменения, увеличивающие расчётную
+        # прибыль, требуют данных» не нарушено.
+        out["sell_floor"] = sell["price"]
+        out["profit"] = compute_net_profit(sell["price"], pair["buy_floor"])
+        out["roi"] = compute_roi_pct(out["profit"], pair["buy_floor"])
+    return out, None
 
 
 def _seetg_arb_already_seen(slug: str, pair: dict) -> bool:
@@ -4020,6 +4079,21 @@ def notify_seetg_arb(name: str, slug: str, pair: dict) -> bool:
     """
     Уведомление об арбитраже между маркетами. True, если отправлено.
 
+    ДВЕ ССЫЛКИ, по прямой просьбе владельца (07.10.2026: «давай ссылки и на
+    то и на то», «где продать кидай ссылку сайта, где будет такая же модель
+    и коллекция»):
+
+      • ГДЕ КУПИТЬ — сам лот на дешёвом маркете;
+      • ГДЕ ПРОДАВАТЬ — такой же лот (та же коллекция, та же модель) на
+        дорогом маркете, то есть ровно тот конкурент, под которого придётся
+        вставать.
+
+    ОБЕ приходят ИЗ ОТВЕТА see.tg (`saleInfo.link`, ведут в бота маркета) и
+    НЕ собираются нами. Своя собранная ссылка в этом проекте уже один раз
+    открывалась пустой страницей из-за формы адреса, и фильтра «коллекция +
+    модель» в форме URL маркетов мы не знаем — выдумать его значило бы
+    повторить ту же ошибку.
+
     ОБЯЗАТЕЛЬНО говорит, что бот этого НЕ КУПИТ: сообщение, похожее на
     находку, заставило бы владельца ждать автоматической сделки, которой не
     будет. И обязательно называет, что комиссии вне Getgems не измерены —
@@ -4038,16 +4112,15 @@ def notify_seetg_arb(name: str, slug: str, pair: dict) -> bool:
     _seetg_arb_sent_ts.append(now)
 
     try:
-        lot, why = seetg_confirm_lot(slug, pair["model"], pair["buy_market"],
-                                     pair["buy_floor"])
+        conf, why = seetg_confirm_pair(slug, pair["model"], pair)
     except RateLimited as e:
         log.warning(f"see.tg: {e}")
         _seetg_arb_sent_ts.pop()
         return False
     except Exception as e:                              # noqa: BLE001
         log.warning(f"see.tg: лот не подтверждён: {e}")
-        lot, why = None, str(e)
-    if lot is None:
+        conf, why = None, str(e)
+    if conf is None:
         # В ТЕЛЕФОН не идёт, в ЛОГ попадает целиком и считается в сводке:
         # подавленное молча неотличимо от несуществующего.
         log.info(f"{_Color.GREY}  арбитраж «{pair['model']}» не подтверждён "
@@ -4056,31 +4129,61 @@ def notify_seetg_arb(name: str, slug: str, pair: dict) -> bool:
         _seetg_arb_unconfirmed += 1
         return False
 
+    buy, sell = conf["buy"], conf["sell"]
+    sell_floor, profit, roi = conf["sell_floor"], conf["profit"], conf["roi"]
+    # Живой конкурент на маркете продажи мог оказаться дешевле борды, и тогда
+    # пара пересчитана ВНИЗ. Если после этого она не проходит пороги показа —
+    # не шлём: иначе в телефон уйдёт число, которое мы сами уже не считаем.
+    if profit <= 0 or roi < SEGMENT_MIN_ROI_PCT:
+        log.info(f"{_Color.GREY}  арбитраж «{pair['model']}» после сверки с "
+                 f"живым лотом на «{pair['sell_market']}» даёт ROI {roi}% — "
+                 f"ниже порога показа, не отправляю{_Color.RESET}")
+        _seetg_arb_sent_ts.pop()
+        return False
+
     q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
-    sale = target_sale_price(pair["sell_floor"])
+    sale = target_sale_price(sell_floor)
     lines = [
         # Первая строка — сразу «почему», а не название.
         f"🟣 АРБИТРАЖ МАРКЕТОВ · «{pair['model']}»",
-        f"🎁 {name}" + (f" #{lot['num']}" if lot.get("num") else ""),
+        f"🎁 {name}" + (f" #{buy['num']}" if buy.get("num") else ""),
         f"💰 Купить на «{pair['buy_market']}» {q(pair['buy_floor'])} → "
         f"продать на «{pair['sell_market']}» {q(sale)} → "
-        f"{'📈' if pair['profit'] > 0 else '📉'} {q(pair['profit']):+} TON "
-        f"({pair['roi']}%)",
+        f"{'📈' if profit > 0 else '📉'} {q(profit):+} TON ({roi}%)",
         "",
     ]
-    lines += price_chain_lines(pair["buy_floor"], pair["sell_floor"],
+    lines += price_chain_lines(pair["buy_floor"], sell_floor,
                               f"«{pair['sell_market']}» (лотов {pair['sell_n']})")
     lines.append("")
     lines.append(f"🌐 «{pair['model']}» по маркетам (цена и лотов): "
                  f"{_seetg_markets_line(pair['markets'])}")
-    if lot.get("price") != pair["buy_floor"]:
-        lines.append(f"ℹ️ самый дешёвый лот сейчас {q(lot['price'])} "
-                     f"на «{lot['market']}» — прибыль считана по борде, то "
+    if sell is not None and sell_floor != pair["sell_floor"]:
+        lines.append(f"ℹ️ живой конкурент на «{pair['sell_market']}» дешевле "
+                     f"борды ({q(sell_floor)} против {q(pair['sell_floor'])}) "
+                     f"— прибыль пересчитана по нему, вниз")
+    if buy.get("price") != pair["buy_floor"]:
+        lines.append(f"ℹ️ самый дешёвый лот сейчас {q(buy['price'])} "
+                     f"на «{buy['market']}» — прибыль считана по борде, то "
                      f"есть по более дорогой покупке")
-    if lot.get("link"):
-        lines.append(f"🔗 {lot['link']}")
-    if lot.get("address"):
-        lines.append(f"🔗 {EXPLORER_URL_TEMPLATE.format(address=friendly_ton_address(lot['address']))}")
+
+    lines.append("")
+    if buy.get("link"):
+        lines.append(f"🛒 КУПИТЬ на «{pair['buy_market']}» {q(buy['price'])}:")
+        lines.append(buy["link"])
+    if buy.get("address"):
+        lines.append("🔍 " + EXPLORER_URL_TEMPLATE.format(
+            address=friendly_ton_address(buy["address"])))
+    if sell is not None and sell.get("link"):
+        # Ровно то, что просил владелец: «ссылку сайта, где будет такая же
+        # модель и коллекция». Это не абстрактная витрина, а КОНКРЕТНЫЙ
+        # конкурент — тот, под кого вставать ценой.
+        lines.append(f"🏷 ГДЕ ПРОДАВАТЬ — такой же «{pair['model']}» на "
+                     f"«{pair['sell_market']}» {q(sell['price'])}:")
+        lines.append(sell["link"])
+    elif sell is None:
+        lines.append(f"ℹ️ ссылки на «{pair['sell_market']}» нет: "
+                     f"{conf.get('sell_note', 'лот не найден')}")
+
     lines += [
         "",
         "⚠️ БОТ ЭТО НЕ КУПИТ: вне Getgems у него нет ни протокола маркета, "

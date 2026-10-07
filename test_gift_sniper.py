@@ -4896,27 +4896,67 @@ check("звёзды не считаются TON и здесь",
           {"amount": "10000", "currency": "xtr", "market": "mrkt"}]},
           "mrkt") is None)
 
+# Лот на маркете ПРОДАЖИ — вторая ссылка, по прямой просьбе владельца:
+# «где продать кидай ссылку сайта, где будет такая же модель и коллекция».
+_sellgift64 = {"num": 777, "giftAddress": "EQSell", "saleInfo": [
+    {"amount": "12400000000", "currency": "gram", "market": "telegram",
+     "link": "https://t.me/nft/x"}]}
+
 _oget64b = gs.seetg_get
 try:
-    gs.seetg_get = lambda path, params=None: {"items": [_gift64]}
-    _lot64, _why64 = gs.seetg_confirm_lot("S", "Love Shard", "portals",
-                                          Decimal("8.8"))
-    check("лот подтверждён, и ссылка взята ИЗ ИХ ответа",
-          _lot64 and _lot64["link"] == "https://t.me/portals/x", _why64)
-    # ВЫШЕ борды — отказ: по названной цене купить нечего.
-    _no64, _whyno64 = gs.seetg_confirm_lot("S", "Love Shard", "portals",
-                                           Decimal("7.0"))
+    # Маркет решает НЕ параметр запроса, а ответ: их API может его
+    # игнорировать, и тогда «лот с нужного маркета» определяется только по
+    # saleInfo. Поэтому в выдаче намеренно лежат лоты разных маркетов.
+    gs.seetg_get = lambda path, params=None: {"items": [_gift64, _sellgift64]}
+    _buy64, _whybuy64 = gs.seetg_cheapest_on("S", "Love Shard", "portals")
+    check("берётся лот ИМЕННО с запрошенного маркета, а не первый в выдаче",
+          _buy64 and _buy64["price"] == Decimal("8.8")
+          and _buy64["link"] == "https://t.me/portals/x", _whybuy64)
+    _sell64, _whysell64 = gs.seetg_cheapest_on("S", "Love Shard", "telegram")
+    check("для маркета ПРОДАЖИ находится свой лот и своя ссылка",
+          _sell64 and _sell64["link"] == "https://t.me/nft/x", _whysell64)
+    check("в причине названо, сколько лотов этого маркета в выборке",
+          "из 2" in _whysell64, _whysell64)
+    _no_m64, _whynom64 = gs.seetg_cheapest_on("S", "Love Shard", "mrkt")
+    check("маркета в выдаче нет — None и сырьё, а не подмена другим маркетом",
+          _no_m64 is None and "saleInfo" in _whynom64, _whynom64)
+
+    # Сторона ПОКУПКИ: выше борды — отказ, ниже — считаем по борде.
+    _conf64, _why64 = gs.seetg_confirm_pair("S", "Love Shard", _pair64)
+    check("пара подтверждена живыми лотами с обеих сторон",
+          _conf64 and _conf64["buy"]["link"] and _conf64["sell"]["link"],
+          _why64)
+    check("прибыль не изменилась: живой конкурент совпал с бордой",
+          _conf64["profit"] == _pair64["profit"], _conf64["profit"])
+    _no64, _whyno64 = gs.seetg_confirm_pair(
+        "S", "Love Shard", dict(_pair64, buy_floor=Decimal("7.0")))
     check("лот дороже борды — отказ, а не отправка выдуманной цены",
           _no64 is None and "купить нечего" in _whyno64, _whyno64)
-    # НИЖЕ борды — допускается и НАЗЫВАЕТСЯ: прибыль считается по борде, то
-    # есть по более дорогой покупке, и расхождение работает в безопасную
-    # сторону.
-    _low64, _whylow64 = gs.seetg_confirm_lot("S", "Love Shard", "portals",
-                                             Decimal("9.5"))
+    _low64, _whylow64 = gs.seetg_confirm_pair(
+        "S", "Love Shard", dict(_pair64, buy_floor=Decimal("9.5")))
     check("лот дешевле борды — считаем по борде, но говорим вслух",
-          _low64 and "дешевле борды" in _whylow64, _whylow64)
+          _low64 and "дешевле борды" in _low64["note"], _low64["note"])
+
+    # СТОРОНА ПРОДАЖИ — ровно наоборот, и это закрывает единственное место,
+    # где ошибка шла в ОПАСНУЮ сторону. Борда обещала 20, живой конкурент
+    # стоит 12.4 — значит продавать придётся против него.
+    _down64, _ = gs.seetg_confirm_pair(
+        "S", "Love Shard", dict(_pair64, sell_floor=Decimal("20")))
+    check("живой конкурент дешевле борды — прибыль пересчитана ВНИЗ",
+          _down64["sell_floor"] == Decimal("12.4")
+          and _down64["profit"] == gs.compute_net_profit(Decimal("12.4"),
+                                                         Decimal("8.8")),
+          (_down64["sell_floor"], _down64["profit"]))
+    # А ВЫШЕ борды оценка не поднимается никогда: это увеличило бы расчётную
+    # прибыль по чужому API, у которого мы даже комиссий маркетов не знаем.
+    _up64, _ = gs.seetg_confirm_pair(
+        "S", "Love Shard", dict(_pair64, sell_floor=Decimal("10")))
+    check("живой конкурент дороже борды — оценка НЕ растёт",
+          _up64["sell_floor"] == Decimal("10")
+          and _up64["profit"] == _pair64["profit"], _up64["sell_floor"])
+
     gs.seetg_get = lambda path, params=None: {"items": []}
-    _none64, _whynone64 = gs.seetg_confirm_lot("S", "M", "portals", Decimal("5"))
+    _none64, _whynone64 = gs.seetg_confirm_pair("S", "M", _pair64)
     check("лотов не отдали — не подтверждено, а не «подтверждено пустотой»",
           _none64 is None, _whynone64)
 finally:
@@ -4972,7 +5012,7 @@ try:
     gs._tg_call = lambda method, payload: (_sent64.append(payload) or {"ok": True})
     gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN = "1", "t"
     gs.SEETG_TOKEN = "12:tok"
-    gs.seetg_get = lambda path, params=None: {"items": [_gift64]}
+    gs.seetg_get = lambda path, params=None: {"items": [_gift64, _sellgift64]}
     gs._seetg_arb_sent_ts.clear()
     check("уведомление отправлено",
           gs.notify_seetg_arb("Surge Boards", "SurgeBoard", _pair64) is True)
@@ -4994,7 +5034,29 @@ try:
           "Getgems" in _txt64 and "роялти" in _txt64, _txt64)
     check("сказано, что внутри модели лоты разные",
           "состав" in _txt64 or "фон и узор" in _txt64, _txt64)
-    check("ссылка на лот взята ОТ них", "t.me/portals/x" in _txt64, _txt64)
+    # ДВЕ ССЫЛКИ, прямая просьба владельца: откуда купить и где продавать.
+    # Обе приходят ОТ see.tg: формы URL с фильтром «коллекция + модель» у
+    # маркетов мы не знаем, а выдуманная ссылка в этом проекте уже один раз
+    # открывалась пустой страницей.
+    check("ссылка КУПИТЬ взята ОТ них", "t.me/portals/x" in _txt64, _txt64)
+    check("ссылка ГДЕ ПРОДАВАТЬ — такой же лот на дорогом маркете",
+          "ГДЕ ПРОДАВАТЬ" in _txt64 and "t.me/nft/x" in _txt64, _txt64)
+    check("у ссылки продажи названа цена конкурента",
+          "12.40" in _txt64, _txt64)
+
+    # Живой конкурент дешевле борды -> пара пересчитана вниз, и если после
+    # этого она не проходит порог показа, в телефон НЕ идёт: иначе уйдёт
+    # число, которое мы сами уже не считаем.
+    gs._seetg_arb_sent_ts.clear()
+    # Борда обещала 20, живой конкурент на telegram стоит 12.4.
+    _thin64 = dict(_pair64, sell_market="telegram",
+                   sell_floor=Decimal("20"), buy_floor=Decimal("12.0"),
+                   profit=gs.compute_net_profit(Decimal("20"), Decimal("12.0")),
+                   roi=Decimal("50"))
+    check("после сверки с живым конкурентом слабая пара не уходит",
+          gs.notify_seetg_arb("X", "S", _thin64) is False)
+    check("и она не тратит часовой лимит", gs._seetg_arb_sent_ts == [],
+          gs._seetg_arb_sent_ts)
 
     # Часовой потолок: телефон, который звонит двадцать раз, выключают.
     gs._seetg_arb_sent_ts[:] = [time.time()] * gs.SEETG_ARB_NOTIFY_MAX_PER_HOUR
