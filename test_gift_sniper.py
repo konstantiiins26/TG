@@ -3354,6 +3354,10 @@ check("равные floor — арбитража нет (комиссия и г�
 
 # Оговорки обязаны идти РЯДОМ С ЧИСЛОМ: голая цифра «+1.02 TON» читается
 # как гарантия профита, а она ею не является.
+# Старый арбитраж по TonAPI с 07.10.2026 в телефон не идёт (SEETG_ONLY=1),
+# поэтому его оговорки проверяются в его же режиме.
+_oonly52 = gs.SEETG_ONLY
+gs.SEETG_ONLY = False
 _l52 = gs._arbitrage_lines([{"collection": "0:c", **_snap52}])
 check("в сводке сказано, что бот сам там купить не может",
       any("НЕ может" in x for x in _l52), _l52)
@@ -3361,6 +3365,8 @@ check("в сводке сказано, что комиссии проверен�
       any("только у Getgems" in x for x in _l52), _l52)
 check("без арбитража строк нет вовсе",
       gs._arbitrage_lines([{"collection": "0:c", "market_floors": {}}]) == [])
+gs.SEETG_ONLY = _oonly52
+
 
 
 # =============================================================================
@@ -3426,7 +3432,13 @@ check("process_item запоминает промахи",
 _ob53 = (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
          gs._last_heartbeat)
 _sent53 = []
+_oonly53 = gs.SEETG_ONLY
 try:
+    # Эти проверки — про СТАРЫЙ арбитраж по TonAPI, а он с 07.10.2026 в
+    # телефон не идёт (SEETG_ONLY=1): в сводку попадает арбитраж по see.tg,
+    # где floor считается по всем пяти маркетам. Механизм не удалён, поэтому
+    # проверяем его в его же режиме.
+    gs.SEETG_ONLY = False
     gs._tg_call = (lambda method, payload:
                    (_sent53.append(payload.get("text", "")),
                     {"ok": True, "result": {"message_id": 1}})[1])
@@ -3450,6 +3462,7 @@ try:
     check("пустой список промахов назван прямо",
           "Оценивать было нечего" in _sent53[0], _sent53[0])
 finally:
+    gs.SEETG_ONLY = _oonly53
     (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
      gs._last_heartbeat) = _ob53
     gs._near_misses.clear()
@@ -5163,6 +5176,47 @@ check("стартовое сообщение называет источник �
       "Чужие цены: see.tg" in _src64)
 check("при SEETG_ONLY=0 стартовое сообщение предупреждает",
       "2 маркета" in _src64 or "2 маркетам" in _src64)
+
+
+# --- АРБИТРАЖ ПО TonAPI В ТЕЛЕФОН НЕ ИДЁТ -------------------------------
+# Живой лог 07.10.2026 печатал ЗЕЛЁНУЮ строку, и она же уходила в часовую
+# сводку:
+#   купить на «Getgems Sales» 5.0000 (лотов 426)
+#   -> продать на «Marketapp Marketplace» 45.8250 (лотов 7) -> ROI 768.22%
+# Floor по семи лотам против floor по четырёмстам — это разный состав лотов,
+# а не выгода. Тот же класс ошибки, из-за которого в тот же день отключили
+# сегментное наблюдение: источник видит 2 маркета из 5.
+_snap65 = {"collection": "0:" + "cd" * 32, "market_floors": {
+    "Getgems Sales": {"floor": Decimal("5.00"), "n": 426},
+    "Marketapp Marketplace": {"floor": Decimal("45.825"), "n": 7}}}
+_arb65 = gs.market_arbitrage(_snap65)
+_oonly65 = gs.SEETG_ONLY
+try:
+    gs.SEETG_ONLY = True
+    check("при SEETG_ONLY арбитраж по TonAPI в сводку НЕ попадает",
+          gs._arbitrage_lines([_snap65]) == [], gs._arbitrage_lines([_snap65]))
+    # И даже со старым источником потолок правдоподобия теперь стоит: он тут
+    # не стоял вовсе, хотя выборка здесь тоньше всего.
+    gs.SEETG_ONLY = False
+    if _arb65 is not None and _arb65["roi_pct"] > gs.SEGMENT_MAX_ROI_PCT:
+        check("ROI выше потолка правдоподобия не идёт в сводку и со старым "
+              "источником", gs._arbitrage_lines([_snap65]) == [],
+              _arb65["roi_pct"])
+    # Правдоподобная пара при SEETG_ONLY=0 по-прежнему печатается: механизм
+    # не удалён, он подчинён выбору источника.
+    _ok65 = {"collection": "0:" + "ef" * 32, "market_floors": {
+        "Getgems Sales": {"floor": Decimal("5.00"), "n": 426},
+        "Marketapp Marketplace": {"floor": Decimal("6.00"), "n": 40}}}
+    check("правдоподобная пара при SEETG_ONLY=0 остаётся в сводке",
+          any("Арбитраж площадок" in ln for ln in gs._arbitrage_lines([_ok65])),
+          gs._arbitrage_lines([_ok65]))
+finally:
+    gs.SEETG_ONLY = _oonly65
+
+_src65 = open("gift_sniper.py", encoding="utf-8").read()
+# Цвет — не оформление: зелёная строка в логе читается как сигнал.
+check("в логе арбитраж TonAPI при SEETG_ONLY не зелёный и назван по имени",
+      "арбитраж TonAPI (2 маркета из 5)" in _src65)
 
 # =============================================================================
 print("\n" + "=" * 60)

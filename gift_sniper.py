@@ -5466,10 +5466,30 @@ def _arbitrage_lines(snapshots: list) -> list:
     в простыню, которую перестанут читать (тот же довод, по которому
     существует HEARTBEAT_MIN).
     """
+    # ПРИ SEETG_ONLY ЭТИХ СТРОК В ТЕЛЕФОНЕ НЕТ ВОВСЕ. Арбитраж здесь считается
+    # по `market_floors` из TonAPI, то есть по Getgems и Marketapp — двум
+    # маркетам из пяти. Ровно за это в тот же день отключили сегментное
+    # наблюдение: источник, видящий часть рынка, называет «выгодой» разницу,
+    # которой нет. Живой лог 07.10.2026 показал цену вопроса:
+    #
+    #   купить на «Getgems Sales» 5.0000 (лотов 426)
+    #   -> продать на «Marketapp Marketplace» 45.8250 (лотов 7)
+    #   -> чистыми 38.4112 TON, ROI 768.22%
+    #
+    # Floor по семи лотам против floor по четырёмстам — это не рынок, а
+    # разный состав лотов. В сводку (то есть в телефон) идёт арбитраж по
+    # see.tg, где floor считается по всем пяти маркетам и подтверждается
+    # живым лотом.
+    if SEETG_ONLY:
+        return []
     best = None
     for snap in snapshots:
         arb = market_arbitrage(snap)
         if arb is None:
+            continue
+        # ПОТОЛОК ПРАВДОПОДОБИЯ — тот же, что у находок и сегментов. Он тут
+        # не стоял вовсе, хотя именно здесь выборка тоньше всего.
+        if SEGMENT_MAX_ROI_PCT > 0 and arb["roi_pct"] > SEGMENT_MAX_ROI_PCT:
             continue
         if best is None or arb["net_profit"] > best[1]["net_profit"]:
             best = (snap, arb)
@@ -8229,13 +8249,26 @@ def _process_collection(client, collection: str, record: bool, trade: bool):
         # лог сразу, а не только в часовую сводку.
         arb = market_arbitrage(snap)
         if arb is not None:
-            log.info(f"{_Color.GREEN}АРБИТРАЖ{_Color.RESET} купить на "
+            # ЦВЕТ ЗДЕСЬ — НЕ ОФОРМЛЕНИЕ. Зелёная строка читается как сигнал,
+            # а это арбитраж по TonAPI, то есть по Getgems и Marketapp —
+            # двум маркетам из пяти. При SEETG_ONLY решение принимается по
+            # see.tg, и эта строка остаётся только справкой в логе.
+            head = (f"{_Color.GREY}арбитраж TonAPI (2 маркета из 5)"
+                    if SEETG_ONLY else
+                    f"{_Color.GREEN}АРБИТРАЖ{_Color.RESET}")
+            tail = ""
+            if SEGMENT_MAX_ROI_PCT > 0 and arb["roi_pct"] > SEGMENT_MAX_ROI_PCT:
+                tail = (f" | ВЫШЕ потолка правдоподобия "
+                        f"{SEGMENT_MAX_ROI_PCT}% — floor по "
+                        f"{arb['sell_n']} лотам это не рынок")
+            elif not arb["buyable"]:
+                tail = " | бот сам купить там НЕ может"
+            log.info(f"{head} купить на "
                      f"«{arb['buy_market']}» {arb['buy_floor']:.4f} "
                      f"(лотов {arb['buy_n']}) → продать на "
                      f"«{arb['sell_market']}» {arb['sell_floor']:.4f} "
                      f"(лотов {arb['sell_n']}) → чистыми {arb['net_profit']:.4f} "
-                     f"TON, ROI {arb['roi_pct']}%"
-                     f"{'' if arb['buyable'] else ' | бот сам купить там НЕ может'}")
+                     f"TON, ROI {arb['roi_pct']}%{tail}{_Color.RESET}")
 
         # Пишем снапшот ДО торговых решений: запись нужна и тогда,
         # когда торговать нельзя (иначе в истории будут дыры).
