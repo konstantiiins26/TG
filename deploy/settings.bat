@@ -274,6 +274,13 @@ REM Ritm progonov bot schitaet SAM tak, chtoby ostatka hvatilo do polunochi
 REM UTC (12 kollekciy x 2 zaprosa = 24 na progon, to est progon raz v ~40 min).
 set SEETG_DAILY_BUDGET=900
 
+REM POTOLOK CENY LOTA V UVEDOMLENII. Pryamaya komanda vladelca 07.10.2026:
+REM "limit maksimalnyy do 10". Lot dorozhe etogo v telefon NE idet voobshche
+REM - ni svyazka, ni "deshevle svoih". Eto NE bank i NE risk-limit bota:
+REM bank - fakt o koshelke, a potolok - reshenie operatora, poetomu on
+REM rabotaet dazhe pri pustom BANKROLL_TON. 0 = vyklyuchit potolok.
+set MAX_NOTIFY_PRICE_TON=10
+
 REM Skolko soobshcheniy ob arbitrazhe marketov slat maksimum za chas i
 REM skolko s odnoy kollekcii za progon. 0 = vyklyuchit uvedomleniya.
 set SEETG_ARB_NOTIFY_MAX_PER_HOUR=12

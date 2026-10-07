@@ -3786,6 +3786,12 @@ SEETG_ARB_SEEN_TTL_SEC = int(os.getenv("SEETG_ARB_SEEN_TTL_SEC", "21600"))
 # считалась против floor ДОРОГОГО маркета, а здесь — против ближайшего
 # конкурента в лестнице, то есть самое сравнимое, что у нас бывает.
 SEETG_ARB_MIN_ROI_PCT = Decimal(os.getenv("SEETG_ARB_MIN_ROI_PCT", "5"))
+# ПОТОЛОК ЦЕНЫ ЛОТА В УВЕДОМЛЕНИИ (прямая команда владельца 07.10.2026:
+# «давай лимит максимальный до 10»). Это НЕ риск-лимит и НЕ банк: это
+# граница того, что он готов рассматривать руками. Отдельная величина
+# именно потому, что банк — факт о кошельке, а потолок — решение оператора,
+# и смешивать их значит пересчитывать одно при изменении другого.
+MAX_NOTIFY_PRICE_TON = Decimal(os.getenv("MAX_NOTIFY_PRICE_TON", "10"))
 # «Ближе всего к связке» — чтобы молчание было объяснено. Молчащий бот
 # неотличим от бота, смотрящего в рынок без возможностей.
 _seetg_near: list = []
@@ -4537,6 +4543,141 @@ def scan_seetg_arbitrage(snap: dict) -> int:
         if notify_seetg_arb(name or slug, slug, pair, collection):
             notified += 1
     return len(pairs)
+
+
+SEETG_WS_URL = os.getenv("SEETG_WS_URL", "wss://live.see.tg/v1/ws")
+SEETG_WS_SECONDS = int(os.getenv("SEETG_WS_SECONDS", "60"))
+SEETG_WS_SHOW = int(os.getenv("SEETG_WS_SHOW", "10"))
+
+
+def _ws_connect(url: str, headers: list, timeout: float):
+    """
+    Открывает WebSocket. Возвращает (соединение, None) или (None, причина).
+
+    Библиотека НЕОБЯЗАТЕЛЬНАЯ — как tonutils: без неё режим говорит, что
+    поставить, а не падает NameError. «Имя не определено» отправляет искать
+    ошибку в коде вместо того, чтобы поставить пакет (поймано прогоном
+    владельца на Windows, где не было tonutils).
+    """
+    try:
+        import websocket                              # websocket-client
+    except ImportError:
+        return None, ("нет библиотеки websocket-client. Поставьте: "
+                      "py -m pip install websocket-client")
+    try:
+        return websocket.create_connection(
+            url, header=headers, timeout=timeout), None
+    except Exception as e:                            # noqa: BLE001
+        # Текст отказа печатается ДОСЛОВНО: 401 с телом и обрыв соединения
+        # лечатся по-разному, а код без тела их не различает — тот же урок,
+        # что с 404 у /v1/resolve.
+        return None, f"{type(e).__name__}: {e}"
+
+
+def seetg_stream_probe(seconds: int = 0) -> bool:
+    """
+    `--seetg-stream [СЕКУНД]`: СНЯТЬ ФОРМУ живого потока see.tg.
+
+    Зачем это отдельный режим, а не сразу сбор цен сделок. Поток — это
+    единственный ЗАКОННЫЙ путь к вопросу «сколько ПЛАТЯТ за модель»: средняя
+    по истории потребовала бы выгрузки сотен предметов, а их правила называют
+    это основанием для блокировки аккаунта целиком. Подписка — не выгрузка.
+
+    Но ЧТО именно приходит в кадрах, не измерено ни разу. В документации
+    названы события `listing`, `price`, `delisting`, `sale`, `transfer` —
+    это ЧУЖОЕ УТВЕРЖДЕНИЕ, а не факт. Писать парсер по нему запрещено
+    правилом проекта: имена полей мы уже один раз угадывали (ключи борды),
+    и это стоило вывода «у see.tg нет наших коллекций».
+
+    Поэтому проба ПЕЧАТАЕТ СЫРЫЕ КАДРЫ и ничего не разбирает: ни в БД, ни в
+    запись рынка, ни в уведомления отсюда не идёт ничего.
+
+    ТОКЕН УХОДИТ ЗАГОЛОВКОМ, а не в URL. В URL он попал бы в трейсбеки,
+    в лог и в историю команд — тот же урок, что с токеном Telegram.
+
+    ТРИ ИСХОДА, и они РАЗНЫЕ (смешать их значит лечить не ту причину):
+    - соединение не открылось → причина печатается дословно;
+    - открылось и кадры идут → форма снята, печатаются сырые;
+    - открылось, кадров нет → возможно, нужна КОМАНДА ПОДПИСКИ, формат
+      которой нам неизвестен. Выдумывать её нельзя: сервер молчит и на
+      неверную команду, и на отсутствие команды, и по молчанию их не
+      различить. Это вопрос владельцу — что написано в их документации.
+    """
+    if not SEETG_TOKEN:
+        log.error(f"{_Color.RED}SEETG_TOKEN не задан — поток требует тот же "
+                  f"токен, что REST{_Color.RESET}")
+        return False
+    seconds = int(seconds or SEETG_WS_SECONDS)
+    log.info(f"Слушаю {SEETG_WS_URL} {seconds}с. Токен уходит заголовком, "
+             f"в URL его нет.")
+    ws, why = _ws_connect(SEETG_WS_URL,
+                          [f"Authorization: Bearer {SEETG_TOKEN}"],
+                          timeout=min(20, max(5, seconds)))
+    if ws is None:
+        log.error(f"{_Color.RED}Поток не открылся: {why}{_Color.RESET}")
+        log.info("Что это может значить: токен не подходит для потока, "
+                 "поток в тарифе не включён, или адрес другой "
+                 "(меняется переменной SEETG_WS_URL).")
+        return False
+
+    log.info(f"{_Color.GREEN}Соединение открыто.{_Color.RESET} Печатаю сырые "
+             f"кадры как есть — разбора здесь нет намеренно.")
+    seen, kinds, started = 0, {}, time.time()
+    try:
+        while time.time() - started < seconds:
+            try:
+                ws.settimeout(max(1.0, started + seconds - time.time()))
+                frame = ws.recv()
+            except Exception as e:                    # noqa: BLE001
+                low = type(e).__name__.lower()
+                if "timeout" in low:
+                    break
+                log.warning(f"Соединение прервалось: {type(e).__name__}: {e}")
+                break
+            if not frame:
+                continue
+            seen += 1
+            # Тип события берётся ТОЛЬКО для счёта, и если ключа нет — так и
+            # написано. Подставить «sale» по догадке значило бы выдумать
+            # статистику потока.
+            kind = "(тип не найден)"
+            try:
+                obj = json.loads(frame)
+                if isinstance(obj, dict):
+                    for k in ("type", "event", "kind", "action"):
+                        if isinstance(obj.get(k), str):
+                            kind = f"{k}={obj[k]}"
+                            break
+            except Exception:                         # noqa: BLE001
+                kind = "(не JSON)"
+            kinds[kind] = kinds.get(kind, 0) + 1
+            if seen <= SEETG_WS_SHOW:
+                log.info(f"  кадр {seen}: {str(frame)[:1200]}")
+    finally:
+        try:
+            ws.close()
+        except Exception:                             # noqa: BLE001
+            pass
+
+    log.info(f"Кадров за {seconds}с: {seen}")
+    for k, n in sorted(kinds.items(), key=lambda x: -x[1]):
+        log.info(f"  {k}: {n}")
+    if not seen:
+        # МОЛЧАНИЕ НАЗВАНО ВСЛУХ и не объявлено поломкой: по пустому потоку
+        # нельзя отличить «нужна подписка» от «сейчас нет событий».
+        log.warning("Соединение держалось, но ни одного кадра не пришло. "
+                    "Два разных объяснения, и по молчанию они неразличимы: "
+                    "(1) поток ждёт КОМАНДУ ПОДПИСКИ, формат которой у нас "
+                    "не измерен — её надо взять из их документации, а не "
+                    "выдумать; (2) за это время на их стороне не было "
+                    "событий. Пришлите страницу про поток — тогда подписка "
+                    "будет написана по их словам, а не по догадке.")
+    else:
+        log.info(f"{_Color.GREEN}Форма снята.{_Color.RESET} Следующий шаг — "
+                 f"копить из кадров `sale` ЦЕНЫ СДЕЛОК по нашим коллекциям: "
+                 f"это ответ на «сколько ПЛАТЯТ», которого в проекте не было "
+                 f"никогда. Парсер пишется по этим кадрам, а не по памяти.")
+    return True
 
 
 def seetg_sales_probe(ref: str = ""):
@@ -5549,9 +5690,17 @@ def owner_can_pay(price) -> tuple:
     когда-нибудь возьмёт сам.
     """
     try:
-        need = Decimal(str(price)) + PURCHASE_GAS_TON
+        want = Decimal(str(price))
+        need = want + PURCHASE_GAS_TON
     except (InvalidOperation, ValueError):
         return True, ""
+    # ПОТОЛОК ОПЕРАТОРА идёт ПЕРВЫМ и не зависит от банка: при пустом
+    # BANKROLL_TON (банк «не знаю») он всё равно должен работать, иначе
+    # команда «лимит максимальный до 10» выполнялась бы только при
+    # заполненной настройке банка.
+    if MAX_NOTIFY_PRICE_TON > 0 and want > MAX_NOTIFY_PRICE_TON:
+        return False, (f"цена {want:.2f} TON выше потолка показа "
+                       f"{MAX_NOTIFY_PRICE_TON:.2f} (MAX_NOTIFY_PRICE_TON)")
     global _bankroll_unset_warned
     if BANKROLL_TON <= 0:
         if not _bankroll_unset_warned:
@@ -8796,6 +8945,10 @@ def parse_args(argv=None):
                         help="арбитраж маркетов по МОДЕЛЯМ по данным see.tg: "
                              "где модель дешевле и где дороже; ничего не "
                              "покупает")
+    parser.add_argument("--seetg-stream", nargs="?", const=0, type=int,
+                        metavar="SEC",
+                        help="послушать живой поток see.tg и напечатать "
+                             "СЫРЫЕ кадры (снять форму; ничего не пишет)")
     parser.add_argument("--seetg-sales", nargs="?", const="PlushPepe-1",
                         metavar="SLUG-N",
                         help="есть ли у see.tg цены СДЕЛОК (а не просьбы): "
@@ -8864,6 +9017,9 @@ if __name__ == "__main__":
         if getattr(args, "seetg_find", False):
             # Ходит в сеть, НИЧЕГО не покупает и в запись не пишет.
             sys.exit(0 if seetg_find_report() else 1)
+        if getattr(args, "seetg_stream", None) is not None:
+            # Только слушает и печатает: ни БД, ни записи, ни покупок.
+            sys.exit(0 if seetg_stream_probe(args.seetg_stream) else 1)
         if getattr(args, "seetg_sales", None):
             sys.exit(0 if seetg_sales_probe(args.seetg_sales) else 1)
         if getattr(args, "seetg_arb", False):

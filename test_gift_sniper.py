@@ -89,6 +89,7 @@ _PINNED = {
     "SEETG_ARB_MAX_PER_COLLECTION": 1,
     "SEETG_ARB_NOTIFY_MAX_PER_HOUR": 12,
     "SEETG_ARB_SEEN_TTL_SEC": 21600, "SEETG_ARB_LOG_TOP": 5,
+    "MAX_NOTIFY_PRICE_TON": Decimal("10"),
 }
 for _name, _value in _PINNED.items():
     setattr(gs, _name, _value)
@@ -5407,10 +5408,14 @@ check("отсутствие сделок названо неизвестност
 # =============================================================================
 print("\n[68] Проверка по банку: показываем то, что можно купить")
 
-_obank68 = (gs.BANKROLL_TON, gs.RESERVE_TON, gs.DB_PATH)
+_obank68 = (gs.BANKROLL_TON, gs.RESERVE_TON, gs.DB_PATH, gs.MAX_NOTIFY_PRICE_TON)
 try:
     gs.DB_PATH = os.path.join(_tmpdir, "afford68.db")
     gs.db_init()
+    # Потолок оператора проверяется НИЖЕ отдельно: здесь вопрос только про
+    # банк, и смешивать два независимых ограничения в одном тесте значит не
+    # знать потом, которое из них отсеяло лот.
+    gs.MAX_NOTIFY_PRICE_TON = Decimal("0")
     # «Банк не задан» и «не хватает» — РАЗНЫЕ вещи. Молча заглушить всё при
     # пустой настройке значило бы объяснять тишину поломкой.
     gs.BANKROLL_TON = Decimal("0")
@@ -5445,7 +5450,8 @@ try:
     check("прошедшее не считается", gs._affordable(Decimal("3.5"), "«X»") is True
           and gs._unaffordable_skips == 1)
 finally:
-    gs.BANKROLL_TON, gs.RESERVE_TON, gs.DB_PATH = _obank68
+    (gs.BANKROLL_TON, gs.RESERVE_TON, gs.DB_PATH,
+     gs.MAX_NOTIFY_PRICE_TON) = _obank68
 
 _src68 = open("gift_sniper.py", encoding="utf-8").read()
 # ОДНА ПРОВЕРКА НА ВСЕ ПУТИ В ТЕЛЕФОН. Урок проекта: исправление в одной
@@ -5507,6 +5513,71 @@ try:
 finally:
     (gs._tg_call, gs.SEETG_TOKEN, gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN,
      gs.seetg_get, gs.DB_PATH) = _o68
+
+# --- ПОТОЛОК ЦЕНЫ ОПЕРАТОРА (команда владельца: «лимит максимальный до 10») -
+# Это НЕ банк и НЕ риск-лимит: банк — факт о кошельке, потолок — решение
+# оператора. Поэтому он работает И при незаданном банке.
+_ocap68 = (gs.MAX_NOTIFY_PRICE_TON, gs.BANKROLL_TON)
+try:
+    gs.MAX_NOTIFY_PRICE_TON, gs.BANKROLL_TON = Decimal("10"), Decimal("0")
+    check("лот за 11 выше потолка 10 — не показываем даже при пустом банке",
+          gs.owner_can_pay(Decimal("11"))[0] is False)
+    check("лот за 9.8 проходит", gs.owner_can_pay(Decimal("9.8"))[0] is True)
+    check("в причине назван и потолок, и имя настройки",
+          "MAX_NOTIFY_PRICE_TON" in gs.owner_can_pay(Decimal("11"))[1])
+    # Потолок считается по ЦЕНЕ лота, а не по цене с газом: владелец сравнивает
+    # с ценой на витрине, и 9.9 + 0.3 не должно читаться как «выше 10».
+    check("газ в потолок не входит — сравниваем с ценой витрины",
+          gs.owner_can_pay(Decimal("9.9"))[0] is True)
+    gs.MAX_NOTIFY_PRICE_TON = Decimal("0")
+    check("ноль отключает потолок", gs.owner_can_pay(Decimal("999"))[0] is True)
+finally:
+    gs.MAX_NOTIFY_PRICE_TON, gs.BANKROLL_TON = _ocap68
+check("потолок цены — настройка со значением 10 по умолчанию",
+      source_default("MAX_NOTIFY_PRICE_TON") == "10",
+      source_default("MAX_NOTIFY_PRICE_TON"))
+
+# =============================================================================
+# [69] ЖИВОЙ ПОТОК see.tg: СНАЧАЛА ФОРМА, ПОТОМ ПАРСЕР
+# Поток — единственный законный путь к «сколько ПЛАТЯТ»: средняя по модели
+# из /history потребовала бы выгрузки сотен предметов, а это у них основание
+# для блокировки аккаунта целиком.
+# =============================================================================
+print("\n[69] Проба живого потока: снимаем форму, не угадываем её")
+
+_src69 = open("gift_sniper.py", encoding="utf-8").read()
+_p69 = _src69.split("def seetg_stream_probe")[1].split("\ndef ")[0]
+check("режим проверки потока существует", "--seetg-stream" in _src69)
+# Токен в URL попал бы в трейсбеки, лог и историю команд — тот же урок, что
+# с токеном Telegram. Он уходит ТОЛЬКО заголовком.
+check("токен уходит заголовком, а не в URL",
+      "Authorization: Bearer" in _p69
+      and "token=" not in _p69 and "?token" not in _p69)
+check("адрес потока — настройка, а не константа в коде",
+      source_default("SEETG_WS_URL") == "wss://live.see.tg/v1/ws",
+      source_default("SEETG_WS_URL"))
+# Разбора здесь нет НАМЕРЕННО: имена полей не измерены, а догадка об именах
+# уже один раз стоила вывода «у see.tg нет наших коллекций».
+check("проба печатает сырые кадры, а не разобранные поля",
+      "сыр" in _p69.lower() and "saleAction" not in _p69)
+check("тип события берётся только для счёта и его отсутствие названо",
+      "(тип не найден)" in _p69)
+# Пустой поток — ДВА разных объяснения, и по молчанию они неразличимы.
+check("молчание потока не объявлено поломкой, причины названы обе",
+      "КОМАНДУ ПОДПИСКИ" in _p69 and "не было" in _p69)
+# Команду подписки ВЫДУМЫВАТЬ нельзя: сервер молчит и на неверную, и на
+# отсутствующую. Поэтому проба её не отправляет вовсе.
+check("проба не отправляет выдуманную команду подписки",
+      ".send(" not in _p69)
+# Библиотека необязательная — как tonutils: без неё режим говорит, что
+# поставить, а не падает NameError.
+_w69 = _src69.split("def _ws_connect")[1].split("\ndef ")[0]
+check("без websocket-client режим советует пакет, а не падает",
+      "pip install websocket-client" in _w69 and "ImportError" in _w69)
+# Поток ничего не копит: это проба формы, а не сбор данных.
+check("проба в БД и в запись не пишет",
+      "record_snapshot" not in _p69 and "db_connect" not in _p69
+      and "meta_set" not in _p69)
 
 # =============================================================================
 print("\n" + "=" * 60)
