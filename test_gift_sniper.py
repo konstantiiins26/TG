@@ -83,6 +83,12 @@ _PINNED = {
     "FLIP_BUDGET_TON": Decimal("7"), "FLIP_MAX_PREMIUM": Decimal("0.20"),
     "FLIP_BUY_SCORE": 70, "FLIP_WATCH_SCORE": 50,
     "FLIP_TARGET_MULT": Decimal("1.5"),
+    # see.tg: источник чужих цен и его суточная квота
+    "SEETG_TOKEN": "", "SEETG_ONLY": True, "SEETG_DAILY_BUDGET": 900,
+    "SEETG_MIN_INTERVAL": Decimal("1.2"),
+    "SEETG_ARB_MAX_PER_COLLECTION": 1,
+    "SEETG_ARB_NOTIFY_MAX_PER_HOUR": 12,
+    "SEETG_ARB_SEEN_TTL_SEC": 21600, "SEETG_ARB_LOG_TOP": 5,
 }
 for _name, _value in _PINNED.items():
     setattr(gs, _name, _value)
@@ -4712,6 +4718,389 @@ check("источник floor пока TonAPI", "seetg" not in
 check("в формуле прибыли одна ставка комиссии на все площадки",
       "sale * (Decimal(\"1\") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)" in _src63)
 check("ставка по умолчанию 2%", source_default("MARKETPLACE_FEE_PCT") == "0.02")
+
+# =============================================================================
+# [64] ЧУЖИЕ ЦЕНЫ ТОЛЬКО ПО see.tg: АРБИТРАЖ МАРКЕТОВ И РИТМ ПО КВОТЕ
+# =============================================================================
+# Прямая команда владельца 07.10.2026: «самое главное смотреть только по see
+# tg», «надо чтобы за сутки хватало лимита», «хотелось бы покупать и с
+# маркета». Основание не вкусовое: сверка по всем маркетам в первом же
+# прогоне отменила ВСЕ 11 находок сегментного поиска по TonAPI — у Love Shard
+# наш конкурент 30.00 против 8.80 у portals, у Privateer 33.33 против 6.29 у
+# tonnel. Источник, который ошибается в каждом случае, не дополняет, а мешает.
+print("\n[64] Чужие цены только по see.tg: арбитраж маркетов и ритм по квоте")
+
+_src64 = open("gift_sniper.py", encoding="utf-8").read()
+
+check("по умолчанию смотрим ТОЛЬКО see.tg",
+      source_default("SEETG_ONLY") == "1", source_default("SEETG_ONLY"))
+# Старый путь НЕ УДАЛЁН: когда квота see.tg исчерпана, других данных нет
+# вовсе, и выбор источника обязан оставаться у оператора.
+check("путь по TonAPI сохранён и включается SEETG_ONLY=0",
+      "def scan_segment_bargains(" in _src64
+      and "return scan_segment_bargains(snap)" in _src64)
+
+# --- ПАРА МАРКЕТОВ ПО ОДНОЙ МОДЕЛИ --------------------------------------
+# Борда `/v1/floors?by=model` даёт floor КАЖДОЙ модели на КАЖДОМ маркете и
+# число листингов — один запрос на коллекцию, и это ИЗМЕРЕНИЕ, а не догадка.
+_row64 = {"key": "Love Shard", "floorTon": 8.8, "floorMarket": "portals",
+          "markets": [
+              {"market": "portals", "floorTon": 8.8, "listings": 40},
+              {"market": "tonnel", "floorTon": 9.0, "listings": 30},
+              {"market": "getgems", "floorTon": 11.0, "listings": 20},
+              {"market": "telegram", "floorTon": 12.4, "listings": 900}]}
+_pair64 = gs._seetg_market_pair(_row64)
+_pair64["model"] = "Love Shard"        # модель подставляет seetg_cross_market
+check("купить — там, где дешевле всего",
+      _pair64["buy_market"] == "portals" and _pair64["buy_floor"] == Decimal("8.8"),
+      _pair64)
+check("продать — там, где дороже всего",
+      _pair64["sell_market"] == "telegram" and _pair64["sell_floor"] == Decimal("12.4"),
+      _pair64)
+# Прибыль считает ТА ЖЕ функция, что принимает торговое решение. Вторая
+# формула прибыли разошлась бы с первой в первый же день.
+check("прибыль считает compute_net_profit, а не своя формула",
+      _pair64["profit"] == gs.compute_net_profit(Decimal("12.4"), Decimal("8.8")),
+      _pair64["profit"])
+check("ROI считает compute_roi_pct",
+      _pair64["roi"] == gs.compute_roi_pct(_pair64["profit"], Decimal("8.8")))
+
+# СТОРОНЫ НЕСИММЕТРИЧНЫ. Покупаем КОНКРЕТНЫЙ лот — одного листинга хватает.
+# Продаём ПРОТИВ ВИТРИНЫ, и высокий floor при двух лотах — это цена желания
+# одного продавца. Без этого порога «арбитраж» находился бы всегда на самом
+# тонком маркете; отчёт --markets чинили ровно так.
+_thin = dict(_row64, markets=_row64["markets"] + [
+    {"market": "mrkt", "floorTon": 99.0, "listings": 2}])
+check("тонкий маркет не становится стороной ПРОДАЖИ",
+      gs._seetg_market_pair(_thin)["sell_market"] == "telegram")
+_cheap1 = dict(_row64, markets=_row64["markets"] + [
+    {"market": "mrkt", "floorTon": 4.0, "listings": 1}])
+check("один листинг годится как сторона ПОКУПКИ: это наблюдённая цена лота",
+      gs._seetg_market_pair(_cheap1)["buy_market"] == "mrkt")
+
+# Безымянный маркет исключается с ОБЕИХ сторон: ни купить, ни выставить там
+# нельзя — адреса мы не знаем. Урок из _best_sell_market(): исправление в
+# одной точке не закрывает класс ошибки, если у значения несколько
+# потребителей, и арбитраж по площадкам этой же ошибкой уже болел.
+_anon = dict(_row64, markets=_row64["markets"] + [
+    {"market": "", "floorTon": 1.0, "listings": 50},
+    {"market": gs._UNKNOWN_MARKET, "floorTon": 50.0, "listings": 50}])
+_panon = gs._seetg_market_pair(_anon)
+check("безымянный маркет не сторона покупки", _panon["buy_market"] == "portals")
+check("безымянный маркет не сторона продажи", _panon["sell_market"] == "telegram")
+
+check("одного маркета для арбитража не хватает",
+      gs._seetg_market_pair({"markets": [
+          {"market": "getgems", "floorTon": 5.0, "listings": 40}]}) is None)
+check("продавать дешевле, чем покупать, — не арбитраж",
+      gs._seetg_market_pair({"markets": [
+          {"market": "getgems", "floorTon": 9.0, "listings": 40},
+          {"market": "mrkt", "floorTon": 10.0, "listings": 40}]})["sell_market"]
+      == "mrkt")
+check("мусор в floorTon не роняет разбор",
+      gs._seetg_market_pair({"markets": [
+          {"market": "getgems", "floorTon": None, "listings": 40},
+          {"market": "mrkt", "floorTon": "нет", "listings": 40}]}) is None)
+
+# --- ОДИН ЗАПРОС НА КОЛЛЕКЦИЮ, БЕЗ ПОСТРАНИЧНОГО ОБХОДА -------------------
+# Их правила прямо запрещают выкачивать базу, и блокируется АККАУНТ целиком,
+# а не токен. Поэтому курсора здесь нет и быть не должно.
+_arb_src = _src64.split("def seetg_cross_market")[1].split("\ndef ")[0]
+check("в арбитраже нет постраничного обхода курсором", "cursor" not in _arb_src)
+_scan_src = _src64.split("def scan_seetg_arbitrage")[1].split("\ndef ")[0]
+check("наблюдение по see.tg не пишет в запись рынка",
+      "record_snapshot" not in _scan_src)
+
+_calls64 = []
+_oget64 = gs.seetg_get
+gs._seetg_model_floors.clear()
+try:
+    def _fake_get(path, params=None):
+        _calls64.append((path, params or {}))
+        if path == "/floors":
+            return {"items": [_row64,
+                              {"key": "Dust", "floorTon": 1.0, "markets": [
+                                  {"market": "getgems", "floorTon": 1.0,
+                                   "listings": 40},
+                                  {"market": "mrkt", "floorTon": 1.01,
+                                   "listings": 40}]}]}
+        raise AssertionError(f"лишний запрос: {path}")
+
+    gs.seetg_get = _fake_get
+    _pairs64 = gs.seetg_cross_market("LoveSlug")
+    check("на коллекцию уходит РОВНО один запрос", len(_calls64) == 1, _calls64)
+    check("пара с нулевой прибылью в список не идёт",
+          [p["model"] for p in _pairs64] == ["Love Shard"],
+          [p["model"] for p in _pairs64])
+    # Борда кешируется: иначе каждое уведомление стоило бы запроса, а их до
+    # 12 в час при квоте 900 в сутки.
+    gs.seetg_cross_market("LoveSlug")
+    check("повторный вызов берёт борду из кеша", len(_calls64) == 1, _calls64)
+finally:
+    gs.seetg_get = _oget64
+    gs._seetg_model_floors.clear()
+
+# --- РИТМ ЗАДАЁТ КВОТА, А НЕ ЦИКЛ НАБЛЮДЕНИЯ ------------------------------
+# Прямой ответ на «надо чтобы за сутки хватало лимита»: интервал СЧИТАЕТСЯ из
+# остатка бюджета и времени до полуночи UTC — ровно как budget_paced_interval()
+# для TonAPI. Цифра, подобранная руками под 12 коллекций, станет неверной на
+# тринадцатой.
+_oload64, _ocost64 = gs.seetg_budget_load, gs._seetg_cost_seen
+_ocolls64 = gs.TARGET_COLLECTIONS
+try:
+    gs.TARGET_COLLECTIONS = ["0:" + "aa" * 32] * 12
+    gs._seetg_cost_seen = 0
+    gs.seetg_budget_load = lambda: 0
+    _secs64 = gs._next_utc_midnight() - time.time()
+    _gap64 = gs.seetg_scan_gap_sec()
+    _rounds64 = _secs64 / _gap64
+    check("прогонов за остаток суток не больше, чем позволяет квота",
+          _rounds64 * 12 * gs._seetg_cost_per_collection()
+          <= gs.SEETG_DAILY_BUDGET + 1,
+          (_rounds64, _gap64 / 60))
+    gs.seetg_budget_load = lambda: gs.SEETG_DAILY_BUDGET - 24
+    check("чем меньше остаток, тем реже прогон",
+          gs.seetg_scan_gap_sec() > _gap64, (gs.seetg_scan_gap_sec(), _gap64))
+    # Исчерпанная квота — не «ходим редко», а НЕ ХОДИМ: жечь исчерпанный
+    # лимит незачем, и за это блокируют аккаунт.
+    gs.seetg_budget_load = lambda: gs.SEETG_DAILY_BUDGET
+    check("при исчерпанной квоте прогонов до полуночи нет",
+          gs.seetg_scan_gap_sec() >= _secs64 - 5, gs.seetg_scan_gap_sec())
+    # Расход ИЗМЕРЯЕТСЯ и берётся МАКСИМУМОМ из виденного — тот же принцип,
+    # что у budget_learn_limit(): занижённая оценка сожжёт квоту к обеду.
+    gs._seetg_cost_seen = 7
+    check("расход на коллекцию берётся максимумом из виденного",
+          gs._seetg_cost_per_collection() == 7)
+    gs._seetg_cost_seen = 0
+    check("до первого замера работает догадка, а не ноль",
+          gs._seetg_cost_per_collection() >= 1)
+finally:
+    gs.seetg_budget_load, gs._seetg_cost_seen = _oload64, _ocost64
+    gs.TARGET_COLLECTIONS = _ocolls64
+
+# --- ЛОТ ПО НАЗВАННОЙ ЦЕНЕ ОБЯЗАН СУЩЕСТВОВАТЬ ----------------------------
+# Борда by=model пересобирается у них раз в минуты, то есть её floor — это
+# утверждение о недавнем прошлом. Отправить цену, по которой лота уже нет,
+# значит послать владельца за сделкой, которой не существует.
+_gift64 = {"num": 14570, "giftAddress": "EQD4cq", "saleInfo": [
+    {"amount": "8800000000", "currency": "gram", "market": "portals",
+     "link": "https://t.me/portals/x"},
+    {"amount": "9000000000", "currency": "gram", "market": "tonnel",
+     "link": "https://t.me/tonnel/x"}]}
+check("предложение берётся НА ЗАПРОШЕННОМ маркете, а не самое дешёвое",
+      gs._seetg_offer_on(_gift64, "tonnel")["price"] == Decimal("9"))
+check("маркета нет в saleInfo — None, а не подмена другим",
+      gs._seetg_offer_on(_gift64, "mrkt") is None)
+check("звёзды не считаются TON и здесь",
+      gs._seetg_offer_on({"saleInfo": [
+          {"amount": "10000", "currency": "xtr", "market": "mrkt"}]},
+          "mrkt") is None)
+
+_oget64b = gs.seetg_get
+try:
+    gs.seetg_get = lambda path, params=None: {"items": [_gift64]}
+    _lot64, _why64 = gs.seetg_confirm_lot("S", "Love Shard", "portals",
+                                          Decimal("8.8"))
+    check("лот подтверждён, и ссылка взята ИЗ ИХ ответа",
+          _lot64 and _lot64["link"] == "https://t.me/portals/x", _why64)
+    # ВЫШЕ борды — отказ: по названной цене купить нечего.
+    _no64, _whyno64 = gs.seetg_confirm_lot("S", "Love Shard", "portals",
+                                           Decimal("7.0"))
+    check("лот дороже борды — отказ, а не отправка выдуманной цены",
+          _no64 is None and "купить нечего" in _whyno64, _whyno64)
+    # НИЖЕ борды — допускается и НАЗЫВАЕТСЯ: прибыль считается по борде, то
+    # есть по более дорогой покупке, и расхождение работает в безопасную
+    # сторону.
+    _low64, _whylow64 = gs.seetg_confirm_lot("S", "Love Shard", "portals",
+                                             Decimal("9.5"))
+    check("лот дешевле борды — считаем по борде, но говорим вслух",
+          _low64 and "дешевле борды" in _whylow64, _whylow64)
+    gs.seetg_get = lambda path, params=None: {"items": []}
+    _none64, _whynone64 = gs.seetg_confirm_lot("S", "M", "portals", Decimal("5"))
+    check("лотов не отдали — не подтверждено, а не «подтверждено пустотой»",
+          _none64 is None, _whynone64)
+finally:
+    gs.seetg_get = _oget64b
+
+# --- ВЫДЕРЖКА ПОВТОРА: СВОЙ ЖУРНАЛ, И ЦЕНА В КЛЮЧЕ ------------------------
+gs._seetg_arb_seen.clear()
+check("пара видна впервые", gs._seetg_arb_already_seen("S", _pair64) is False)
+check("та же пара повторно не шлётся",
+      gs._seetg_arb_already_seen("S", _pair64) is True)
+check("подешевевшая пара — новость, а не повтор",
+      gs._seetg_arb_already_seen("S", dict(_pair64, buy_floor=Decimal("7.0")))
+      is False)
+# Журнал СВОЙ: общий с сегментным наблюдением означал бы, что одно тихо
+# помечает лот виденным для другого.
+check("журнал арбитража отдельный от сегментного",
+      "_seetg_arb_seen" in _src64 and "_segment_seen" in _src64
+      and "_seetg_arb_seen = _segment_seen" not in _src64)
+gs._seetg_arb_seen.clear()
+
+# --- БЕЗ ТОКЕНА НЕ ПОДМЕНЯЕМ ИСТОЧНИК МОЛЧА -------------------------------
+# Тихий откат на путь по TonAPI — это и есть «горит зелёным, пока ошибка
+# растёт»: владелец получал бы те же выдуманные числа, думая, что смотрит
+# все маркеты.
+_oseg64 = gs.scan_segment_bargains
+_oarb64 = gs.scan_seetg_arbitrage
+_otok64 = gs.SEETG_TOKEN
+try:
+    _hits = []
+    gs.scan_segment_bargains = lambda snap: _hits.append("tonapi")
+    gs.scan_seetg_arbitrage = lambda snap: _hits.append("seetg")
+    gs.SEETG_TOKEN = ""
+    gs._seetg_only_warned = False
+    gs._scan_bargains({"collection": "0:x"})
+    check("SEETG_ONLY без токена НЕ откатывается на TonAPI молча", _hits == [],
+          _hits)
+    gs.SEETG_TOKEN = "12:tok"
+    gs._scan_bargains({"collection": "0:x"})
+    check("с токеном смотрим see.tg", _hits == ["seetg"], _hits)
+    gs.SEETG_ONLY = False
+    gs._scan_bargains({"collection": "0:x"})
+    check("SEETG_ONLY=0 возвращает старый путь", _hits[-1] == "tonapi", _hits)
+finally:
+    gs.scan_segment_bargains, gs.scan_seetg_arbitrage = _oseg64, _oarb64
+    gs.SEETG_TOKEN, gs.SEETG_ONLY = _otok64, True
+
+# --- СООБЩЕНИЕ: ТРИ ЧИСЛА, ССЫЛКА ОТ НИХ, ОГОВОРКИ ------------------------
+_sent64 = []
+_otg64, _otok64b = gs._tg_call, gs.SEETG_TOKEN
+_ochat64, _obot64 = gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN
+_oget64c = gs.seetg_get
+try:
+    gs._tg_call = lambda method, payload: (_sent64.append(payload) or {"ok": True})
+    gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN = "1", "t"
+    gs.SEETG_TOKEN = "12:tok"
+    gs.seetg_get = lambda path, params=None: {"items": [_gift64]}
+    gs._seetg_arb_sent_ts.clear()
+    check("уведомление отправлено",
+          gs.notify_seetg_arb("Surge Boards", "SurgeBoard", _pair64) is True)
+    _txt64 = _sent64[-1]["text"]
+    check("названы ОБА маркета: где купить и где выставить",
+          "portals" in _txt64 and "telegram" in _txt64, _txt64)
+    check("три числа на месте: купить, продать, чистыми",
+          "8.80" in _txt64 and "+" in _txt64
+          and str(_pair64["roi"]) in _txt64, _txt64)
+    check("цепочка цены печатается целиком",
+          "Откуда берётся цена продажи" in _txt64)
+    check("рядом стоит, сколько лотов на маркете",
+          "лотов" in _txt64 and "900" in _txt64, _txt64)
+    # БОТ ЭТОГО НЕ КУПИТ: вне Getgems у него нет ни протокола, ни адреса
+    # контракта продажи. Сообщение, похожее на находку, заставило бы владельца
+    # ждать автоматической сделки.
+    check("сказано прямо, что бот это не купит", "НЕ КУПИТ" in _txt64)
+    check("оговорка про комиссии вне Getgems стоит рядом с числом",
+          "Getgems" in _txt64 and "роялти" in _txt64, _txt64)
+    check("сказано, что внутри модели лоты разные",
+          "состав" in _txt64 or "фон и узор" in _txt64, _txt64)
+    check("ссылка на лот взята ОТ них", "t.me/portals/x" in _txt64, _txt64)
+
+    # Часовой потолок: телефон, который звонит двадцать раз, выключают.
+    gs._seetg_arb_sent_ts[:] = [time.time()] * gs.SEETG_ARB_NOTIFY_MAX_PER_HOUR
+    gs._seetg_arb_suppressed = 0
+    check("сверх часового лимита не шлём",
+          gs.notify_seetg_arb("X", "S", _pair64) is False)
+    check("подавленное считается, а не теряется",
+          gs._seetg_arb_suppressed == 1, gs._seetg_arb_suppressed)
+    gs._seetg_arb_sent_ts.clear()
+
+    # НЕПОДТВЕРЖДЁННЫЙ ЛОТ: в телефон не идёт, лимит часа не тратит, и
+    # попадает в сводку — подавленное молча неотличимо от несуществующего.
+    gs.seetg_get = lambda path, params=None: {"items": []}
+    gs._seetg_arb_unconfirmed = 0
+    check("без живого лота уведомление не уходит",
+          gs.notify_seetg_arb("X", "S", _pair64) is False)
+    check("отказ не тратит часовой лимит", gs._seetg_arb_sent_ts == [],
+          gs._seetg_arb_sent_ts)
+    check("неподтверждённое считается для сводки",
+          gs._seetg_arb_unconfirmed == 1, gs._seetg_arb_unconfirmed)
+finally:
+    gs._tg_call, gs.SEETG_TOKEN = _otg64, _otok64b
+    gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN = _ochat64, _obot64
+    gs.seetg_get = _oget64c
+    gs._seetg_arb_sent_ts.clear()
+    gs._seetg_arb_suppressed = gs._seetg_arb_unconfirmed = 0
+
+# --- ПОРОГИ ПОКАЗА И ПОТОЛОК ПРАВДОПОДОБИЯ --------------------------------
+# Те же пороги, что у сегментного наблюдения: ROI от 10% (вопрос не экономики
+# сделки, а того, что стоит читать с телефона) и потолок 100% — все
+# разобранные случаи такого размера оказывались ошибкой ДАННЫХ.
+_oslug64, _oboard64, _onotify64 = (gs.seetg_slug_for, gs.seetg_model_board,
+                                   gs.notify_seetg_arb)
+_otok64c, _oload64b = gs.SEETG_TOKEN, gs.seetg_budget_load
+try:
+    gs.SEETG_TOKEN = "12:tok"
+    gs.seetg_budget_load = lambda: 0
+    gs.seetg_slug_for = lambda *a, **k: ("SurgeBoard", "из БД")
+    _notified64 = []
+    gs.notify_seetg_arb = lambda name, slug, pair: (
+        _notified64.append(pair["model"]) or True)
+
+    _huge = {"key": "Wild", "markets": [
+        {"market": "mrkt", "floorTon": 1.0, "listings": 40},
+        {"market": "telegram", "floorTon": 50.0, "listings": 900}]}
+    # Прибыль ПОЛОЖИТЕЛЬНАЯ, но ROI меньше порога показа: проверяем именно
+    # порог, а не то, что убыточная пара отсеялась раньше.
+    _small = {"key": "Tiny", "markets": [
+        {"market": "mrkt", "floorTon": 10.0, "listings": 40},
+        {"market": "telegram", "floorTon": 11.8, "listings": 900}]}
+    _small_pair = gs._seetg_market_pair(_small)
+    check("пара ниже порога показа всё же считается положительной",
+          _small_pair["profit"] > 0
+          and _small_pair["roi"] < gs.SEGMENT_MIN_ROI_PCT,
+          (_small_pair["profit"], _small_pair["roi"]))
+    gs.seetg_model_board = lambda slug: {"Wild": _huge, "Tiny": _small}
+    gs._seetg_arb_seen.clear()
+    gs._seetg_scan_at.clear()
+    gs._seetg_arb_implausible = 0
+    _scanned64 = gs.scan_seetg_arbitrage(
+        {"collection": "0:" + "aa" * 32, "on_sale": []})
+    check("ROI выше потолка правдоподобия в телефон не идёт",
+          "Wild" not in _notified64, _notified64)
+    check("отсеянное потолком считается для сводки",
+          gs._seetg_arb_implausible == 1, gs._seetg_arb_implausible)
+    check("ROI ниже порога показа тоже не идёт",
+          "Tiny" not in _notified64, _notified64)
+    check("обе пары при этом в логе, а не выброшены",
+          _scanned64 == 2, _scanned64)
+
+    # РИТМ: повторный прогон по той же коллекции в тот же миг пропускается,
+    # и пропуск СЧИТАЕТСЯ — молчание без причины неотличимо от поломки.
+    gs._seetg_paced_skips = 0
+    gs.scan_seetg_arbitrage({"collection": "0:" + "aa" * 32, "on_sale": []})
+    check("второй прогон подряд пропущен по бюджету",
+          gs._seetg_paced_skips == 1, gs._seetg_paced_skips)
+    check("пропуск по бюджету печатается в логе",
+          "прогон пропущен по бюджету" in _src64)
+finally:
+    (gs.seetg_slug_for, gs.seetg_model_board,
+     gs.notify_seetg_arb) = _oslug64, _oboard64, _onotify64
+    gs.SEETG_TOKEN, gs.seetg_budget_load = _otok64c, _oload64b
+    gs._seetg_scan_at.clear()
+    gs._seetg_arb_seen.clear()
+    gs._seetg_arb_implausible = gs._seetg_paced_skips = 0
+
+# --- НАХОДКА ТОЖЕ СВЕРЯЕТСЯ ПО ВСЕМ МАРКЕТАМ ------------------------------
+# «Продам по floor» в уведомлении о находке — утверждение о двух площадках из
+# пяти, и сверка показала направление ошибки: чужие маркеты дешевле.
+check("находка сверяется с see.tg до отправки",
+      "seetg_rival_check(item.get(\"collection_address\", \"\"), model_name,"
+      in _src64)
+check("находка отменяется, если по всем маркетам не дороже нашей цены",
+      'if seetg["floor"] <= ev["buy_price"]:' in _src64)
+check("отменённая находка не тратит часовой лимит",
+      "_find_sent_ts.pop()" in _src64)
+check("при их floor ниже нашего в сообщении об этом сказано",
+      "TonAPI видит 2 маркета из 5" in _src64)
+
+# Стартовое сообщение обязано называть источник: подмена источника меняет ВСЕ
+# числа, которые придут в телефон, а тихий старт с не теми настройками уже
+# портил запись рынка.
+check("стартовое сообщение называет источник чужих цен",
+      "Чужие цены: see.tg" in _src64)
+check("при SEETG_ONLY=0 стартовое сообщение предупреждает",
+      "2 маркета" in _src64 or "2 маркетам" in _src64)
 
 # =============================================================================
 print("\n" + "=" * 60)

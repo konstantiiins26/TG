@@ -3744,6 +3744,511 @@ def seetg_rival_check(collection: str, model: str, our_rival: Decimal):
         return None
 
 
+# -----------------------------------------------------------------------------
+# АРБИТРАЖ МАРКЕТОВ ПО МОДЕЛЯМ — ТОЛЬКО ПО ДАННЫМ see.tg
+# -----------------------------------------------------------------------------
+# По прямой просьбе владельца (07.10.2026): «хотелось бы покупать и с маркета
+# например, но вот самое главное смотреть только по see tg».
+#
+# ПОЧЕМУ ЭТО ЗАМЕНЯЕТ СЕГМЕНТНОЕ НАБЛЮДЕНИЕ, А НЕ ДОПОЛНЯЕТ ЕГО. Сверка
+# конкурента по всем маркетам, включённая вечером 06.10.2026, в первом же
+# прогоне отменила ВСЕ 11 находок «дешевле своих»:
+#
+#     «Love Shard» — у нас конкурент 30.00, по всем маркетам  8.80 (portals)
+#     «Privateer»  — у нас конкурент 33.33, по всем маркетам  6.29 (tonnel)
+#     «Obsidian»   — у нас конкурент 27.00, по всем маркетам  9.18 (mrkt)
+#
+# Это не «иногда ошибается»: ошиблись ВСЕ одиннадцать, и всегда в сторону
+# завышения прибыли. Причина известна и неустранима настройкой — TonAPI
+# читает блокчейн, то есть видит Getgems и Marketapp, а MRKT, Portals, Tonnel
+# и ресейл Telegram не видит ВООБЩЕ. «Самый дешёвый конкурент» по двум
+# площадкам из пяти — это не конкурент.
+#
+# ЧТО ЗДЕСЬ ИЗМЕРЕНО, А ЧТО ДОПУЩЕНО (разделять обязательно):
+#   ИЗМЕРЕНО  floor КАЖДОЙ модели на КАЖДОМ маркете и число листингов там —
+#             борда `/v1/floors?by=model`, ОДИН запрос на коллекцию;
+#   ДОПУЩЕНО  комиссия 2% на всех маркетах (решение владельца 06.10.2026;
+#             измерена она только у Getgems) и сравнимость лотов внутри
+#             одной модели — фон и узор внутри модели разные, и дорогой
+#             маркет может быть дорог СОСТАВОМ, а не спросом.
+#
+# Поэтому это ПОДСКАЗКА ДЛЯ РУК, а не план бота: вне `ALLOWED_MARKETS` он не
+# покупает, а на MRKT/Portals/Tonnel не может в принципе — у него нет ни их
+# протокола, ни даже адреса контракта продажи (его see.tg не отдаёт).
+
+SEETG_ONLY = os.getenv("SEETG_ONLY", "1") == "1"
+SEETG_ARB_MAX_PER_COLLECTION = int(os.getenv("SEETG_ARB_MAX_PER_COLLECTION", "1"))
+SEETG_ARB_NOTIFY_MAX_PER_HOUR = int(os.getenv("SEETG_ARB_NOTIFY_MAX_PER_HOUR", "12"))
+SEETG_ARB_SEEN_TTL_SEC = int(os.getenv("SEETG_ARB_SEEN_TTL_SEC", "21600"))
+SEETG_ARB_LOG_TOP = int(os.getenv("SEETG_ARB_LOG_TOP", "5"))
+
+_seetg_arb_seen: dict = {}
+_seetg_arb_sent_ts: list = []
+_seetg_arb_suppressed = 0
+_seetg_arb_implausible = 0
+_seetg_arb_unconfirmed = 0
+_seetg_paced_skips = 0
+_seetg_scan_at: dict = {}
+
+# Расход на один прогон по одной коллекции. ИЗМЕРЯЕТСЯ (максимум виденного),
+# догадка нужна только до первого замера.
+_SEETG_COST_GUESS = 2
+_seetg_cost_seen = 0
+
+
+def _seetg_cost_per_collection() -> int:
+    """
+    Сколько запросов see.tg стоит прогон по ОДНОЙ коллекции.
+
+    Берётся МАКСИМУМ из виденного, а не последнее значение и не константа:
+    борда кешируется на три минуты, ссылка на лот запрашивается только у
+    того, что реально уходит в телефон, — то есть расход зависит от того,
+    нашлось ли что-нибудь. Тот же принцип, что у `budget_learn_limit()`:
+    занижённая оценка расхода сожжёт квоту к обеду, завышенная всего лишь
+    сделает наблюдение реже.
+    """
+    return max(_SEETG_COST_GUESS, _seetg_cost_seen)
+
+
+def seetg_scan_gap_sec(collections: int = 0) -> float:
+    """
+    Сколько секунд между прогонами, чтобы суточной квоты see.tg хватило ДО
+    ПОЛУНОЧИ UTC. Прямой ответ на просьбу владельца «надо чтобы за сутки
+    хватало лимита».
+
+    Считается, а не задаётся — ровно по тем же причинам, что и
+    `budget_paced_interval()` для TonAPI: число коллекций и расход на
+    коллекцию меняются, и цифра, подобранная руками под двенадцать
+    коллекций, станет неверной на тринадцатой.
+
+    Арифметика на сегодня: 12 коллекций x 2 запроса = 24 на прогон, при
+    бюджете 900 это 37 прогонов в сутки, то есть раз в ~39 минут. Цикл
+    записи при этом остаётся своим (6.5 мин) — наблюдение за рынком пишется
+    TonAPI, их правила массовый обход see.tg запрещают.
+    """
+    colls = collections or max(1, len(TARGET_COLLECTIONS))
+    secs = max(60.0, _next_utc_midnight() - time.time())
+    left = seetg_budget_left()
+    if left <= 0:
+        # Бюджет исчерпан: до полуночи не ходим вовсе. Жечь исчерпанный
+        # лимит незачем, а их правила за это блокируют АККАУНТ целиком.
+        return secs
+    per_round = max(1, colls * _seetg_cost_per_collection())
+    rounds = left / per_round
+    return secs / max(rounds, 1e-9)
+
+
+def _seetg_market_pair(row: dict):
+    """
+    Лучшая пара «купить там — продать тут» для ОДНОЙ модели, или None.
+
+    ПОЧЕМУ СТОРОНЫ НЕСИММЕТРИЧНЫ. Покупаем мы КОНКРЕТНЫЙ лот, и одного
+    листинга для этого достаточно — это наблюдённая цена, по которой он
+    выставлен. А продаём мы ПРОТИВ ВИТРИНЫ: высокий floor там, где стоит
+    один лот, — это цена желания одного продавца, а не рынок. Поэтому
+    сторона продажи требует `MIN_MARKET_SAMPLE` листингов, а сторона
+    покупки — нет. Без этого порога «арбитраж» находился бы всегда на самом
+    тонком маркете, и это уже было: отчёт `--markets` чинили ровно так.
+
+    Безымянный маркет исключается с ОБЕИХ сторон: ни купить, ни выставить
+    там нельзя, адреса мы не знаем. Урок из `_best_sell_market()` —
+    исправление в одной точке не закрывает класс ошибки, если у значения
+    несколько потребителей.
+    """
+    buy = sell = None
+    for m in row.get("markets") or []:
+        if not isinstance(m, dict):
+            continue
+        name = str(m.get("market") or "").strip()
+        if not name or name == _UNKNOWN_MARKET:
+            continue
+        try:
+            price = Decimal(str(m.get("floorTon")))
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        if price <= 0:
+            continue
+        try:
+            listings = int(m.get("listings") or 0)
+        except (ValueError, TypeError):
+            listings = 0
+        if buy is None or price < buy[1]:
+            buy = (name, price, listings)
+        if listings >= MIN_MARKET_SAMPLE and (sell is None or price > sell[1]):
+            sell = (name, price, listings)
+    if buy is None or sell is None or buy[0] == sell[0] or sell[1] <= buy[1]:
+        return None
+    # Прибыль считает compute_net_profit() — ТА ЖЕ функция, что принимает
+    # торговое решение. Второй формулы прибыли в проекте нет и быть не должно.
+    profit = compute_net_profit(sell[1], buy[1])
+    return {
+        "buy_market": buy[0], "buy_floor": buy[1], "buy_n": buy[2],
+        "sell_market": sell[0], "sell_floor": sell[1], "sell_n": sell[2],
+        "profit": profit, "roi": compute_roi_pct(profit, buy[1]),
+        "markets": row.get("markets") or [],
+    }
+
+
+def seetg_cross_market(slug: str):
+    """
+    Все модели коллекции, у которых есть положительная пара маркетов.
+
+    ОДИН запрос на коллекцию (борда кешируется на 3 минуты). Постраничного
+    обхода их базы здесь нет и быть не должно: их правила это прямо
+    запрещают, а блокируется весь аккаунт see.tg, не токен.
+    """
+    out = []
+    for model, row in seetg_model_board(slug).items():
+        pair = _seetg_market_pair(row)
+        if pair is None or pair["profit"] <= 0:
+            continue
+        pair["model"] = model
+        out.append(pair)
+    out.sort(key=lambda p: p["roi"], reverse=True)
+    return out
+
+
+def _seetg_offer_on(gift: dict, market: str):
+    """Предложение по лоту НА ЗАДАННОМ маркете, или None. Форма — `saleInfo`."""
+    offers = gift.get("saleInfo")
+    if isinstance(offers, dict):
+        offers = [offers]
+    if not isinstance(offers, list) or not market:
+        return None
+    want = str(market).strip().lower()
+    for offer in offers:
+        if not isinstance(offer, dict):
+            continue
+        if str(offer.get("market") or "").strip().lower() != want:
+            continue
+        # Только нативная монета: рядом бывают звёзды и USDT, а курса у нас
+        # нет. Пересчитать его «по памяти» значило бы придумать прибыль.
+        if str(offer.get("currency", "")).lower() not in ("gram", "ton"):
+            continue
+        price = _nano_to_ton(offer.get("amount"))
+        if price is None or price <= 0:
+            continue
+        return {"price": price, "market": offer.get("market"),
+                "link": offer.get("link")}
+    return None
+
+
+def seetg_confirm_lot(slug: str, model: str, market: str, buy_floor: Decimal):
+    """
+    ПОДТВЕРЖДЕНИЕ, ЧТО ПО ЭТОЙ ЦЕНЕ ЕСТЬ ЧТО КУПИТЬ. (лот, причина).
+
+    Борда `by=model` пересобирается у них раз в несколько минут, то есть её
+    floor — утверждение о недавнем прошлом. Отправить в телефон цену, по
+    которой лота уже нет, значит послать владельца за сделкой, которой не
+    существует: это ровно та ошибка, из-за которой ссылка в уведомлении
+    однажды открывалась пустой страницей.
+
+    ПРОВЕРКА ОДНОСТОРОННЯЯ, и асимметрия тут не косметика:
+      • цена лота ВЫШЕ борда-floor более чем на процент — отказ: значит по
+        названной цене купить нечего (или мы читаем не то поле);
+      • цена НИЖЕ — допускается и только НАЗЫВАЕТСЯ. Прибыль всё равно
+        считается по борда-floor, то есть по БОЛЕЕ ДОРОГОЙ покупке, и
+        расхождение работает в безопасную сторону.
+
+    Ссылка берётся ИЗ ИХ ОТВЕТА (`saleInfo.link`, ведёт в бота маркета), а
+    не собирается нами: своя собранная ссылка в этом проекте уже один раз
+    открывалась пустой страницей из-за формы адреса.
+    """
+    rows = _seetg_rows(seetg_get("/gifts", {
+        "collection": slug, "model": model, "on_sale": "true",
+        "sort": "price", "limit": 1}))
+    if not rows:
+        return None, "лотов этой модели не отдали"
+    gift = rows[0]
+    offer = _seetg_offer_on(gift, market)
+    if offer is None:
+        raw = str(gift.get("saleInfo"))[:200]
+        return None, (f"на «{market}» цена лота не разобрана. "
+                      f"Сырьё saleInfo: {raw}")
+    price = offer["price"]
+    if buy_floor > 0 and price / buy_floor > Decimal("1.01"):
+        return None, (f"самый дешёвый лот «{model}» стоит {price}, а борда "
+                      f"обещала {buy_floor} — по названной цене купить нечего")
+    note = "лот подтверждён"
+    if buy_floor > 0 and price < buy_floor:
+        note = (f"лот сейчас дешевле борды ({price} против {buy_floor}) — "
+                f"считаем по борде, то есть по дорогой покупке")
+    return {"price": price, "market": offer.get("market") or market,
+            "link": offer.get("link"), "num": gift.get("num"),
+            "address": gift.get("giftAddress") or ""}, note
+
+
+def _seetg_arb_already_seen(slug: str, pair: dict) -> bool:
+    """
+    Выдержка повтора. Ключ несёт ЦЕНЫ, поэтому подешевевшая пара приходит
+    сразу: выдержка глушит повтор, а не новость. Журнал СВОЙ, не общий с
+    сегментным наблюдением — два разных вопроса, два журнала, иначе одно
+    тихо помечало бы лот виденным для другого.
+    """
+    q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
+    key = (f"{slug}|{pair['model']}|{pair['buy_market']}|{pair['sell_market']}"
+           f"|{q(pair['buy_floor'])}|{q(pair['sell_floor'])}")
+    now = time.time()
+    for k in [k for k, ts in _seetg_arb_seen.items()
+              if now - ts > SEETG_ARB_SEEN_TTL_SEC]:
+        _seetg_arb_seen.pop(k, None)
+    if now - _seetg_arb_seen.get(key, -1e9) < SEETG_ARB_SEEN_TTL_SEC:
+        return True
+    _seetg_arb_seen[key] = now
+    return False
+
+
+def _seetg_markets_line(markets) -> str:
+    """Строка «кто сколько просит» — та же, что видна у них в борде."""
+    parts = []
+    for m in markets or []:
+        if not isinstance(m, dict):
+            continue
+        name = str(m.get("market") or "").strip()
+        try:
+            price = Decimal(str(m.get("floorTon")))
+        except (InvalidOperation, ValueError, TypeError):
+            continue
+        if not name:
+            continue
+        parts.append(f"{name} {price.quantize(Decimal('0.01'))} "
+                     f"({m.get('listings', '?')})")
+    return " | ".join(parts)
+
+
+def notify_seetg_arb(name: str, slug: str, pair: dict) -> bool:
+    """
+    Уведомление об арбитраже между маркетами. True, если отправлено.
+
+    ОБЯЗАТЕЛЬНО говорит, что бот этого НЕ КУПИТ: сообщение, похожее на
+    находку, заставило бы владельца ждать автоматической сделки, которой не
+    будет. И обязательно называет, что комиссии вне Getgems не измерены —
+    голая разница цен читалась бы как гарантия профита.
+    """
+    global _seetg_arb_suppressed, _seetg_arb_unconfirmed
+    if SEETG_ARB_NOTIFY_MAX_PER_HOUR <= 0:
+        return False
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    now = time.time()
+    _seetg_arb_sent_ts[:] = [t for t in _seetg_arb_sent_ts if now - t < 3600]
+    if len(_seetg_arb_sent_ts) >= SEETG_ARB_NOTIFY_MAX_PER_HOUR:
+        _seetg_arb_suppressed += 1
+        return False
+    _seetg_arb_sent_ts.append(now)
+
+    try:
+        lot, why = seetg_confirm_lot(slug, pair["model"], pair["buy_market"],
+                                     pair["buy_floor"])
+    except RateLimited as e:
+        log.warning(f"see.tg: {e}")
+        _seetg_arb_sent_ts.pop()
+        return False
+    except Exception as e:                              # noqa: BLE001
+        log.warning(f"see.tg: лот не подтверждён: {e}")
+        lot, why = None, str(e)
+    if lot is None:
+        # В ТЕЛЕФОН не идёт, в ЛОГ попадает целиком и считается в сводке:
+        # подавленное молча неотличимо от несуществующего.
+        log.info(f"{_Color.GREY}  арбитраж «{pair['model']}» не подтверждён "
+                 f"лотом: {why}{_Color.RESET}")
+        _seetg_arb_sent_ts.pop()
+        _seetg_arb_unconfirmed += 1
+        return False
+
+    q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
+    sale = target_sale_price(pair["sell_floor"])
+    lines = [
+        # Первая строка — сразу «почему», а не название.
+        f"🟣 АРБИТРАЖ МАРКЕТОВ · «{pair['model']}»",
+        f"🎁 {name}" + (f" #{lot['num']}" if lot.get("num") else ""),
+        f"💰 Купить на «{pair['buy_market']}» {q(pair['buy_floor'])} → "
+        f"продать на «{pair['sell_market']}» {q(sale)} → "
+        f"{'📈' if pair['profit'] > 0 else '📉'} {q(pair['profit']):+} TON "
+        f"({pair['roi']}%)",
+        "",
+    ]
+    lines += price_chain_lines(pair["buy_floor"], pair["sell_floor"],
+                              f"«{pair['sell_market']}» (лотов {pair['sell_n']})")
+    lines.append("")
+    lines.append(f"🌐 «{pair['model']}» по маркетам (цена и лотов): "
+                 f"{_seetg_markets_line(pair['markets'])}")
+    if lot.get("price") != pair["buy_floor"]:
+        lines.append(f"ℹ️ самый дешёвый лот сейчас {q(lot['price'])} "
+                     f"на «{lot['market']}» — прибыль считана по борде, то "
+                     f"есть по более дорогой покупке")
+    if lot.get("link"):
+        lines.append(f"🔗 {lot['link']}")
+    if lot.get("address"):
+        lines.append(f"🔗 {EXPLORER_URL_TEMPLATE.format(address=friendly_ton_address(lot['address']))}")
+    lines += [
+        "",
+        "⚠️ БОТ ЭТО НЕ КУПИТ: вне Getgems у него нет ни протокола маркета, "
+        "ни адреса контракта продажи. Сделка РУЧНАЯ, отметить: "
+        "--bought АДРЕС ЦЕНА",
+        f"⚠️ комиссия {MARKETPLACE_FEE_PCT * 100:.0f}% измерена ТОЛЬКО у "
+        f"Getgems; на остальных маркетах взята та же по решению владельца, "
+        f"а у одного лота вне Getgems роялти было 0.45 TON",
+        "⚠️ внутри одной модели фон и узор разные — дорогой маркет может "
+        "быть дорог составом лотов, а не спросом",
+    ]
+    return bool(_tg_call("sendMessage", {
+        "chat_id": TELEGRAM_CHAT_ID, "text": "\n".join(lines),
+        "disable_web_page_preview": True}))
+
+
+def scan_seetg_arbitrage(snap: dict) -> int:
+    """
+    Прогон по ОДНОЙ коллекции: арбитраж моделей по данным see.tg.
+
+    Возвращает число найденных пар. Покупок не делает, `evaluate_trade()` не
+    трогает, запись рынка не меняет — запись остаётся на TonAPI, потому что
+    массовый обход see.tg их правила запрещают (раздел 4b).
+
+    РИТМ ЗАДАЁТ БЮДЖЕТ, а не цикл наблюдения: `seetg_scan_gap_sec()`
+    растягивает прогоны так, чтобы суточной квоты хватило до полуночи UTC.
+    Пропуск по бюджету — не поломка, и он СЧИТАЕТСЯ: молчание без причины
+    неотличимо от сломанного наблюдения.
+    """
+    global _seetg_paced_skips, _seetg_cost_seen
+    if not SEETG_TOKEN:
+        return 0
+    collection = snap.get("collection") or ""
+    if not collection:
+        return 0
+
+    gap = seetg_scan_gap_sec()
+    if time.time() - _seetg_scan_at.get(collection, 0.0) < gap:
+        _seetg_paced_skips += 1
+        return 0
+    # Метка ставится ДО работы: сбой не должен означать «попробуем снова
+    # через секунду», иначе отказ начнёт жечь квоту быстрее успеха.
+    _seetg_scan_at[collection] = time.time()
+    spent_before = seetg_budget_load()
+
+    items = snap.get("on_sale") or snap.get("candidates") or []
+    name = snap.get("collection_name") or ""
+    if not name and items:
+        name = items[0].get("collection_name") or ""
+    try:
+        slug, why = seetg_slug_for(collection, name, items)
+        if not slug:
+            log.info(f"{_Color.GREY}see.tg: слаг коллекции неизвестен — "
+                     f"{why}{_Color.RESET}")
+            return 0
+        pairs = seetg_cross_market(slug)
+    except RateLimited as e:
+        log.warning(f"see.tg: {e}")
+        return 0
+    except Exception as e:                              # noqa: BLE001
+        log.warning(f"see.tg: арбитраж не посчитан: {e}")
+        return 0
+    finally:
+        # Расход ИЗМЕРЯЕТСЯ, а не предполагается: по нему считается ритм.
+        _seetg_cost_seen = max(_seetg_cost_seen,
+                               seetg_budget_load() - spent_before)
+
+    if not pairs:
+        log.info(f"{_Color.GREY}see.tg «{slug}»: положительных пар маркетов "
+                 f"нет — ни одна модель не даёт прибыли после комиссии и "
+                 f"газа{_Color.RESET}")
+        return 0
+
+    log.info(f"{_Color.GREEN}see.tg «{slug}»: моделей с положительным "
+             f"арбитражем {len(pairs)}{_Color.RESET}")
+    global _seetg_arb_implausible
+    notified = 0
+    for pair in pairs[:max(SEETG_ARB_LOG_TOP, SEETG_ARB_MAX_PER_COLLECTION)]:
+        log.info(f"  «{pair['model']}»: купить на {pair['buy_market']} "
+                 f"{pair['buy_floor']} (лотов {pair['buy_n']}) → продать на "
+                 f"{pair['sell_market']} {pair['sell_floor']} (лотов "
+                 f"{pair['sell_n']}) → {pair['profit']:+.4f} TON, "
+                 f"ROI {pair['roi']}%")
+        if pair["roi"] < SEGMENT_MIN_ROI_PCT:
+            log.info(f"      ниже порога показа {SEGMENT_MIN_ROI_PCT}%")
+            continue
+        if SEGMENT_MAX_ROI_PCT > 0 and pair["roi"] > SEGMENT_MAX_ROI_PCT:
+            # ПОТОЛОК ПРАВДОПОДОБИЯ. Все разобранные случаи ROI такого
+            # размера оказывались ошибкой ДАННЫХ, а не рынком.
+            log.info(f"      ВЫШЕ потолка правдоподобия "
+                     f"{SEGMENT_MAX_ROI_PCT}% — в телефон не идёт")
+            _seetg_arb_implausible += 1
+            continue
+        if notified >= SEETG_ARB_MAX_PER_COLLECTION:
+            continue
+        if _seetg_arb_already_seen(slug, pair):
+            continue
+        if notify_seetg_arb(name or slug, slug, pair):
+            notified += 1
+    return len(pairs)
+
+
+def seetg_arb_report(limit_collections: int = 0):
+    """
+    `--seetg-arb`: арбитраж маркетов по моделям сразу, не дожидаясь ритма.
+
+    Ничего не покупает и ничего не шлёт в телефон: это проверка руками,
+    а уведомления идут из цикла наблюдения.
+    """
+    if not SEETG_TOKEN:
+        log.error("SEETG_TOKEN не задан. Токен: мини-апп see.tg -> Полезное "
+                  "-> API. Вписать в deploy\\my-secrets.bat.")
+        return False
+    colls = TARGET_COLLECTIONS[:limit_collections] if limit_collections \
+        else TARGET_COLLECTIONS
+    log.info(f"{_Color.BOLD}Арбитраж маркетов по see.tg: {len(colls)} "
+             f"коллекций. Бюджет: осталось {seetg_budget_left()} из "
+             f"{SEETG_DAILY_BUDGET}.{_Color.RESET}")
+    total = 0
+    for coll in colls:
+        key = f"seetg_slug:{normalize_ton_address(coll) or coll}"
+        slug = meta_get(key)
+        name = ""
+        if not slug:
+            # Слаг доказывается ОДИН раз и лежит в БД. Пока его нет, нужна
+            # наша выборка: доказательство — совпадение giftAddress.
+            try:
+                snap = get_market_snapshot(coll)
+            except Exception as e:                      # noqa: BLE001
+                log.error(f"{_short(coll)}: {e}")
+                continue
+            items = snap.get("on_sale") or []
+            name = items[0].get("collection_name") if items else ""
+            slug, why = seetg_slug_for(coll, name or "", items)
+            if not slug:
+                log.warning(f"{_short(coll)}: слаг неизвестен — {why}")
+                continue
+        log.info("")
+        log.info(f"{_Color.BOLD}{slug}{_Color.RESET}")
+        try:
+            pairs = seetg_cross_market(slug)
+        except RateLimited as e:
+            log.error(f"  {e}")
+            break
+        except Exception as e:                          # noqa: BLE001
+            log.error(f"  сбой: {e}")
+            continue
+        if not pairs:
+            log.info("  положительных пар маркетов нет")
+            continue
+        for pair in pairs[:SEETG_ARB_LOG_TOP]:
+            total += 1
+            log.info(f"  «{pair['model']}»: купить на {pair['buy_market']} "
+                     f"{pair['buy_floor']} (лотов {pair['buy_n']}) → продать "
+                     f"на {pair['sell_market']} {pair['sell_floor']} (лотов "
+                     f"{pair['sell_n']}) → {pair['profit']:+.4f} TON, "
+                     f"ROI {pair['roi']}%")
+            log.info(f"      по маркетам: {_seetg_markets_line(pair['markets'])}")
+    log.info("")
+    log.info(f"{_Color.BOLD}Пар показано: {total}. Потрачено see.tg за сутки: "
+             f"{seetg_budget_load()}/{SEETG_DAILY_BUDGET}. Прогон раз в "
+             f"{seetg_scan_gap_sec() / 60:.0f} мин хватит до полуночи UTC."
+             f"{_Color.RESET}")
+    log.info("Комиссии измерены только у Getgems; бот вне Getgems купить не "
+             "может — сделка ручная, отметить: --bought АДРЕС ЦЕНА.")
+    return True
+
+
 def notify_segment_bargain(b: dict) -> bool:
     """
     Сообщает о таком лоте. True, если отправлено.
@@ -4936,6 +5441,30 @@ def notify_heartbeat(snapshots: list, force: bool = False):
                      f"{_segment_truncated} — обход не дошёл до конца "
                      f"(лимит TonAPI)")
         _segment_truncated = 0
+    # see.tg: расход квоты, подавленное и неподтверждённое. Каждая строка
+    # отвечает на вопрос «почему молчит», и без них молчание читается как
+    # поломка — тот же довод, что у «находок не было».
+    global _seetg_arb_suppressed, _seetg_arb_implausible
+    global _seetg_arb_unconfirmed
+    if SEETG_ONLY and SEETG_TOKEN:
+        lines.append(f"see.tg: потрачено {seetg_budget_load()}/"
+                     f"{SEETG_DAILY_BUDGET} за сутки, прогон по коллекции "
+                     f"раз в {seetg_scan_gap_sec() / 60:.0f} мин — так квоты "
+                     f"хватит до полуночи UTC")
+    if _seetg_arb_suppressed:
+        lines.append(f"Арбитраж не отправлен из-за лимита: "
+                     f"{_seetg_arb_suppressed}")
+        _seetg_arb_suppressed = 0
+    if _seetg_arb_implausible:
+        lines.append(f"⚠️ арбитраж отсеян по потолку правдоподобия "
+                     f"(ROI > {SEGMENT_MAX_ROI_PCT}%): "
+                     f"{_seetg_arb_implausible} — в логе целиком")
+        _seetg_arb_implausible = 0
+    if _seetg_arb_unconfirmed:
+        lines.append(f"⚠️ арбитраж не подтверждён живым лотом: "
+                     f"{_seetg_arb_unconfirmed} — борда обещала цену, по "
+                     f"которой купить нечего")
+        _seetg_arb_unconfirmed = 0
     # Подавленное потолком правдоподобия НЕ теряется молча: ROI выше сотни
     # чаще означает неполную выборку, чем дешёвый лот, но решать владельцу —
     # в логе такой лот лежит целиком.
@@ -5015,6 +5544,34 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
     name = item.get("collection_name") or "лот"
     mint = item.get("mint_index")
 
+    # СВЕРКА С ОСТАЛЬНЫМИ МАРКЕТАМИ ДО ОТПРАВКИ. Наш floor посчитан по
+    # TonAPI, то есть по Getgems и Marketapp; MRKT, Portals, Tonnel и ресейл
+    # Telegram там не видны ВООБЩЕ, а на всех трёх сверенных коллекциях они
+    # оказались ДЕШЕВЛЕ нашего минимума (−11.3% / −6.4% / −8.2%). Значит
+    # «продам по floor» — утверждение о двух площадках из пяти.
+    #
+    # Оценка от этого только ПАДАЕТ: выше их floor мы не поднимаем ничего,
+    # потому что комиссий чужих маркетов не знаем.
+    seetg_note = None
+    model_name = (item.get("traits") or {}).get("model") or ""
+    seetg = seetg_rival_check(item.get("collection_address", ""), model_name,
+                              ev["eff_floor"])
+    if seetg and seetg["floor"] < ev["eff_floor"]:
+        if seetg["floor"] <= ev["buy_price"]:
+            log.warning(
+                f"{_Color.YELLOW}НАХОДКА отменена по see.tg: "
+                f"{_short(addr)} «{model_name}» — у нас floor "
+                f"{ev['eff_floor']}, а по всем маркетам {seetg['floor']} "
+                f"({seetg['market']}), это не выше нашей цены "
+                f"{ev['buy_price']}. TonAPI не видит MRKT/Portals/Tonnel."
+                f"{_Color.RESET}")
+            _find_sent_ts.pop()        # лимит часа не тратим на отказ
+            return False
+        seetg_note = (f"⚠️ по see.tg «{model_name}» дешевле всего стоит "
+                      f"{q(seetg['floor'])} на «{seetg['market']}» — ниже "
+                      f"нашего floor {q(ev['eff_floor'])}, значит прибыль "
+                      f"ниже посчитанной: TonAPI видит 2 маркета из 5")
+
     # ПЕРВАЯ СТРОКА — сразу «почему», а не название. По просьбе владельца:
     # «чтобы видел сразу, почему купил». Название лота само по себе ничего
     # не объясняет, а решение принимают по первой строке.
@@ -5055,6 +5612,8 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
     # Предупреждения. Каждое означает «сделка может не состояться», и молчать
     # о них нельзя: владелец ждал бы покупки, которой не будет.
     warn = []
+    if seetg_note:
+        warn.append(seetg_note)
     # Газ — величина В ТОНАХ. На цене 5 TON он почти незаметен, на цене
     # 1 TON съедает пятую часть, и порог безубытка уезжает вдвое. Молчать
     # об этом значит предлагать «искать подешевле» как бесплатный совет.
@@ -5286,6 +5845,21 @@ def notify_startup(collections):
                      f"{max_position_size()} TON")
     if not COLLECTION_WHITELIST:
         lines.append("⚠️ whitelist пуст — защита от скам-коллекций выключена")
+    # ЧЕМ СМОТРИМ ЧУЖИЕ ЦЕНЫ — обязательно в стартовом сообщении: подмена
+    # источника меняет ВСЕ числа, которые придут в телефон, а тихий старт с
+    # не теми настройками уже портил запись.
+    if SEETG_ONLY and SEETG_TOKEN:
+        lines.append(f"Чужие цены: see.tg, все 5 маркетов. Прогон раз в "
+                     f"{seetg_scan_gap_sec() / 60:.0f} мин "
+                     f"(квота {SEETG_DAILY_BUDGET}/сутки, потрачено "
+                     f"{seetg_budget_load()})")
+    elif SEETG_ONLY:
+        lines.append("⚠️ SEETG_ONLY=1, а токена нет — чужие цены не смотрим "
+                     "вовсе")
+    else:
+        lines.append("⚠️ SEETG_ONLY=0: сравнение с конкурентами идёт по "
+                     "TonAPI, то есть по 2 маркетам из 5 — в живом прогоне "
+                     "оно ошиблось во всех 11 случаях")
     notify("\n".join(lines))
     return True
 
@@ -7481,7 +8055,57 @@ def main(record: bool = False, trade: bool = True):
                         f"set TONAPI_MIN_INTERVAL={TONAPI_MIN_INTERVAL + Decimal('0.5')}"
                         f"{_Color.RESET}")
         _cycle_requests, _cycle_429 = 0, 0
+        # ПРОПУСК ПО БЮДЖЕТУ see.tg — не поломка, но и не молчание: без этой
+        # строки «арбитраж ничего не сказал» неотличимо от «арбитраж не
+        # работает». Ритм задаёт квота, а не цикл наблюдения.
+        global _seetg_paced_skips
+        if _seetg_paced_skips:
+            log.info(f"{_Color.GREY}see.tg: прогон пропущен по бюджету у "
+                     f"{_seetg_paced_skips} коллекций — следующий не раньше "
+                     f"чем через {seetg_scan_gap_sec() / 60:.0f} мин "
+                     f"(потрачено {seetg_budget_load()}/{SEETG_DAILY_BUDGET})."
+                     f"{_Color.RESET}")
+            _seetg_paced_skips = 0
         time.sleep(sleep_for)
+
+
+_seetg_only_warned = False
+
+
+def _scan_bargains(snap: dict) -> int:
+    """
+    КАКИМ ИСТОЧНИКОМ СМОТРЕТЬ ЧУЖИЕ ЦЕНЫ — одна точка выбора.
+
+    По умолчанию `SEETG_ONLY` = 1, то есть только see.tg, и это прямая
+    команда владельца (07.10.2026: «самое главное смотреть только по see
+    tg»), подкреплённая измерением: сверка по всем маркетам отменила ВСЕ 11
+    находок сегментного поиска по TonAPI в первом же прогоне. Источник,
+    который ошибается в каждом случае, не «дополняет» — он мешает.
+
+    Старый путь НЕ УДАЛЁН и включается `SEETG_ONLY=0`: он отвечает на
+    соседний вопрос (дёшев ли лот среди своей модели ПО НАШЕЙ выборке), и
+    когда квота see.tg исчерпана, других данных у нас нет вовсе. Но
+    по умолчанию он выключен, потому что его ответ измеренно неверен.
+    """
+    global _seetg_only_warned
+    if SEETG_ONLY:
+        if not SEETG_TOKEN:
+            # БЕЗ ТОКЕНА ЭТО ПОЛНАЯ ТИШИНА, и её надо назвать. Молча
+            # откатиться на путь по TonAPI нельзя: его ответ измеренно
+            # неверен, и тихая подмена источника — это и есть «горит зелёным,
+            # пока ошибка растёт».
+            if not _seetg_only_warned:
+                _seetg_only_warned = True
+                log.warning(
+                    f"{_Color.YELLOW}SEETG_ONLY=1, но SEETG_TOKEN не задан: "
+                    f"чужие цены не смотрим ВООБЩЕ. Токен: мини-апп see.tg "
+                    f"-> Полезное -> API, вписать в deploy\\my-secrets.bat. "
+                    f"Либо SEETG_ONLY=0 — но сегментный поиск по TonAPI видит "
+                    f"две площадки из пяти, и в живом прогоне ошибся во всех "
+                    f"11 случаях.{_Color.RESET}")
+            return 0
+        return scan_seetg_arbitrage(snap)
+    return scan_segment_bargains(snap)
 
 
 def _process_collection(client, collection: str, record: bool, trade: bool):
@@ -7528,9 +8152,9 @@ def _process_collection(client, collection: str, record: bool, trade: bool):
                 if found:
                     log.info(f"{_Color.GREEN}Находок в этом цикле: {found}"
                              f"{_Color.RESET}")
-                # Наблюдение по сегменту: покупок не делает, торговый путь не
-                # трогает. Смотрит ВСЕ выставленные лоты, а не пять дешёвых.
-                scan_segment_bargains(snap)
+                # НАБЛЮДЕНИЕ ЗА ЧУЖИМИ ЦЕНАМИ. Покупок не делает, торговый
+                # путь не трогает.
+                _scan_bargains(snap)
             else:
                 log.warning("Данных с рынка нет — снапшот НЕ записан.")
         elif not candidates:
@@ -7557,10 +8181,10 @@ def _process_collection(client, collection: str, record: bool, trade: bool):
             if recent_sales is not None:
                 log.info(f"Продаж за {LIQUIDITY_WINDOW_HOURS}ч: {recent_sales}")
 
-            # Наблюдение по сегменту идёт ДО торговли и независимо от неё:
-            # это другой вопрос к тем же данным, и отвечать на него надо
-            # даже когда торговля по коллекции чем-то заблокирована.
-            scan_segment_bargains(snap)
+            # Наблюдение идёт ДО торговли и независимо от неё: это другой
+            # вопрос к тем же данным, и отвечать на него надо даже когда
+            # торговля по коллекции чем-то заблокирована.
+            _scan_bargains(snap)
 
             # Прогоняем самые дешёвые лоты через ИИ.
             for item in candidates:
@@ -7614,6 +8238,10 @@ def parse_args(argv=None):
     parser.add_argument("--seetg-find", action="store_true",
                         help="искать через see.tg: лоты дешевле всех в своей "
                              "модели ПО ВСЕМ маркетам; ничего не покупает")
+    parser.add_argument("--seetg-arb", action="store_true",
+                        help="арбитраж маркетов по МОДЕЛЯМ по данным see.tg: "
+                             "где модель дешевле и где дороже; ничего не "
+                             "покупает")
     parser.add_argument("--numbers", nargs="?", const=RECORD_PATH, metavar="FILE",
                         help="просят ли больше за красивый НОМЕР "
                              "(почему в уведомлении стоит +0%%)")
@@ -7678,6 +8306,9 @@ if __name__ == "__main__":
         if getattr(args, "seetg_find", False):
             # Ходит в сеть, НИЧЕГО не покупает и в запись не пишет.
             sys.exit(0 if seetg_find_report() else 1)
+        if getattr(args, "seetg_arb", False):
+            # Ходит в сеть, НИЧЕГО не покупает и в запись не пишет.
+            sys.exit(0 if seetg_arb_report() else 1)
         if args.bought:
             if not 2 <= len(args.bought) <= 3:
                 log.error("Нужно: --bought АДРЕС ЦЕНА [FLOOR_КОНКУРЕНТА]")

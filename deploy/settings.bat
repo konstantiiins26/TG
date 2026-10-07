@@ -250,6 +250,35 @@ REM Ranshe bralas obshchaya vyderzhka 300s pri cikle 6.5 min - odin i tot zhe
 REM lot schitalsya novym kazhdyy cikl. Smena ceny probivaet vyderzhku.
 set SEGMENT_SEEN_TTL_SEC=21600
 
+REM --- CHUZHIE CENY: TOLKO see.tg (reshenie vladelca 07.10.2026) ---
+REM SEETG_ONLY=1 znachit, chto sravnenie s konkurentami idet po see.tg, to
+REM est po VSEM pyati marketam (telegram, portals, tonnel, getgems, mrkt).
+REM
+REM Pochemu tak, a ne "oba istochnika": sverka po vsem marketam v pervom zhe
+REM progone OTMENILA VSE 11 nahodok segmentnogo poiska po TonAPI.
+REM   "Love Shard" - u nas konkurent 30.00, po vsem marketam  8.80 (portals)
+REM   "Privateer"  - u nas konkurent 33.33, po vsem marketam  6.29 (tonnel)
+REM   "Obsidian"   - u nas konkurent 27.00, po vsem marketam  9.18 (mrkt)
+REM TonAPI chitaet blokchein, poetomu vidit Getgems i Marketapp, a MRKT,
+REM Portals, Tonnel i resale Telegram ne vidit VOOBSHCHE. "Samyy deshevyy
+REM konkurent" po dvum ploshchadkam iz pyati - eto ne konkurent.
+REM
+REM SEETG_ONLY=0 vozvrashchaet staryy put (po nashey vyborke iz TonAPI).
+REM Nuzhen tolko esli kvota see.tg konchilas, a smotret chem-to nado.
+set SEETG_ONLY=1
+
+REM Sutochnaya kvota see.tg. U Free tarifa potolok 1000 zaprosov v sutki,
+REM poetomu 900 - s zapasom. Rashod HRANITSYA V BD: kvota zhivet na ih
+REM storone, i bot, perezapushchennyy v obed, inache schital by ee netronutoy.
+REM Ritm progonov bot schitaet SAM tak, chtoby ostatka hvatilo do polunochi
+REM UTC (12 kollekciy x 2 zaprosa = 24 na progon, to est progon raz v ~40 min).
+set SEETG_DAILY_BUDGET=900
+
+REM Skolko soobshcheniy ob arbitrazhe marketov slat maksimum za chas i
+REM skolko s odnoy kollekcii za progon. 0 = vyklyuchit uvedomleniya.
+set SEETG_ARB_NOTIFY_MAX_PER_HOUR=12
+set SEETG_ARB_MAX_PER_COLLECTION=1
+
 REM --- Pauza mezhdu zaprosami k TonAPI ---
 REM Tarify Ton Console (snyato so skrinshota 23.09.2026, REST API):
 REM   Free  $0     1 RPS   <- tekushchiy
