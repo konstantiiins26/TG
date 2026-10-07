@@ -4583,27 +4583,44 @@ def _ws_connect(url: str, headers: list, timeout: float):
 
 def _ws_candidate_frames(events: list) -> list:
     """
-    Кадры-кандидаты для подписки. СОБИРАЮТСЯ ИЗ ИХ ЖЕ РУКОПОЖАТИЯ.
+    Кадры-кандидаты подписки. ОБЁРТКА ИЗМЕРЕНА, перебирается ЗНАЧЕНИЕ.
 
-    Имена событий берутся из `hello.events` — то есть из того, что сервер
-    назвал сам. Из памяти тут не берётся НИЧЕГО, кроме обёртки ключа
-    (`type`/`action`/`op`), а она и есть предмет измерения: какую именно
-    сервер поймёт, покажет ЕГО ОТВЕТ.
+    Живой ответ сервера 07.10.2026 на заведомо неверный кадр:
 
-    Первым идёт заведомо НЕВЕРНЫЙ кадр, и это не шутка, а самый
-    информативный запрос из всех: сервер на неизвестную команду часто
-    отвечает ошибкой, в которой называет правильную форму. Один кадр
-    экономит перебор.
+        {"code":"bad_request","message":"unknown message type","type":"error"}
+
+    Отсюда ДВА факта, и оба добыты одним кадром: сервер читает наши сообщения
+    и разбирает их как JSON, и ключ он смотрит именно `type` («unknown message
+    TYPE»). Значит угадывать надо не форму конверта, а слово внутри него.
+
+    Имена событий по-прежнему берутся из `hello.events` — из памяти тут не
+    берётся ничего. `ping` стоит первым не ради вежливости: это слово,
+    которое есть почти у любого потока, и ответ на него отделяет «моё слово
+    не то» от «сервер вообще не отвечает ничем, кроме ошибок».
     """
     want = [e for e in events if e in ("sale", "listing", "price")] or ["sale"]
     return [
-        ('проба ошибкой (что сервер скажет о неизвестной команде)',
-         {"type": "__unknown_probe__"}),
-        ('type/subscribe', {"type": "subscribe", "events": want}),
-        ('action/subscribe', {"action": "subscribe", "events": want}),
-        ('op/subscribe', {"op": "subscribe", "events": want}),
-        ('type/sub', {"type": "sub", "events": want}),
+        ("type=ping", {"type": "ping"}),
+        ("type=subscribe + events", {"type": "subscribe", "events": want}),
+        ("type=subscribe + channels", {"type": "subscribe", "channels": want}),
+        ("type=sub + events", {"type": "sub", "events": want}),
+        ("type=listen + events", {"type": "listen", "events": want}),
+        ("type=watch + events", {"type": "watch", "events": want}),
     ]
+
+
+def _ws_is_error(frame: str) -> str:
+    """Ответ — это отказ? Возвращает текст отказа или пустую строку."""
+    try:
+        obj = json.loads(frame)
+    except Exception:                                  # noqa: BLE001
+        return ""
+    if not isinstance(obj, dict):
+        return ""
+    if str(obj.get("type", "")).lower() == "error" or obj.get("code") or \
+            obj.get("error"):
+        return str(obj.get("message") or obj.get("error") or obj.get("code"))
+    return ""
 
 
 def seetg_subscribe_probe(wait_sec: int = 0) -> bool:
@@ -4672,6 +4689,7 @@ def seetg_subscribe_probe(wait_sec: int = 0) -> bool:
             log.warning("Рукопожатия со списком событий не было — кандидаты "
                         "соберу по умолчанию («sale»).")
 
+        refusals = []
         for name, frame in _ws_candidate_frames(events):
             log.info(f"{_Color.GREY}→ пробую {name}: "
                      f"{json.dumps(frame, ensure_ascii=False)}{_Color.RESET}")
@@ -4686,15 +4704,36 @@ def seetg_subscribe_probe(wait_sec: int = 0) -> bool:
                 continue
             for f in got:
                 log.info(f"  {_Color.GREEN}ОТВЕТ:{_Color.RESET} {f[:1200]}")
-            # ОТВЕТ ЛЮБОГО РОДА — уже измерение: даже отказ называет форму.
-            log.info(f"{_Color.GREEN}Сервер ответил на «{name}».{_Color.RESET} "
+            # ОТКАЗ — НЕ ОСТАНОВКА. Он доказывает только, что сервер нас
+            # слышит; искали мы РАБОЧУЮ команду. Остановиться на отказе —
+            # то же самое, что посчитать рукопожатие событием.
+            errs = [_ws_is_error(f) for f in got]
+            if all(errs):
+                for e in errs:
+                    if e and e not in refusals:
+                        refusals.append(e)
+                log.info(f"{_Color.GREY}  это отказ — слово не то, пробую "
+                         f"дальше{_Color.RESET}")
+                continue
+            log.info(f"{_Color.GREEN}Сервер ПРИНЯЛ «{name}».{_Color.RESET} "
                      f"Перебор прекращаю — лишний трафик к ним не нужен. "
                      f"Пришлите эти строки: по НИМ будет написана подписка.")
             return True
-        log.warning("Ни один кадр ответа не вызвал. Это ТОЖЕ результат, и он "
-                    "означает не «подписки нет», а что её форма не угадана и "
-                    "сервер молчит на неизвестное. Нужна их страница про "
-                    "поток — писать подписку по догадке запрещено.")
+
+        if refusals:
+            # Слова отказов — это ИХ словарь, и он подсказывает следующий шаг
+            # лучше любой догадки: «unknown message type» и «missing field»
+            # означают разное.
+            log.warning("Ни одно слово не принято. Сервер отказал так:")
+            for e in refusals:
+                log.warning(f"  «{e}»")
+            log.warning("Это ТОЖЕ результат: он слышит нас и разбирает JSON, "
+                        "но названные слова ему неизвестны. Нужна их страница "
+                        "про поток — подбирать дальше вслепую значит гадать.")
+        else:
+            log.warning("Ни один кадр ответа не вызвал. Это НЕ значит «подписки "
+                        "нет»: значит форма не угадана, а на неизвестное сервер "
+                        "молчит. Нужна их страница про поток.")
         return True
     finally:
         try:

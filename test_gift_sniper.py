@@ -5659,20 +5659,32 @@ check("кандидаты подписки собираются из ИХ спи
       all("sale" in str(f) for _n, f in _cands[1:]), _cands)
 check("имя события не выдумано: взято из рукопожатия",
       all("stats" not in str(f) for _n, f in _cands))
-# Самый информативный кадр — заведомо неверный: отказ часто называет форму.
-check("первым идёт проба ошибкой", "__unknown_probe__" in str(_cands[0][1]))
-check("кандидатов немного — это не перебор ради перебора", len(_cands) <= 6)
-check("перебираются разные обёртки ключа",
-      {k for _n, f in _cands for k in f} >= {"type", "action", "op"})
+# ОБЁРТКА ИЗМЕРЕНА живым ответом «unknown message TYPE»: сервер смотрит
+# именно `type`. Значит перебирать надо значение, а не ключ — иначе кадры
+# тратятся на то, что уже известно.
+check("все кандидаты идут с измеренным ключом type",
+      all("type" in f for _n, f in _cands), _cands)
+check("кандидатов немного — это не перебор ради перебора", len(_cands) <= 8)
+check("ping стоит первым: он отделяет «слово не то» от «молчит на всё»",
+      _cands[0][1] == {"type": "ping"}, _cands[0])
+
+# Отказ опознаётся по их же форме ответа (живая строка 07.10.2026).
+check("отказ опознан и его текст извлечён",
+      gs._ws_is_error('{"code":"bad_request","message":"unknown message type",'
+                      '"type":"error"}') == "unknown message type")
+check("обычный кадр отказом не считается",
+      gs._ws_is_error('{"type":"sale","amount":"1"}') == "")
 
 _src70 = open("gift_sniper.py", encoding="utf-8").read()
 _sp70 = _src70.split("def seetg_subscribe_probe")[1].split("\ndef ")[0]
 # Перебор прекращается на первом ответе: лишний трафик к ним запрещён их же
 # правилами, а ответ любого рода — уже измерение.
-check("перебор прекращается на первом ответе", "return True" in _sp70
-      and "Перебор прекращаю" in _sp70)
+check("перебор прекращается на ПРИНЯТОМ кадре, а не на отказе",
+      "Сервер ПРИНЯЛ" in _sp70 and "это отказ — слово не то" in _sp70)
+check("слова отказов собираются и печатаются — это их словарь",
+      "refusals" in _sp70 and "Сервер отказал так" in _sp70)
 check("молчание на все кандидаты названо НЕ доказательством отсутствия",
-      "не «подписки нет»" in _sp70)
+      'НЕ значит «подписки' in _sp70)
 check("ответы печатаются сырыми, парсер по ним здесь не пишется",
       "ОТВЕТ:" in _sp70 and "saleAction" not in _sp70)
 check("токен и здесь уходит заголовком",
@@ -5681,14 +5693,18 @@ check("режим доступен как --seetg-subscribe", "--seetg-subscribe
 
 # Проба на поддельном соединении: сервер отвечает на второй кандидат.
 class _FakeWS70:
+    """Отказывает на всё, кроме subscribe+channels — как живой сервер."""
     def __init__(self):
         self.sent, self.queue, self.closed = [], [_hello69], False
     def settimeout(self, t):
         pass
     def send(self, data):
         self.sent.append(data)
-        if '"action": "subscribe"' in data or '"action":"subscribe"' in data:
+        if "channels" in data:
             self.queue.append('{"type":"subscribed","events":["sale"]}')
+        else:
+            self.queue.append('{"code":"bad_request",'
+                              '"message":"unknown message type","type":"error"}')
     def recv(self):
         if not self.queue:
             raise TimeoutError("timed out")
@@ -5702,9 +5718,10 @@ try:
     _f70 = _FakeWS70()
     gs._ws_connect = lambda url, headers, timeout: (_f70, None)
     check("проба подписки отработала", gs.seetg_subscribe_probe(1) is True)
-    # Остановились НА ответившем кандидате: после него ни одного кадра.
-    check("после ответа лишние кадры НЕ шлются",
-          len(_f70.sent) == 3 and "action" in _f70.sent[-1], _f70.sent)
+    # ОТКАЗЫ перебор не останавливают, а ПРИНЯТЫЙ кадр — останавливает:
+    # после него ни одного лишнего.
+    check("отказы не останавливают перебор, принятый кадр останавливает",
+          len(_f70.sent) == 3 and "channels" in _f70.sent[-1], _f70.sent)
     check("соединение закрыто", _f70.closed is True)
 finally:
     gs._ws_connect, gs.SEETG_TOKEN = _ows70, _otok70
