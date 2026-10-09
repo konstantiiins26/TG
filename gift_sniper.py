@@ -4638,6 +4638,118 @@ SEETG_FRAMES_FILE = os.getenv("SEETG_FRAMES_FILE", "seetg-frames.jsonl")
 _WS_SUBSCRIBE = {"type": "subscribe", "events": ["sale"]}
 
 
+# СДЕЛКОЙ СЧИТАЕТСЯ НЕ ВСЁ, ЧТО ПРИШЛО СОБЫТИЕМ `sale`. Измерено на 116
+# живых кадрах 09.10.2026: `sale_kind` бывает `purchase` (94), `sale` (20)
+# и `lucky_buy_win` (2). Последнее — выигрыш в «счастливой покупке» на
+# portals, то есть цена ПРИЗА, а не то, что кто-то заплатил за предмет на
+# витрине. Что именно она означает, не измерено, поэтому в среднюю она не
+# идёт, но СЧИТАЕТСЯ отдельно: выбросить молча значило бы потерять факт.
+_SALE_KINDS_REAL = ("purchase", "sale")
+
+
+def seetg_sale_from_frame(obj: dict):
+    """
+    Разбирает кадр потока в сделку. (запись | None, причина пропуска).
+
+    РАЗБОР НАПИСАН ПО 116 ЖИВЫМ КАДРАМ, а не по памяти. Дословная форма:
+
+        {"type":"event","event":"sale","at":"2026-10-09T08:20:25.9+00:00",
+         "market":"portals","price":{"amount":22000000000,"currency":"gram"},
+         "price_ton":22000000000,"sale_kind":"purchase","gift":{...}}
+
+    ТРИ ВЕЩИ, КАЖДАЯ ПРОТИВ КОНКРЕТНОЙ ОШИБКИ:
+
+    1. **Цена лежит РЯДОМ с `gift`, а не внутри него.** Внутри `gift` есть
+       `resellAmountTon`, и у сделок с mrkt и tonnel он равен нулю —
+       прочитать цену оттуда значило бы получить ноль там, где заплатили
+       22 TON. Поэтому берётся только верхний уровень.
+    2. **`price_ton` ВОПРЕКИ ИМЕНИ В НАНОТОНАХ.** 22000000000 — это 22 TON,
+       а не 22 миллиарда. Имя поля обещает одно, значение другое, и это
+       ровно тот стык слоёв, на котором проект уже ломался (своя форма
+       адреса у API и у витрины). Делим на 1e9 через общий `_nano_to_ton`.
+    3. **Сходимость, а не доверие:** во всех 116 кадрах `price.amount`
+       равнялось `price_ton`. Если они разойдутся, значит одно из них
+       означает не то, что мы думаем, — запись ПРОПУСКАЕТСЯ с причиной,
+       а не берётся наугад.
+    """
+    if not isinstance(obj, dict) or obj.get("type") != "event" \
+            or obj.get("event") != "sale":
+        return None, "не событие продажи"
+    price = obj.get("price")
+    if not isinstance(price, dict):
+        return None, "нет блока price"
+    cur = str(price.get("currency", "")).lower()
+    if cur not in ("gram", "ton"):
+        # Звёзды и USDT пропускаем: курса у нас нет, а выдумать его значит
+        # придумать цену. То же правило, что у `saleInfo`.
+        return None, f"валюта {cur or '?'} — не TON"
+    amount, pton = price.get("amount"), obj.get("price_ton")
+    if pton is not None and str(amount) != str(pton):
+        return None, (f"price.amount {amount} != price_ton {pton} — "
+                      f"поля означают разное, пропускаю")
+    ton = _nano_to_ton(amount)
+    if ton is None or ton <= 0:
+        return None, f"цена не разобрана: {amount!r}"
+
+    gift = obj.get("gift") if isinstance(obj.get("gift"), dict) else {}
+    det = gift.get("details") if isinstance(gift.get("details"), dict) else {}
+    pick = lambda k: (det.get(k) or gift.get(k))
+    name = lambda v: (v.get("name") if isinstance(v, dict) else None)
+    est = det.get("estimate") if isinstance(det.get("estimate"), dict) else {}
+    slug = pick("slug")
+    if not slug:
+        return None, "в кадре нет слага коллекции"
+    return {
+        "slug": str(slug),
+        "num": pick("num"),
+        "model": name(pick("model")),
+        "backdrop": name(pick("backdrop")),
+        "pattern": name(pick("pattern")),
+        "market": obj.get("market"),
+        "price_ton": ton,
+        "sale_kind": str(obj.get("sale_kind") or ""),
+        # ИХ оценка кладётся рядом НЕ как истина, а чтобы потом сравнить её
+        # с настоящей ценой: чужая оценка принимается только по сходимости.
+        "estimate_ton": est.get("ton"),
+        "at_iso": obj.get("at"),
+    }, ""
+
+
+def record_sale(sale: dict) -> bool:
+    """Пишет сделку в БД. False — такая уже есть (повтор при переподключении)."""
+    with db_connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO sales (slug, num, model, backdrop, pattern,"
+            " market, price_ton, sale_kind, estimate_ton, at_iso, seen_ts)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (sale["slug"], sale.get("num"), sale.get("model"),
+             sale.get("backdrop"), sale.get("pattern"), sale.get("market"),
+             str(sale["price_ton"]), sale.get("sale_kind"),
+             (str(sale["estimate_ton"]) if sale.get("estimate_ton") is not None
+              else None),
+             sale.get("at_iso"), time.time()))
+        return cur.rowcount > 0
+
+
+def known_seetg_slugs() -> dict:
+    """
+    Слаги НАШИХ коллекций из БД: {слаг: адрес}. Доказаны `seetg_prove_slug()`.
+
+    Зачем фильтр вообще. Поток — это ВЕСЬ рынок: в пробе 116 сделок пришли
+    по 20+ коллекциям, из которых наши единицы. Складывать к себе всё
+    значило бы собирать копию их базы, а это ровно то, что их правила
+    называют основанием для блокировки аккаунта целиком. Нам нужен ответ
+    про СВОИ коллекции — его и копим.
+    """
+    out = {}
+    with db_connect() as conn:
+        for row in conn.execute(
+                "SELECT key, value FROM meta WHERE key LIKE 'seetg_slug:%'"):
+            if row["value"]:
+                out[str(row["value"])] = row["key"].split(":", 1)[1]
+    return out
+
+
 def seetg_listen_capture(seconds: int = 0, events: str = "") -> bool:
     """
     `--seetg-listen [СЕК]` — записать кадры ЦЕЛИКОМ, чтобы найти цену сделки.
@@ -4759,6 +4871,197 @@ def seetg_listen_capture(seconds: int = 0, events: str = "") -> bool:
                     "ничего не происходило. Попробуйте дольше или добавьте "
                     "события: --seetg-listen 120 sale,listing,price")
     return fh_ok
+
+
+def seetg_watch_sales(seconds: int = 0) -> bool:
+    """
+    `--seetg-watch [СЕК]` — слушать поток и копить ЦЕНЫ СДЕЛОК по СВОИМ
+    коллекциям.
+
+    Это ответ на вопрос, который в проекте стоял с первого дня и не имел
+    источника: **сколько за модель ПЛАТЯТ**, а не сколько просят. Всё
+    остальное — `--premium`, `--numbers`, floor'ы, лестница — это цены
+    просьбы, и разница между ними и есть неликвид.
+
+    ПОЧЕМУ ЭТО ЗАКОННО, а `/history` пачками — нет. Поток это ПОДПИСКА:
+    сервер сам шлёт то, что происходит. Выгрузка историй сотен предметов —
+    массовый парсинг, и их правила называют его основанием для блокировки
+    аккаунта целиком. Поэтому здесь: подписка на одно событие (`sale`),
+    запись ТОЛЬКО по своим коллекциям, только поля для вопроса о цене.
+
+    ПЕРЕПОДКЛЮЧЕНИЕ ОБЯЗАТЕЛЬНО, и с выдержкой: соединение рвётся, а
+    молча прекратить слушать значило бы потерять часы наблюдения и не
+    сказать об этом. Повторы при этом не страшны — `record_sale()`
+    отбрасывает их по UNIQUE.
+    """
+    if not SEETG_TOKEN:
+        log.error(f"{_Color.RED}SEETG_TOKEN не задан{_Color.RESET}")
+        return False
+    seconds = int(seconds or 3600)
+    slugs = known_seetg_slugs()
+    if not slugs:
+        # МОЛЧА СКЛАДЫВАТЬ ВСЁ ПОДРЯД НЕЛЬЗЯ: это копия их базы, а не ответ
+        # на наш вопрос. И тихо писать ноль тоже нельзя — владелец решил бы,
+        # что сделок нет.
+        log.error(f"{_Color.RED}Слаги наших коллекций не доказаны — писать "
+                  f"нечего.{_Color.RESET} Сначала один раз: "
+                  f"deploy\\run.bat --seetg-arb (он докажет слаги и "
+                  f"запомнит их в БД).")
+        return False
+    log.info(f"Слушаю сделки по {len(slugs)} своим коллекциям {seconds}с: "
+             f"{', '.join(sorted(slugs))}")
+
+    started, saved, dup, foreign, skipped, lucky = time.time(), 0, 0, 0, 0, 0
+    reasons, by_slug = {}, {}
+    attempt = 0
+    while time.time() - started < seconds:
+        ws, why = _ws_connect(SEETG_WS_URL,
+                              [f"Authorization: Bearer {SEETG_TOKEN}"],
+                              timeout=20)
+        if ws is None:
+            attempt += 1
+            pause = min(60.0, 2.0 ** attempt)
+            log.warning(f"Поток не открылся ({why}); повтор через {pause:.0f}с")
+            if time.time() - started + pause >= seconds:
+                break
+            time.sleep(pause)
+            continue
+        attempt = 0
+        ticked = 0.0
+        try:
+            ws.send(json.dumps(dict(_WS_SUBSCRIBE, events=["sale"])))
+            while time.time() - started < seconds:
+                try:
+                    left = started + seconds - time.time()
+                    if left <= 0:
+                        break
+                    ws.settimeout(min(_WS_TICK_SEC, max(1.0, left)))
+                    frame = ws.recv()
+                except Exception as e:                 # noqa: BLE001
+                    if "timeout" not in type(e).__name__.lower():
+                        log.warning(f"Соединение прервалось: "
+                                    f"{type(e).__name__}: {e}")
+                        break
+                    now = time.time()
+                    if now - max(ticked, started) >= _WS_TICK_SEC:
+                        ticked = now
+                        log.info(f"  …слушаю {now - started:.0f}с из "
+                                 f"{seconds}, записано {saved}")
+                    continue
+                try:
+                    obj = json.loads(frame)
+                except Exception:                      # noqa: BLE001
+                    continue
+                sale, why2 = seetg_sale_from_frame(obj)
+                if sale is None:
+                    if isinstance(obj, dict) and obj.get("event") == "sale":
+                        skipped += 1
+                        reasons[why2] = reasons.get(why2, 0) + 1
+                    continue
+                if sale["slug"] not in slugs:
+                    foreign += 1          # чужая коллекция — не наше дело
+                    continue
+                if sale["sale_kind"] not in _SALE_KINDS_REAL:
+                    lucky += 1
+                    log.info(f"{_Color.GREY}  «{sale['slug']}-{sale['num']}» "
+                             f"{sale['price_ton']} TON — вид сделки "
+                             f"«{sale['sale_kind']}», в среднюю не идёт"
+                             f"{_Color.RESET}")
+                    continue
+                if record_sale(sale):
+                    saved += 1
+                    by_slug[sale["slug"]] = by_slug.get(sale["slug"], 0) + 1
+                    est = sale.get("estimate_ton")
+                    log.info(f"{_Color.GREEN}СДЕЛКА{_Color.RESET} "
+                             f"{sale['slug']}-{sale['num']} "
+                             f"«{sale.get('model')}» {sale['price_ton']} TON "
+                             f"на {sale['market']}"
+                             + (f" | их оценка {est}" if est else ""))
+                else:
+                    dup += 1
+        finally:
+            try:
+                ws.close()
+            except Exception:                          # noqa: BLE001
+                pass
+
+    log.info(f"Записано сделок: {saved} (повторов {dup}), по коллекциям: "
+             f"{by_slug or '—'}")
+    log.info(f"Чужих коллекций в потоке: {foreign} — это весь рынок, мы "
+             f"пишем только свои")
+    if lucky:
+        log.info(f"Сделок вида не «purchase/sale»: {lucky} — в среднюю не "
+                 f"идут, потому что что они означают, не измерено")
+    for r, n in sorted(reasons.items(), key=lambda x: -x[1]):
+        log.warning(f"Не разобрано ({n}): {r}")
+    if saved:
+        log.info(f"{_Color.GREEN}Отчёт: deploy\\run.bat --sales"
+                 f"{_Color.RESET}")
+    else:
+        log.warning("Сделок по нашим коллекциям не было. Это не поломка: "
+                    "в пробе 116 сделок за 2 минуты пришлись на 20+ "
+                    "коллекций, и наши в них попадают не каждую минуту. "
+                    "Слушать надо часами, а не минутами.")
+    return True
+
+
+def sales_report(slug_filter: str = "") -> bool:
+    """
+    `--sales [СЛАГ]` — за сколько РЕАЛЬНО уходили лоты наших коллекций.
+
+    ЭТО ПЕРВЫЙ ОТЧЁТ В ПРОЕКТЕ, ПОСТРОЕННЫЙ НА ЦЕНАХ СДЕЛОК. Все прежние
+    (`--premium`, `--numbers`, `--markets`) считались по ценам ПРОСЬБЫ, и в
+    каждом стоит оговорка, что это другой вопрос. Здесь оговорка обратная:
+    это деньги, но выборка мала, пока поток не послушали достаточно долго.
+
+    Медиана, а не среднее: одна сделка «счастливой покупки» или слив за
+    0.5 TON сдвигает среднее так, что по нему нельзя решать.
+    """
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM sales" + (" WHERE slug = ?" if slug_filter else "")
+            + " ORDER BY seen_ts", (slug_filter,) if slug_filter else ()
+        ).fetchall()
+    if not rows:
+        log.warning("Сделок в базе нет. Их копит `--seetg-watch`, и это "
+                    "единственный источник цен СДЕЛОК в проекте: всё "
+                    "остальное — цены просьбы.")
+        return True
+
+    log.info(f"{_Color.BOLD}ЦЕНЫ СДЕЛОК из живого потока see.tg"
+             f"{_Color.RESET} — сколько ПЛАТЯТ, а не сколько просят")
+    log.info(f"Всего сделок: {len(rows)}")
+
+    # ПО МОДЕЛЯМ — тот вопрос, ради которого всё строилось. Сегмент с одной
+    # сделкой не усредняется: «медиана по одному» это цена одного покупателя.
+    seg = {}
+    for r in rows:
+        seg.setdefault((r["slug"], r["model"] or "—"), []).append(
+            (Decimal(r["price_ton"]),
+             Decimal(r["estimate_ton"]) if r["estimate_ton"] else None))
+    log.info("")
+    log.info(f"{'коллекция / модель':<42} {'сделок':>6} {'медиана':>10} "
+             f"{'мин':>8} {'макс':>8}  их оценка")
+    for (slug, model), vals in sorted(seg.items(), key=lambda x: -len(x[1])):
+        prices = sorted(v[0] for v in vals)
+        med = prices[len(prices) // 2]
+        ests = [v[1] for v in vals if v[1]]
+        rel = f"x{(med / (sum(ests) / len(ests))):.2f}" if ests else "—"
+        log.info(f"{(slug + ' / ' + str(model))[:42]:<42} {len(prices):>6} "
+                 f"{med:>10.3f} {prices[0]:>8.3f} {prices[-1]:>8.3f}  {rel}")
+
+    n_single = sum(1 for v in seg.values() if len(v) == 1)
+    log.info("")
+    log.info(f"Сегментов с ОДНОЙ сделкой: {n_single} из {len(seg)} — по ним "
+             f"медиана это цена одного покупателя, а не рынок.")
+    log.info("Колонка «их оценка» — отношение нашей медианы к ИХ `estimate`. "
+             "Около 1.00 значит, что их оценка сходится с деньгами; это и "
+             "есть проверка, после которой её можно будет использовать.")
+    log.info(f"{_Color.YELLOW}ЧЕГО ЭТО ЕЩЁ НЕ ДАЁТ:{_Color.RESET} права "
+             f"поднять `PREMIUM_MULT`. Для этого надо сравнить сделки по "
+             f"РЕДКОМУ трейту с обычными в той же коллекции, а для такого "
+             f"сравнения сделок пока мало.")
+    return True
 
 
 def seetg_subscribe_probe(wait_sec: int = 0) -> bool:
@@ -5780,6 +6083,33 @@ def db_init():
         """)
         # Смещение getUpdates обязано пережить перезапуск: иначе бот заново
         # проглотит старые нажатия и откроет позиции повторно.
+        # СДЕЛКИ ИЗ ЖИВОГО ПОТОКА see.tg. Это ответ на вопрос «сколько
+        # ПЛАТЯТ», которого в проекте не было никогда: всё остальное — цены
+        # просьбы. Копим ТОЛЬКО по своим коллекциям и только поля, нужные
+        # для этого вопроса: их правила запрещают выкачивать базу, а
+        # подписка на свои коллекции — не выгрузка.
+        #
+        # UNIQUE спасает от повторов при переподключении: поток может
+        # прислать то же событие снова, а дважды засчитанная сделка
+        # сдвинула бы медиану.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sales (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug        TEXT NOT NULL,
+                num         INTEGER,
+                model       TEXT,
+                backdrop    TEXT,
+                pattern     TEXT,
+                market      TEXT,
+                price_ton   TEXT NOT NULL,
+                sale_kind   TEXT,
+                estimate_ton TEXT,
+                at_iso      TEXT,
+                seen_ts     REAL NOT NULL,
+                UNIQUE(slug, num, at_iso, price_ton)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_slug ON sales(slug)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
@@ -9314,6 +9644,12 @@ def parse_args(argv=None):
                         help="арбитраж маркетов по МОДЕЛЯМ по данным see.tg: "
                              "где модель дешевле и где дороже; ничего не "
                              "покупает")
+    parser.add_argument("--seetg-watch", nargs="?", const=0, type=int,
+                        metavar="SEC",
+                        help="слушать поток и копить ЦЕНЫ СДЕЛОК по своим "
+                             "коллекциям (сколько ПЛАТЯТ, а не просят)")
+    parser.add_argument("--sales", nargs="?", const="", metavar="SLUG",
+                        help="отчёт по накопленным ценам СДЕЛОК")
     parser.add_argument("--seetg-listen", nargs="*", metavar="SEC EVENTS",
                         help="слушать поток и писать кадры ЦЕЛИКОМ в файл "
                              "(ищем, где лежит цена сделки); ничего не "
@@ -9394,6 +9730,10 @@ if __name__ == "__main__":
         if getattr(args, "seetg_find", False):
             # Ходит в сеть, НИЧЕГО не покупает и в запись не пишет.
             sys.exit(0 if seetg_find_report() else 1)
+        if getattr(args, "seetg_watch", None) is not None:
+            sys.exit(0 if seetg_watch_sales(args.seetg_watch) else 1)
+        if getattr(args, "sales", None) is not None:
+            sys.exit(0 if sales_report(args.sales) else 1)
         if getattr(args, "seetg_listen", None) is not None:
             _a = list(args.seetg_listen or [])
             _sec = int(_a[0]) if _a and _a[0].isdigit() else 0

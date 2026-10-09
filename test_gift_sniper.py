@@ -5802,6 +5802,111 @@ finally:
         _ofile71, _otok71, _ows71)
 
 # =============================================================================
+# [71] ЦЕНЫ СДЕЛОК ИЗ ПОТОКА. Кадры ДОСЛОВНЫЕ, из 116 живых событий,
+# присланных владельцем 09.10.2026. Разбор написан по ним, а не по памяти.
+# =============================================================================
+print("\n[71] Сделки из потока: цена рядом с gift и в нанотонах")
+
+_sale71 = json.loads('{"type": "event", "event": "sale", "at": "2026-10-09T08'
+    ':20:27.682444+00:00", "market": "portals", "price": {"amount": 500000000,'
+    ' "currency": "gram"}, "price_ton": 500000000, "sale_kind": "purchase", "g'
+    'ift": {"id": 5848429011021071715, "num": 3391, "slug": "SnakeBox", "resel'
+    'lAmountTon": "0", "details": {"slug": "SnakeBox", "num": 3391, "model": {"'
+    'name": "Bento", "rarityPermille": 6}, "backdrop": {"name": "Coral Red", "r'
+    'arityPermille": 10}, "pattern": {"name": "Turban", "rarityPermille": 10}, '
+    '"giftId": "6023679164349940429", "estimate": {"ton": 3.425569105, "backdro'
+    'pMult": 1}}}}')
+_lucky71 = json.loads('{"type": "event", "event": "sale", "at": "2026-10-09T08'
+    ':21:48.188014+00:00", "market": "portals", "price": {"amount": 4320000000,'
+    ' "currency": "gram"}, "price_ton": 4320000000, "sale_kind": "lucky_buy_win'
+    '", "gift": {"num": 183808, "slug": "PetSnake", "resellAmountTon": "0", "de'
+    'tails": {"slug": "PetSnake", "num": 183808, "model": {"name": "Sketchy"}}}}')
+
+_s71, _why71 = gs.seetg_sale_from_frame(_sale71)
+check("сделка разобрана", _s71 is not None, _why71)
+# ГЛАВНАЯ ЛОВУШКА: price_ton ВОПРЕКИ ИМЕНИ в нанотонах. 500000000 = 0.5 TON,
+# а не 500 миллионов. Имя поля обещает одно, значение другое.
+check("price_ton прочитан как НАНОТОНЫ, а не как TON",
+      _s71["price_ton"] == Decimal("0.5"), _s71["price_ton"])
+# Цена лежит РЯДОМ с gift. Внутри gift есть resellAmountTon, и он здесь "0":
+# прочитать оттуда значило бы получить ноль там, где заплатили.
+check("цена взята с верхнего уровня, а не из gift.resellAmountTon",
+      _s71["price_ton"] > 0 and _sale71["gift"]["resellAmountTon"] == "0")
+check("модель, фон и узор разобраны",
+      (_s71["model"], _s71["backdrop"], _s71["pattern"])
+      == ("Bento", "Coral Red", "Turban"), _s71)
+check("их оценка сохраняется рядом для будущей сверки",
+      str(_s71["estimate_ton"]) == "3.425569105", _s71["estimate_ton"])
+
+# Расхождение price.amount и price_ton означает, что одно из полей значит не
+# то, что мы думаем. Во всех 116 кадрах они совпали — разойдутся, пропускаем.
+_bad71, _w71 = gs.seetg_sale_from_frame(
+    dict(_sale71, price_ton=999, price={"amount": 500000000, "currency": "gram"}))
+check("расхождение price.amount и price_ton — пропуск, а не догадка",
+      _bad71 is None and "означают разное" in _w71, _w71)
+# Звёзды и USDT: курса у нас нет, выдумать его значит придумать цену.
+_st71, _w71b = gs.seetg_sale_from_frame(
+    dict(_sale71, price={"amount": 10000, "currency": "stars"}))
+check("цена не в TON пропускается", _st71 is None and "валюта" in _w71b, _w71b)
+check("листинг и прочие события сделкой не считаются",
+      gs.seetg_sale_from_frame(dict(_sale71, event="listing"))[0] is None)
+
+# lucky_buy_win — выигрыш в «счастливой покупке», а не покупка на витрине.
+# Что эта цена означает, НЕ ИЗМЕРЕНО, поэтому в среднюю она не идёт.
+_lk71, _ = gs.seetg_sale_from_frame(_lucky71)
+check("lucky_buy_win разбирается, но видом сделки отличается",
+      _lk71 is not None and _lk71["sale_kind"] == "lucky_buy_win")
+check("в среднюю идут только purchase и sale",
+      gs._SALE_KINDS_REAL == ("purchase", "sale"), gs._SALE_KINDS_REAL)
+
+_osales71 = gs.DB_PATH
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "sales71.db")
+    gs.db_init()
+    check("сделка записана", gs.record_sale(_s71) is True)
+    # Поток переподключается, и то же событие приходит снова. Дважды
+    # засчитанная сделка сдвинула бы медиану.
+    check("повтор того же события второй записи НЕ делает",
+          gs.record_sale(_s71) is False)
+    with gs.db_connect() as _c:
+        _n = _c.execute("SELECT COUNT(*) c FROM sales").fetchone()["c"]
+        _p = _c.execute("SELECT price_ton FROM sales").fetchone()["price_ton"]
+    check("в базе одна строка", _n == 1, _n)
+    # Цена лежит СТРОКОЙ: через float она потеряла бы нанотоны, ровно как в
+    # записи рынка, где цены хранятся строками намеренно.
+    check("цена хранится строкой, а не float", isinstance(_p, str) and
+          Decimal(_p) == Decimal("0.5"), _p)
+
+    # Фильтр по своим коллекциям: поток — это весь рынок (в пробе 116 сделок
+    # пришлись на 20+ коллекций). Складывать всё значило бы копить их базу.
+    check("слаги берутся из доказанных, а не из воздуха",
+          gs.known_seetg_slugs() == {})
+    gs.meta_set("seetg_slug:0:abc", "SnakeBox")
+    check("доказанный слаг виден фильтру",
+          gs.known_seetg_slugs() == {"SnakeBox": "0:abc"})
+    check("отчёт по сделкам отрабатывает", gs.sales_report() is True)
+finally:
+    gs.DB_PATH = _osales71
+
+_src72 = open("gift_sniper.py", encoding="utf-8").read()
+_w72 = _src72.split("def seetg_watch_sales")[1].split("\ndef ")[0]
+# Без доказанных слагов — отказ, а не «запишем всё и разберёмся потом».
+check("без своих слагов watch отказывается писать",
+      "Слаги наших коллекций не доказаны" in _w72)
+check("подписка идёт тем же измеренным кадром", "_WS_SUBSCRIBE" in _w72)
+check("соединение переподключается с выдержкой",
+      "2.0 ** attempt" in _w72 and "min(60.0" in _w72)
+# Молчание объясняется: в пробе 116 сделок за 2 минуты пришлись на весь
+# рынок, и наши коллекции попадают туда не каждую минуту.
+check("пустой результат назван НЕ поломкой", "не поломка" in _w72)
+_r72 = _src72.split("def sales_report")[1].split("\ndef ")[0]
+check("отчёт берёт медиану, а не среднее",
+      "медиана" in _r72 and "len(prices) // 2" in _r72)
+check("сегмент с одной сделкой назван вслух", "ОДНОЙ сделкой" in _r72)
+check("отчёт не разрешает поднимать премию",
+      "PREMIUM_MULT" in _r72 and "ЧЕГО ЭТО ЕЩЁ НЕ ДАЁТ" in _r72)
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
