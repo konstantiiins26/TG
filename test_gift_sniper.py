@@ -5906,6 +5906,42 @@ check("сегмент с одной сделкой назван вслух", "О
 check("отчёт не разрешает поднимать премию",
       "PREMIUM_MULT" in _r72 and "ЧЕГО ЭТО ЕЩЁ НЕ ДАЁТ" in _r72)
 
+# --- СХЕМА СОЗДАЁТСЯ ПРИ ЛЮБОМ ОБРАЩЕНИИ К БД (живой баг 09.10.2026) -------
+# `--seetg-watch` и `--sales` упали с «no such table: sales»: таблицу
+# добавили в db_init(), а эти режимы её не звали, и база владельца
+# существовала с прошлых запусков — то есть таблица не появлялась НИКОГДА.
+_osch = (gs.DB_PATH, gs._schema_ready_for)
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "old72.db")
+    gs.db_init()
+    with gs.db_connect() as _c:          # база «как её создавал прошлый код»
+        _c.execute("DROP TABLE sales")
+    gs._schema_ready_for = None          # процесс, который db_init() не звал
+    _tables = lambda: {r["name"] for r in gs.db_connect().execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    gs._schema_ready_for = None
+    check("на старой базе запись сделки НЕ падает",
+          gs.record_sale({"slug": "S", "num": 1, "model": "M", "backdrop": None,
+                          "pattern": None, "market": "portals",
+                          "price_ton": Decimal("3.41"), "sale_kind": "purchase",
+                          "estimate_ton": None, "at_iso": "t"}) is True)
+    check("недостающая таблица создалась сама", "sales" in _tables())
+    check("отчёт на той же базе отрабатывает", gs.sales_report() is True)
+
+    # Флаг — это ПУТЬ, а не «да/нет»: иначе вторая база осталась бы пустой.
+    gs.DB_PATH = os.path.join(_tmpdir, "second72.db")
+    check("смена базы заново создаёт схему", "sales" in _tables())
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osch
+
+_src72b = open("gift_sniper.py", encoding="utf-8").read()
+_dc72 = _src72b.split("def db_connect")[1].split("\ndef ")[0]
+# Оговорка обязана жить в коде: CREATE TABLE IF NOT EXISTS добавляет только
+# ТАБЛИЦЫ. Новая КОЛОНКА в существующей таблице требует ALTER TABLE, и
+# забыть про это значит получить ту же ошибку под другим именем.
+check("ограничение миграции названо прямо в коде",
+      "ALTER TABLE" in _dc72 and "КОЛОНКА" in _dc72)
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:
