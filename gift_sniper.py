@@ -4712,6 +4712,11 @@ def seetg_sale_from_frame(obj: dict):
         # с настоящей ценой: чужая оценка принимается только по сходимости.
         "estimate_ton": est.get("ton"),
         "at_iso": obj.get("at"),
+        # ВЛАДЕЛЕЦ ЛЕЖИТ В `gift`, А НЕ В `details` — проверено по сырым
+        # кадрам, а не угадано. Он замаскирован («Po***l»), но этого хватает:
+        # у восьми «продаж» одного предмета подряд он не менялся ни разу.
+        "owner_name": gift.get("owner_name"),
+        "gift_id": (gift.get("id") or det.get("id")),
     }, ""
 
 
@@ -4720,14 +4725,17 @@ def record_sale(sale: dict) -> bool:
     with db_connect() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO sales (slug, num, model, backdrop, pattern,"
-            " market, price_ton, sale_kind, estimate_ton, at_iso, seen_ts)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " market, price_ton, sale_kind, estimate_ton, at_iso, seen_ts,"
+            " owner_name, gift_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (sale["slug"], sale.get("num"), sale.get("model"),
              sale.get("backdrop"), sale.get("pattern"), sale.get("market"),
              str(sale["price_ton"]), sale.get("sale_kind"),
              (str(sale["estimate_ton"]) if sale.get("estimate_ton") is not None
               else None),
-             sale.get("at_iso"), time.time()))
+             sale.get("at_iso"), time.time(),
+            sale.get("owner_name"),
+            (str(sale["gift_id"]) if sale.get("gift_id") is not None else None)))
         return cur.rowcount > 0
 
 
@@ -5154,6 +5162,17 @@ def sales_report(slug_filter: str = "") -> bool:
     # Урок проекта: число, по которому можно сделать неверный вывод, опаснее
     # отсутствующего, и читают его раньше оговорки.
     susp = suspicious_sales(rows)
+    # ОДИН ПРЕДСТАВИТЕЛЬ НА (предмет, цена). Повторы не выбрасываются: предмет
+    # по этой цене, похоже, ушёл один раз, и этот один раз остаётся. Выкинуть
+    # группу целиком значило бы потерять сделку, а оставить все 104 — считать
+    # её ста четырьмя. Счёт по представителям идёт РЯДОМ с полным, а не
+    # вместо него: какой из них правдивее, решают данные, а не отчёт.
+    rep_ids, seen_keys = set(), set()
+    for r in rows:
+        k = (r["slug"], r["num"], r["price_ton"])
+        if k not in seen_keys:
+            seen_keys.add(k)
+            rep_ids.add(r["id"])
 
     log.info(f"{_Color.BOLD}ЦЕНЫ СДЕЛОК из живого потока see.tg"
              f"{_Color.RESET} — сколько ПЛАТЯТ, а не сколько просят")
@@ -5165,8 +5184,8 @@ def sales_report(slug_filter: str = "") -> bool:
     for r in rows:
         seg.setdefault((r["slug"], r["model"] or "—"), []).append(r)
     log.info("")
-    log.info(f"{'коллекция / модель':<42} {'сделок':>6} {'медиана':>10} "
-             f"{'мин':>8} {'макс':>8}  их оценка")
+    log.info(f"{'коллекция / модель':<40} {'строк':>6} {'уник':>6} "
+             f"{'медиана':>9} {'уник.мед':>9} {'мин':>8} {'макс':>8}  оценка")
     seg_susp = {}
     shown, hidden, hidden_trades = 0, 0, 0
     for key, srows in sorted(seg.items(), key=lambda x: -len(x[1])):
@@ -5176,23 +5195,27 @@ def sales_report(slug_filter: str = "") -> bool:
                   for r in srows
                   if r["estimate_ton"] and Decimal(r["estimate_ton"]) > 0]
         rel = f"x{_median(ratios):.2f}" if ratios else "—"
+        uniq = [Decimal(r["price_ton"]) for r in srows if r["id"] in rep_ids]
+        umed = _median(uniq)
         bad = [r for r in srows if r["id"] in susp["ids"]]
         if bad:
-            clean = [Decimal(r["price_ton"]) for r in srows
-                     if r["id"] not in susp["ids"]]
-            seg_susp[key] = (len(bad), med, _median(clean))
+            seg_susp[key] = (len(bad), med, umed)
         mark = f" {_Color.YELLOW}!{_Color.RESET}" if bad else ""
         if shown >= _SALES_TOP_SEGMENTS:
             hidden += 1
             hidden_trades += len(prices)
             continue
         shown += 1
-        log.info(f"{(key[0] + ' / ' + str(key[1]))[:42]:<42} "
-                 f"{len(prices):>6} {med:>10.3f} {min(prices):>8.3f} "
-                 f"{max(prices):>8.3f}  {rel}{mark}")
+        log.info(f"{(key[0] + ' / ' + str(key[1]))[:40]:<40} "
+                 f"{len(prices):>6} {len(uniq):>6} {med:>9.3f} "
+                 f"{umed:>9.3f} {min(prices):>8.3f} {max(prices):>8.3f}"
+                 f"  {rel}{mark}")
 
     n_single = sum(1 for v in seg.values() if len(v) == 1)
     log.info("")
+    log.info(f"«уник» — строк, если считать каждую пару «предмет + цена» ОДИН "
+             f"раз ({len(rep_ids)} из {len(rows)}). Разрыв между колонками — "
+             f"это повторы, см. блок ниже.")
     if hidden:
         # ОГРАНИЧЕНИЕ ТОЛЬКО ПЕЧАТИ. Скрытые сегменты УЧАСТВУЮТ во всех
         # числах ниже — иначе отчёт считал бы одно, а показывал другое.
@@ -5244,8 +5267,8 @@ def sales_report(slug_filter: str = "") -> bool:
     log.info("")
     log.info(f"{_Color.BOLD}ПО МАРКЕТАМ{_Color.RESET} — где платят выше "
              f"их оценки")
-    log.info(f"  {'маркет':<14} {'сделок':>7} {'медиана':>9} "
-             f"{'цена/оценка':>12} {'подозр.':>8}")
+    log.info(f"  {'маркет':<14} {'строк':>7} {'уник':>7} {'медиана':>9} "
+             f"{'уник.мед':>9} {'цена/оценка':>12} {'подозр.':>8}")
     for market, mrows in sorted(mk.items(), key=lambda x: -len(x[1])):
         prices = [Decimal(r["price_ton"]) for r in mrows]
         ratios = [Decimal(r["price_ton"]) / Decimal(r["estimate_ton"])
@@ -5255,8 +5278,11 @@ def sales_report(slug_filter: str = "") -> bool:
         nbad = susp["by_market"].get(market, 0)
         thin = (f"  {_Color.GREY}мало{_Color.RESET}"
                 if len(mrows) < MIN_BACKTEST_TRADES else "")
-        log.info(f"  {str(market)[:14]:<14} {len(mrows):>7} "
-                 f"{_median(prices):>9.3f} {rel:>12} {nbad:>8}{thin}")
+        uniq = [Decimal(r["price_ton"]) for r in mrows if r["id"] in rep_ids]
+        log.info(f"  {str(market)[:14]:<14} {len(mrows):>7} {len(uniq):>7} "
+                 f"{_median(prices):>9.3f} "
+                 f"{(_median(uniq) if uniq else 0):>9.3f} {rel:>12} "
+                 f"{nbad:>8}{thin}")
     log.info(f"  «мало» — сделок меньше {MIN_BACKTEST_TRADES}: статистика по "
              f"такой выборке скачет от одной сделки (тот же порог и та же "
              f"причина, что у `MIN_BACKTEST_TRADES` в бэктесте).")
@@ -5290,7 +5316,7 @@ def sales_report(slug_filter: str = "") -> bool:
             was = f"{med:.3f}"
             now = f"{clean:.3f}" if clean is not None else "нечего считать"
             log.info(f"    {key[0]} / {key[1]}: медиана {was}, "
-                     f"без повторов {now} (повторов {nbad})")
+                     f"по одному на предмет {now} (повторов {nbad})")
         prof = suspicious_profile(rows, susp["ids"])
         log.info(f"  Моментов времени у повторов: {prof['stamps']} на "
                  f"{prof['rows']} строк; в самый людный момент "
@@ -6337,6 +6363,21 @@ def db_connect():
     return conn
 
 
+def _add_missing_columns(conn, table: str, cols: dict) -> None:
+    """
+    Добавляет недостающие КОЛОНКИ. `CREATE TABLE IF NOT EXISTS` их не создаёт.
+
+    Это вторая половина урока про `no such table: sales`: схема теперь
+    создаётся при любом обращении к базе, но только ТАБЛИЦЫ. Колонка,
+    дописанная в CREATE, в существующей базе не появится НИКОГДА, и ошибка
+    вылезет при первой записи — у владельца, а не в тестах.
+    """
+    have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in cols.items():
+        if name not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
 def db_init():
     """Создаёт схему, если её ещё нет. Безопасно вызывать при каждом запуске."""
     with db_connect() as conn:
@@ -6404,10 +6445,23 @@ def db_init():
                 estimate_ton TEXT,
                 at_iso      TEXT,
                 seen_ts     REAL NOT NULL,
+                owner_name  TEXT,
+                gift_id     TEXT,
                 UNIQUE(slug, num, at_iso, price_ton)
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sales_slug ON sales(slug)")
+        # НОВАЯ КОЛОНКА САМА НЕ ПОЯВИТСЯ. `CREATE TABLE IF NOT EXISTS` молча
+        # оставляет старую таблицу как есть, и у владельца база живёт с
+        # прошлых запусков — ровно так пропала таблица `sales`. Поэтому
+        # недостающие колонки добавляются явным ALTER TABLE.
+        _add_missing_columns(conn, "sales", {
+            # Владелец и id предмета из кадра. Нужны потому, что 09.10.2026
+            # половина записи оказалась повторами ОДНОГО предмета, и
+            # различить их можно только по тому, что лежит в самом кадре.
+            "owner_name": "TEXT",
+            "gift_id": "TEXT",
+        })
         conn.execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,

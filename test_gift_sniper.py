@@ -6064,8 +6064,13 @@ try:
           and "Комиссии измерены только у Getgems" in _out72)
     # Пометка обязана стоять РЯДОМ с числом: оговорку двадцатью строками
     # ниже читают после того, как вывод уже сделан.
-    check("подозрительные сегменты названы с чистой медианой",
-          "без повторов" in _out72 and "3.650" in _out72)
+    # Повтор не выбрасывается, а СЧИТАЕТСЯ ОДИН РАЗ: предмет по этой цене,
+    # похоже, ушёл однажды. Bowl of Hygeia: строки 0.5, 0.5, 3.65 дают по
+    # одному на пару «предмет+цена» -> [0.5, 3.65] -> медиана 2.075.
+    check("подозрительные сегменты названы со свёрнутой медианой",
+          "по одному на предмет" in _out72 and "2.075" in _out72)
+    check("колонка уникальных объясняет себя рядом с таблицей",
+          "«уник»" in _out72)
     check("неисправленная медиана названа намеренной",
           "НЕ ИСПРАВЛЕНА НАМЕРЕННО" in _out72)
     check("отчёт по-прежнему не разрешает поднимать премию",
@@ -6145,6 +6150,54 @@ try:
           gs._iso_seconds("не время") is None and gs._iso_seconds(None) is None)
 finally:
     gs.DB_PATH, gs._schema_ready_for = _osales74, _osch74
+
+
+# --- ВЛАДЕЛЕЦ И id ПРЕДМЕТА ИЗ КАДРА; НОВАЯ КОЛОНКА В СТАРОЙ БАЗЕ ---------
+# По сырым кадрам 09.10.2026: у восьми «продаж» PoolFloat-128385 подряд
+# совпали и цена, и id, и владелец «Po***l» — то есть это один и тот же
+# предмет в одном и том же состоянии, а не восемь переходов из рук в руки.
+# Владелец лежит в `gift`, а НЕ в `gift.details` — проверено, не угадано.
+_frame75 = {
+    "type": "event", "event": "sale",
+    "at": "2026-10-09T08:21:01.905487+00:00", "market": "portals",
+    "price": {"amount": 500000000, "currency": "gram"},
+    "price_ton": 500000000, "sale_kind": "purchase",
+    "gift": {"id": "5900012238260930601", "owner_name": "Po***l",
+             "owner_masked": True,
+             "details": {"slug": "PoolFloat", "num": 128385,
+                         "model": {"name": "Leonardo"}}},
+}
+_s75, _why75 = gs.seetg_sale_from_frame(_frame75)
+check("владелец берётся из gift, а не из details",
+      _s75 is not None and _s75["owner_name"] == "Po***l")
+check("id предмета сохраняется", _s75["gift_id"] == "5900012238260930601")
+
+_osales75, _osch75 = gs.DB_PATH, gs._schema_ready_for
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "sales75.db")
+    gs._schema_ready_for = None
+    gs.db_init()
+    # БАЗА ВЛАДЕЛЬЦА СТАРАЯ: таблица есть, новых колонок нет. CREATE TABLE
+    # IF NOT EXISTS их не добавит — нужен явный ALTER TABLE.
+    with gs.db_connect() as _c75:
+        _c75.execute("DROP TABLE sales")
+        _c75.execute("CREATE TABLE sales (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                     " slug TEXT NOT NULL, num INTEGER, model TEXT,"
+                     " backdrop TEXT, pattern TEXT, market TEXT,"
+                     " price_ton TEXT NOT NULL, sale_kind TEXT,"
+                     " estimate_ton TEXT, at_iso TEXT, seen_ts REAL NOT NULL,"
+                     " UNIQUE(slug, num, at_iso, price_ton))")
+    gs._schema_ready_for = None
+    check("запись в старую базу без колонки не падает",
+          gs.record_sale(_s75) is True)
+    with gs.db_connect() as _c75b:
+        _got75 = _c75b.execute(
+            "SELECT owner_name, gift_id FROM sales").fetchone()
+    check("колонка добавлена и заполнена",
+          _got75["owner_name"] == "Po***l"
+          and _got75["gift_id"] == "5900012238260930601")
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osales75, _osch75
 
 
 # =============================================================================
