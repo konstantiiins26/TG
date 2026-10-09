@@ -5297,6 +5297,45 @@ def sales_report(slug_filter: str = "") -> bool:
              "однажды было 0.45 TON. Разница в цене — ещё не разница на "
              "руки.")
 
+    # ОДНИ И ТЕ ЖЕ МОДЕЛИ НА РАЗНЫХ МАРКЕТАХ — единственный способ отличить
+    # «там платят больше» от «там продаётся другое». Таблица выше сравнивает
+    # маркеты по ВСЕМ их сделкам, то есть вместе с составом: если на дорогом
+    # маркете чаще торгуют дорогими моделями, он окажется дороже, ничего не
+    # говоря о спросе. Здесь каждая модель сравнивается САМА С СОБОЙ.
+    bymm = {}
+    for r in rows:
+        if r["id"] not in rep_ids:
+            continue
+        bymm.setdefault((r["slug"], r["model"] or "—"), {}).setdefault(
+            r["market"] or _UNKNOWN_MARKET, []).append(Decimal(r["price_ton"]))
+    pair_ratios = {}
+    for mk in bymm.values():
+        if len(mk) < 2:
+            continue              # модель видели только на одном маркете
+        for market, prices in mk.items():
+            others = [p for m2, ps in mk.items() if m2 != market for p in ps]
+            base = _median(others)
+            if base and base > 0:
+                pair_ratios.setdefault(market, []).append(
+                    _median(prices) / base)
+    if pair_ratios:
+        log.info("")
+        log.info(f"{_Color.BOLD}ТА ЖЕ МОДЕЛЬ НА РАЗНЫХ МАРКЕТАХ{_Color.RESET}"
+                 f" — платят больше или продают другое")
+        log.info(f"  {'маркет':<14} {'моделей':>8} {'к той же модели':>16}")
+        for market, rr in sorted(pair_ratios.items(), key=lambda x: -len(x[1])):
+            thin = (f"  {_Color.GREY}мало{_Color.RESET}"
+                    if len(rr) < MIN_BACKTEST_TRADES else "")
+            log.info(f"  {str(market)[:14]:<14} {len(rr):>8} "
+                     f"{('x' + format(_median(rr), '.3f')):>16}{thin}")
+        log.info("  Считается по моделям, которые продавались НА ДВУХ И "
+                 "БОЛЕЕ маркетах: цена модели на этом маркете делится на её "
+                 "же цену на остальных. Состав по моделям так исключён.")
+        log.info(f"  {_Color.YELLOW}ЧЕГО ЭТО НЕ ИСКЛЮЧАЕТ:{_Color.RESET} "
+                 f"состав ВНУТРИ модели. Фон и узор у лотов разные, и если "
+                 f"на одном маркете чаще уходят редкие фоны, он окажется "
+                 f"дороже по этой причине, а не по спросу.")
+
     if susp["ids"]:
         log.info("")
         log.info(f"{_Color.YELLOW}ПОДОЗРИТЕЛЬНЫЕ СТРОКИ: {len(susp['ids'])} "

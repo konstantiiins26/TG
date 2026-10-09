@@ -6200,6 +6200,47 @@ finally:
     gs.DB_PATH, gs._schema_ready_for = _osales75, _osch75
 
 
+# --- ТА ЖЕ МОДЕЛЬ НА РАЗНЫХ МАРКЕТАХ (09.10.2026) -------------------------
+# Таблица по маркетам сравнивает их по ВСЕМ сделкам, то есть вместе с
+# составом: маркет, где чаще торгуют дорогими моделями, окажется дороже,
+# ничего не сказав о спросе. Поэтому модель сравнивается сама с собой.
+_osales76, _osch76 = gs.DB_PATH, gs._schema_ready_for
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "sales76.db")
+    gs._schema_ready_for = None
+    # «Rich» продаётся только на getgems и стоит дорого — если бы состав не
+    # исключался, getgems вышел бы дорогим из-за неё одной.
+    for _k in range(3):
+        gs.record_sale(_sale72("C", 500 + _k, "Rich", "getgems", "50",
+                               "50", at=f"r{_k}"))
+    # «Common» продаётся на обоих: 5.0 на getgems против 4.0 на mrkt.
+    for _k in range(3):
+        gs.record_sale(_sale72("C", 600 + _k, "Common", "getgems", "5.0",
+                               "5.0", at=f"g{_k}"))
+        gs.record_sale(_sale72("C", 700 + _k, "Common", "mrkt", "4.0",
+                               "4.0", at=f"m{_k}"))
+    _h76 = _Collect72()
+    gs.log.addHandler(_h76)
+    try:
+        gs.sales_report()
+    finally:
+        gs.log.removeHandler(_h76)
+    _out76 = "\n".join(_h76.lines)
+    check("сравнение той же модели напечатано",
+          "ТА ЖЕ МОДЕЛЬ НА РАЗНЫХ МАРКЕТАХ" in _out76)
+    # 5.0 / 4.0 = 1.25 у getgems и 0.8 у mrkt, и ТОЛЬКО по «Common»:
+    # модель, виденная на одном маркете, в сравнение не идёт вовсе.
+    _gg76 = next((l for l in _h76.lines if "getgems" in l and "x1.250" in l), "")
+    _mk76 = next((l for l in _h76.lines if "mrkt" in l and "x0.800" in l), "")
+    check("дорогая модель с одного маркета в сравнение не попала",
+          bool(_gg76) and " 1 " in _gg76)
+    check("обратная сторона посчитана симметрично", bool(_mk76))
+    check("состав внутри модели назван как неисключённый",
+          "состав ВНУТРИ модели" in _out76)
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osales76, _osch76
+
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:
