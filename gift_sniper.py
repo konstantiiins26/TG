@@ -5302,39 +5302,57 @@ def sales_report(slug_filter: str = "") -> bool:
     # маркеты по ВСЕМ их сделкам, то есть вместе с составом: если на дорогом
     # маркете чаще торгуют дорогими моделями, он окажется дороже, ничего не
     # говоря о спросе. Здесь каждая модель сравнивается САМА С СОБОЙ.
-    bymm = {}
-    for r in rows:
-        if r["id"] not in rep_ids:
-            continue
-        bymm.setdefault((r["slug"], r["model"] or "—"), {}).setdefault(
-            r["market"] or _UNKNOWN_MARKET, []).append(Decimal(r["price_ton"]))
-    pair_ratios = {}
-    for mk in bymm.values():
-        if len(mk) < 2:
-            continue              # модель видели только на одном маркете
-        for market, prices in mk.items():
-            others = [p for m2, ps in mk.items() if m2 != market for p in ps]
-            base = _median(others)
-            if base and base > 0:
-                pair_ratios.setdefault(market, []).append(
-                    _median(prices) / base)
-    if pair_ratios:
-        log.info("")
-        log.info(f"{_Color.BOLD}ТА ЖЕ МОДЕЛЬ НА РАЗНЫХ МАРКЕТАХ{_Color.RESET}"
-                 f" — платят больше или продают другое")
-        log.info(f"  {'маркет':<14} {'моделей':>8} {'к той же модели':>16}")
-        for market, rr in sorted(pair_ratios.items(), key=lambda x: -len(x[1])):
+    def _cross_market(keyfn):
+        """Отношение цены к цене ТОГО ЖЕ набора признаков на других маркетах."""
+        groups = {}
+        for r in rows:
+            if r["id"] not in rep_ids:
+                continue
+            groups.setdefault(keyfn(r), {}).setdefault(
+                r["market"] or _UNKNOWN_MARKET, []
+            ).append(Decimal(r["price_ton"]))
+        out = {}
+        for mk in groups.values():
+            if len(mk) < 2:
+                continue          # видели только на одном маркете — не с чем
+            for market, prices in mk.items():
+                others = [p for m2, ps in mk.items() if m2 != market
+                          for p in ps]
+                base = _median(others)
+                if base and base > 0:
+                    out.setdefault(market, []).append(_median(prices) / base)
+        return out
+
+    def _print_cross(title, data, unit):
+        log.info(f"  {title}")
+        log.info(f"  {'маркет':<14} {unit:>8} {'к тому же':>12}")
+        for market, rr in sorted(data.items(), key=lambda x: -len(x[1])):
             thin = (f"  {_Color.GREY}мало{_Color.RESET}"
                     if len(rr) < MIN_BACKTEST_TRADES else "")
             log.info(f"  {str(market)[:14]:<14} {len(rr):>8} "
-                     f"{('x' + format(_median(rr), '.3f')):>16}{thin}")
-        log.info("  Считается по моделям, которые продавались НА ДВУХ И "
-                 "БОЛЕЕ маркетах: цена модели на этом маркете делится на её "
-                 "же цену на остальных. Состав по моделям так исключён.")
-        log.info(f"  {_Color.YELLOW}ЧЕГО ЭТО НЕ ИСКЛЮЧАЕТ:{_Color.RESET} "
-                 f"состав ВНУТРИ модели. Фон и узор у лотов разные, и если "
-                 f"на одном маркете чаще уходят редкие фоны, он окажется "
-                 f"дороже по этой причине, а не по спросу.")
+                     f"{('x' + format(_median(rr), '.3f')):>12}{thin}")
+
+    by_model = _cross_market(lambda r: (r["slug"], r["model"] or "—"))
+    # ВТОРОЙ УРОВЕНЬ — та же модель И ТОТ ЖЕ ФОН. Сравнение по модели
+    # исключает состав по моделям, но не внутри: если на дорогом маркете
+    # чаще уходят редкие фоны, он окажется дороже по составу, а не по
+    # спросу. Выборка тут меньше, зато утверждение сильнее.
+    by_back = _cross_market(lambda r: (r["slug"], r["model"] or "—",
+                                       r["backdrop"] or "—"))
+    if by_model:
+        log.info("")
+        log.info(f"{_Color.BOLD}ТО ЖЕ САМОЕ НА РАЗНЫХ МАРКЕТАХ{_Color.RESET}"
+                 f" — платят больше или продают другое")
+        _print_cross("по МОДЕЛИ:", by_model, "моделей")
+        if by_back:
+            _print_cross("по МОДЕЛИ И ФОНУ (состав исключён глубже):",
+                         by_back, "пар")
+        log.info("  Берутся наборы, продававшиеся НА ДВУХ И БОЛЕЕ маркетах: "
+                 "цена здесь делится на цену того же набора на остальных.")
+        log.info(f"  {_Color.YELLOW}ЧЕГО НЕ ИСКЛЮЧАЕТ ДАЖЕ ВТОРАЯ "
+                 f"ТАБЛИЦА:{_Color.RESET} узор и номер. И обе молчат о том, "
+                 f"КАК ДОЛГО лот ждал покупателя: медиана считается по "
+                 f"состоявшимся сделкам, а не по выставленным лотам.")
 
     if susp["ids"]:
         log.info("")
