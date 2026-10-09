@@ -5005,6 +5005,13 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
     return True
 
 
+# Сколько строк таблицы сегментов печатать. Не настройка: это вопрос того,
+# что можно прочитать глазами. За 8 часов потока приходит ~8700 сделок и
+# больше тысячи сегментов, а отчёт, который не дочитывают, не отличается от
+# неотправленного (тот же довод, что у HEARTBEAT_MIN).
+_SALES_TOP_SEGMENTS = 40
+
+
 def _median(vals: list):
     """
     Медиана. ПРИ ЧЁТНОМ ЧИСЛЕ — среднее двух серединных, а не верхняя из них.
@@ -5118,6 +5125,7 @@ def sales_report(slug_filter: str = "") -> bool:
     log.info(f"{'коллекция / модель':<42} {'сделок':>6} {'медиана':>10} "
              f"{'мин':>8} {'макс':>8}  их оценка")
     seg_susp = {}
+    shown, hidden, hidden_trades = 0, 0, 0
     for key, srows in sorted(seg.items(), key=lambda x: -len(x[1])):
         prices = [Decimal(r["price_ton"]) for r in srows]
         med = _median(prices)
@@ -5131,12 +5139,26 @@ def sales_report(slug_filter: str = "") -> bool:
                      if r["id"] not in susp["ids"]]
             seg_susp[key] = (len(bad), med, _median(clean))
         mark = f" {_Color.YELLOW}!{_Color.RESET}" if bad else ""
+        if shown >= _SALES_TOP_SEGMENTS:
+            hidden += 1
+            hidden_trades += len(prices)
+            continue
+        shown += 1
         log.info(f"{(key[0] + ' / ' + str(key[1]))[:42]:<42} "
                  f"{len(prices):>6} {med:>10.3f} {min(prices):>8.3f} "
                  f"{max(prices):>8.3f}  {rel}{mark}")
 
     n_single = sum(1 for v in seg.values() if len(v) == 1)
     log.info("")
+    if hidden:
+        # ОГРАНИЧЕНИЕ ТОЛЬКО ПЕЧАТИ. Скрытые сегменты УЧАСТВУЮТ во всех
+        # числах ниже — иначе отчёт считал бы одно, а показывал другое.
+        # Названо вслух: молча обрезанный список читается как «больше
+        # ничего нет», а это другое утверждение.
+        log.info(f"Показаны {shown} самых торгуемых сегментов из {len(seg)}. "
+                 f"Остальные {hidden} ({hidden_trades} сделок) не напечатаны "
+                 f"— в них по одной-две сделки. В СЧЁТ НИЖЕ ОНИ ВХОДЯТ; "
+                 f"посмотреть одну коллекцию целиком: `--sales СЛАГ`.")
     log.info(f"Сегментов с ОДНОЙ сделкой: {n_single} из {len(seg)} — по ним "
              f"медиана это цена одного покупателя, а не рынок.")
 

@@ -6073,6 +6073,37 @@ try:
 finally:
     gs.DB_PATH, gs._schema_ready_for = _osales72, _osch72
 
+# --- ДЛИННАЯ ТАБЛИЦА ОБРЕЗАЕТСЯ, НО СЧЁТ ИДЁТ ПО ВСЕМУ (09.10.2026) --------
+# Восемь часов потока дали 8701 сделку и больше тысячи сегментов. Отчёт на
+# тысячу строк не дочитывают, а недочитанный не отличается от неотправленного.
+# Обрезается ПЕЧАТЬ: числа ниже обязаны считаться по всем строкам, иначе
+# отчёт показывал бы одно, а считал другое.
+_osales73, _osch73 = gs.DB_PATH, gs._schema_ready_for
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "sales73.db")
+    gs._schema_ready_for = None
+    for _i in range(45):
+        gs.record_sale(_sale72("BigColl", 1000 + _i, f"Model{_i}", "portals",
+                               "5.0", "5.0", at=f"t{_i}"))
+    _h73 = _Collect72()
+    gs.log.addHandler(_h73)
+    try:
+        gs.sales_report()
+    finally:
+        gs.log.removeHandler(_h73)
+    _out73 = "\n".join(_h73.lines)
+    check("длинная таблица обрезана по числу сегментов",
+          f"Показаны {gs._SALES_TOP_SEGMENTS}" in _out73)
+    # Молча обрезанный список читается как «больше ничего нет».
+    check("скрытые сегменты названы числом", "Остальные 5" in _out73)
+    _mk73 = next((l for l in _h73.lines
+                  if "portals" in l and " 45 " in l), "")
+    check("скрытые сегменты ВХОДЯТ в счёт по маркетам", bool(_mk73))
+    check("скрытые сегменты входят в общий счёт", "Всего сделок: 45" in _out73)
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osales73, _osch73
+
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:
