@@ -6104,6 +6104,49 @@ finally:
     gs.DB_PATH, gs._schema_ready_for = _osales73, _osch73
 
 
+# --- ЧТО ИМЕННО ПОВТОРЯЕТСЯ: ПАЧКА ИЛИ РЫНОК (09.10.2026) -----------------
+# Восьмичасовой прогон дал 4707 повторов из 9275 строк, и они легли на
+# portals (4272) при нуле у getgems и tonnel. Повтор на уровне транспорта
+# бьёт по всем маркетам одинаково, поэтому вопрос решается измерением:
+# сколько РАЗНЫХ моментов времени приходится на эти строки.
+_osales74, _osch74 = gs.DB_PATH, gs._schema_ready_for
+try:
+    # ПАЧКА: восемь предметов, два одинаковых момента времени на всех.
+    gs.DB_PATH = os.path.join(_tmpdir, "sales74a.db")
+    gs._schema_ready_for = None
+    for _i in range(8):
+        for _k in range(2):
+            gs.record_sale(_sale72("Batch", 100 + _i, "M", "portals", "3.8",
+                                   "3.8", at=f"2026-10-09T10:0{_k}:00+00:00"))
+    with gs.db_connect() as _c74:
+        _rows74 = _c74.execute("SELECT * FROM sales").fetchall()
+    _s74 = gs.suspicious_sales(_rows74)
+    _p74 = gs.suspicious_profile(_rows74, _s74["ids"])
+    check("пачка видна по числу моментов времени",
+          _p74["rows"] == 16 and _p74["stamps"] == 2 and _p74["busiest"] == 8)
+
+    # РЫНОК: один предмет, у каждого повтора своё время с шагом 300с.
+    gs.DB_PATH = os.path.join(_tmpdir, "sales74b.db")
+    gs._schema_ready_for = None
+    for _k in range(5):
+        gs.record_sale(_sale72("Mkt", 7, "M", "portals", "3.8", "3.8",
+                               at=f"2026-10-09T10:{_k * 5:02d}:00+00:00"))
+    with gs.db_connect() as _c74b:
+        _rows74b = _c74b.execute("SELECT * FROM sales").fetchall()
+    _s74b = gs.suspicious_sales(_rows74b)
+    _p74b = gs.suspicious_profile(_rows74b, _s74b["ids"])
+    check("у отдельных событий своё время у каждого",
+          _p74b["stamps"] == 5 and _p74b["busiest"] == 1)
+    # Шаг между повторами — то, что отличает механику от рынка.
+    check("шаг между повторами измерен",
+          gs._median(_p74b["gaps"]) == 300 and _p74b["top_n"] == 5)
+    # Неразобранное время не роняет отчёт и не выдумывает секунды.
+    check("непонятное время даёт None, а не ноль",
+          gs._iso_seconds("не время") is None and gs._iso_seconds(None) is None)
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osales74, _osch74
+
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:

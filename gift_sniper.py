@@ -5083,6 +5083,49 @@ def suspicious_sales(rows: list) -> dict:
             "by_market": by_market}
 
 
+def _iso_seconds(value):
+    """Время события в секундах, или None. Форму их `at` не угадываем."""
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def suspicious_profile(rows: list, ids: set) -> dict:
+    """
+    ЧТО ИМЕННО повторяется — измерение, отвечающее на «это мы или они».
+
+    Повтор на уровне транспорта (наше переподключение, их переотправка
+    пачкой) бьёт по ВСЕМ маркетам одинаково и сажает много строк на ОДИН
+    момент времени. Поведение одного маркета — наоборот: строки
+    сосредоточены у него, а времена у них разные.
+
+    Поэтому считаются три вещи, и все три — наблюдаемые:
+    число РАЗНЫХ моментов времени против числа строк, разбивка по виду
+    сделки, и шаг между повторами у самого частого предмета. Ровный шаг
+    означает механику, неровный — рынок.
+    """
+    sus = [r for r in rows if r["id"] in ids]
+    stamps, kinds, per_item = {}, {}, {}
+    for r in sus:
+        stamps[r["at_iso"]] = stamps.get(r["at_iso"], 0) + 1
+        kinds[r["sale_kind"] or "—"] = kinds.get(r["sale_kind"] or "—", 0) + 1
+        per_item.setdefault((r["slug"], r["num"]), []).append(r["at_iso"])
+    top_key, gaps, span = None, [], None
+    if per_item:
+        top_key = max(per_item, key=lambda k: len(per_item[k]))
+        secs = sorted(x for x in (_iso_seconds(v) for v in per_item[top_key])
+                      if x is not None)
+        gaps = [b - a for a, b in zip(secs, secs[1:])]
+        if secs:
+            span = secs[-1] - secs[0]
+    return {"rows": len(sus), "stamps": len(stamps),
+            "busiest": (max(stamps.values()) if stamps else 0),
+            "kinds": kinds, "top_key": top_key,
+            "top_n": (len(per_item[top_key]) if top_key else 0),
+            "gaps": gaps, "span": span}
+
+
 def sales_report(slug_filter: str = "") -> bool:
     """
     `--sales [СЛАГ]` — за сколько РЕАЛЬНО уходили лоты наших коллекций.
@@ -5248,6 +5291,31 @@ def sales_report(slug_filter: str = "") -> bool:
             now = f"{clean:.3f}" if clean is not None else "нечего считать"
             log.info(f"    {key[0]} / {key[1]}: медиана {was}, "
                      f"без повторов {now} (повторов {nbad})")
+        prof = suspicious_profile(rows, susp["ids"])
+        log.info(f"  Моментов времени у повторов: {prof['stamps']} на "
+                 f"{prof['rows']} строк; в самый людный момент "
+                 f"{prof['busiest']}.")
+        log.info("   Много строк на ОДНОМ моменте — это переотправка пачкой "
+                 "(наша или их). Своё время у каждой строки — значит сервер "
+                 "присылал их как отдельные события.")
+        log.info("  По виду сделки: " + ", ".join(
+            f"{k} {n}" for k, n in sorted(prof["kinds"].items(),
+                                          key=lambda x: -x[1])))
+        log.info("  По маркетам: " + ", ".join(
+            f"{m} {n}" for m, n in sorted(susp["by_market"].items(),
+                                          key=lambda x: -x[1])))
+        log.info("   Повтор на уровне транспорта бьёт по ВСЕМ маркетам "
+                 "одинаково. Перекос в один маркет значит, что это его "
+                 "поведение, а не наша поломка.")
+        if prof["gaps"]:
+            g = sorted(prof["gaps"])
+            log.info(f"  Чаще всех повторялся {prof['top_key'][0]}-"
+                     f"{prof['top_key'][1]}: {prof['top_n']} раз за "
+                     f"{(prof['span'] or 0) / 3600:.1f}ч, шаг между "
+                     f"повторами медиана {_median(g):.0f}с "
+                     f"(от {g[0]:.0f} до {g[-1]:.0f}).")
+            log.info("   Ровный шаг — механика (что-то повторяется по "
+                     "часам). Разброс от секунд до минут — похоже на рынок.")
         log.info(f"  {_Color.BOLD}МЕДИАНА В ТАБЛИЦЕ НЕ ИСПРАВЛЕНА НАМЕРЕННО."
                  f"{_Color.RESET} Выбросить дешёвые строки значит ПОДНЯТЬ "
                  f"медиану, то есть увеличить расчётную выручку — "
