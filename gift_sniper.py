@@ -5005,6 +5005,77 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
     return True
 
 
+def _median(vals: list):
+    """
+    Медиана. ПРИ ЧЁТНОМ ЧИСЛЕ — среднее двух серединных, а не верхняя из них.
+
+    В проекте медиану считали на месте как `sorted(x)[len(x) // 2]`, то есть
+    при чётном N брали ВЕРХНЮЮ. На выборке из двух сделок это даёт БОЛЬШУЮ
+    цену, то есть смещает оценку выручки ВВЕРХ — ровно то направление, в
+    котором теряют деньги. Здесь берётся среднее.
+    """
+    s = sorted(vals)
+    if not s:
+        return None
+    mid = len(s) // 2
+    if len(s) % 2:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2
+
+
+def _nearest_rank(vals: list, q: float):
+    """
+    Перцентиль по ближайшему рангу, БЕЗ интерполяции.
+
+    Интерполяция между двумя настоящими ценами даёт точку, по которой никто
+    ничего не выставлял и не покупал — этим проект уже один раз обжёгся
+    (floor сегмента 10.35 между лотами 4.47 и 11.00). Для отчёта нужен
+    наблюдённый край распределения, а не вычисленный.
+    """
+    s = sorted(vals)
+    if not s:
+        return None
+    return s[max(0, min(len(s) - 1, int(round((len(s) - 1) * q))))]
+
+
+def suspicious_sales(rows: list) -> dict:
+    """
+    Строки, которые не могут означать то, что в них написано.
+
+    ПРИЗНАК ИЗМЕРЕН, А НЕ ПРИДУМАН. В часовом прогоне 09.10.2026 один и тот
+    же предмет приходил несколько раз с ОДНОЙ И ТОЙ ЖЕ ценой:
+    `ChillFlame-258898 «Prometheus»` — 0.500/0.510 четыре раза,
+    `ChillFlame-15347 «Bowl of Hygeia»` — 0.500 дважды, а потом 3.650.
+
+    Предмет переходит из рук в руки ОДИН раз по данной цене. Значит одно из
+    трёх: маркет присылает событие повторно; цена в событии не цена предмета;
+    либо это плата какого-то механизма маркета — в том же прогоне `lucky_buy`
+    шёл РЯДОМ с настоящей покупкой того же предмета (0.3816 при цене 3.774).
+    Различить эти три случая нечем, поэтому строка НЕ УДАЛЯЕТСЯ, а называется.
+
+    Дедупликация БД (`UNIQUE(slug, num, at_iso, price_ton)`) их не ловит и не
+    должна: время у событий разное, то есть для базы это разные события.
+
+    Правило отбора НЕ ОПИРАЕТСЯ НА УРОВЕНЬ ЦЕНЫ. Порог «дешевле 0.5 TON»
+    был бы придуманным критерием, а повтор — наблюдаемый факт. Какие именно
+    цены повторяются, отчёт печатает отдельно, и 0.500 называет себя сам.
+    """
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["slug"], r["num"], r["price_ton"]), []).append(r)
+    ids, items, prices, by_market = set(), {}, {}, {}
+    for (slug, num, price), grp in groups.items():
+        if len(grp) < 2:
+            continue
+        for r in grp:
+            ids.add(r["id"])
+            by_market[r["market"] or "—"] = by_market.get(r["market"] or "—", 0) + 1
+        items[(slug, num)] = items.get((slug, num), 0) + len(grp)
+        prices[price] = prices.get(price, 0) + len(grp)
+    return {"ids": ids, "items": items, "prices": prices,
+            "by_market": by_market}
+
+
 def sales_report(slug_filter: str = "") -> bool:
     """
     `--sales [СЛАГ]` — за сколько РЕАЛЬНО уходили лоты наших коллекций.
@@ -5028,6 +5099,12 @@ def sales_report(slug_filter: str = "") -> bool:
                     "остальное — цены просьбы.")
         return True
 
+    # ПОДОЗРИТЕЛЬНЫЕ СЧИТАЮТСЯ ПЕРВЫМИ: таблица сегментов их помечает, а
+    # пометка обязана стоять РЯДОМ с числом, а не двадцатью строками ниже.
+    # Урок проекта: число, по которому можно сделать неверный вывод, опаснее
+    # отсутствующего, и читают его раньше оговорки.
+    susp = suspicious_sales(rows)
+
     log.info(f"{_Color.BOLD}ЦЕНЫ СДЕЛОК из живого потока see.tg"
              f"{_Color.RESET} — сколько ПЛАТЯТ, а не сколько просят")
     log.info(f"Всего сделок: {len(rows)}")
@@ -5036,27 +5113,128 @@ def sales_report(slug_filter: str = "") -> bool:
     # сделкой не усредняется: «медиана по одному» это цена одного покупателя.
     seg = {}
     for r in rows:
-        seg.setdefault((r["slug"], r["model"] or "—"), []).append(
-            (Decimal(r["price_ton"]),
-             Decimal(r["estimate_ton"]) if r["estimate_ton"] else None))
+        seg.setdefault((r["slug"], r["model"] or "—"), []).append(r)
     log.info("")
     log.info(f"{'коллекция / модель':<42} {'сделок':>6} {'медиана':>10} "
              f"{'мин':>8} {'макс':>8}  их оценка")
-    for (slug, model), vals in sorted(seg.items(), key=lambda x: -len(x[1])):
-        prices = sorted(v[0] for v in vals)
-        med = prices[len(prices) // 2]
-        ests = [v[1] for v in vals if v[1]]
-        rel = f"x{(med / (sum(ests) / len(ests))):.2f}" if ests else "—"
-        log.info(f"{(slug + ' / ' + str(model))[:42]:<42} {len(prices):>6} "
-                 f"{med:>10.3f} {prices[0]:>8.3f} {prices[-1]:>8.3f}  {rel}")
+    seg_susp = {}
+    for key, srows in sorted(seg.items(), key=lambda x: -len(x[1])):
+        prices = [Decimal(r["price_ton"]) for r in srows]
+        med = _median(prices)
+        ratios = [Decimal(r["price_ton"]) / Decimal(r["estimate_ton"])
+                  for r in srows
+                  if r["estimate_ton"] and Decimal(r["estimate_ton"]) > 0]
+        rel = f"x{_median(ratios):.2f}" if ratios else "—"
+        bad = [r for r in srows if r["id"] in susp["ids"]]
+        if bad:
+            clean = [Decimal(r["price_ton"]) for r in srows
+                     if r["id"] not in susp["ids"]]
+            seg_susp[key] = (len(bad), med, _median(clean))
+        mark = f" {_Color.YELLOW}!{_Color.RESET}" if bad else ""
+        log.info(f"{(key[0] + ' / ' + str(key[1]))[:42]:<42} "
+                 f"{len(prices):>6} {med:>10.3f} {min(prices):>8.3f} "
+                 f"{max(prices):>8.3f}  {rel}{mark}")
 
     n_single = sum(1 for v in seg.values() if len(v) == 1)
     log.info("")
     log.info(f"Сегментов с ОДНОЙ сделкой: {n_single} из {len(seg)} — по ним "
              f"медиана это цена одного покупателя, а не рынок.")
-    log.info("Колонка «их оценка» — отношение нашей медианы к ИХ `estimate`. "
-             "Около 1.00 значит, что их оценка сходится с деньгами; это и "
-             "есть проверка, после которой её можно будет использовать.")
+
+    # СХОДИМОСТЬ ИХ ОЦЕНКИ С ДЕНЬГАМИ — одно число на всю выборку.
+    # Отношение считается ПО КАЖДОЙ СДЕЛКЕ, а не по медианам сегментов:
+    # усреднение медиан дало бы вес сегменту с одной сделкой такой же, как
+    # сегменту с тридцатью.
+    all_ratios = [Decimal(r["price_ton"]) / Decimal(r["estimate_ton"])
+                  for r in rows
+                  if r["estimate_ton"] and Decimal(r["estimate_ton"]) > 0]
+    log.info("")
+    if all_ratios:
+        log.info(f"{_Color.BOLD}СХОДИТСЯ ЛИ ИХ ОЦЕНКА С ДЕНЬГАМИ"
+                 f"{_Color.RESET} (по {len(all_ratios)} сделкам с оценкой)")
+        log.info(f"  медиана цена/оценка {_median(all_ratios):.3f}  "
+                 f"| 10-й перцентиль {_nearest_rank(all_ratios, 0.10):.3f} "
+                 f"| 90-й {_nearest_rank(all_ratios, 0.90):.3f}")
+        if susp["ids"]:
+            log.info(f"  В это число ВОШЛИ {len(susp['ids'])} подозрительных "
+                     f"строк (ниже) — они тянут отношение ВНИЗ. Иначе читатель "
+                     f"решит, что их оценка завышена, хотя дело в наших "
+                     f"данных.")
+        log.info("  Около 1.00 в середине значит, что их `estimate` сходится "
+                 "с деньгами. ЛЕВЫЙ ХВОСТ — это не шум: лот, ушедший много "
+                 "ниже оценки, и есть ошибка продавца, ради которой бот "
+                 "строился.")
+        log.info("  Правом поднять `PREMIUM_MULT` это НЕ становится: оценка "
+                 "их, а сходимость проверена против неё же, а не против "
+                 "нашей модели.")
+    else:
+        log.info("Оценки (`estimate`) ни у одной сделки нет — сравнивать "
+                 "цену не с чем.")
+
+    # ПО МАРКЕТАМ — первый в проекте ответ на вопрос арбитража ДЕНЬГАМИ,
+    # а не ценами просьбы. Именно здесь видно, платят ли на дорогом маркете
+    # выше оценки или он дорог только витриной.
+    mk = {}
+    for r in rows:
+        mk.setdefault(r["market"] or _UNKNOWN_MARKET, []).append(r)
+    log.info("")
+    log.info(f"{_Color.BOLD}ПО МАРКЕТАМ{_Color.RESET} — где платят выше "
+             f"их оценки")
+    log.info(f"  {'маркет':<14} {'сделок':>7} {'медиана':>9} "
+             f"{'цена/оценка':>12} {'подозр.':>8}")
+    for market, mrows in sorted(mk.items(), key=lambda x: -len(x[1])):
+        prices = [Decimal(r["price_ton"]) for r in mrows]
+        ratios = [Decimal(r["price_ton"]) / Decimal(r["estimate_ton"])
+                  for r in mrows
+                  if r["estimate_ton"] and Decimal(r["estimate_ton"]) > 0]
+        rel = f"x{_median(ratios):.3f}" if ratios else "—"
+        nbad = susp["by_market"].get(market, 0)
+        thin = (f"  {_Color.GREY}мало{_Color.RESET}"
+                if len(mrows) < MIN_BACKTEST_TRADES else "")
+        log.info(f"  {str(market)[:14]:<14} {len(mrows):>7} "
+                 f"{_median(prices):>9.3f} {rel:>12} {nbad:>8}{thin}")
+    log.info(f"  «мало» — сделок меньше {MIN_BACKTEST_TRADES}: статистика по "
+             f"такой выборке скачет от одной сделки (тот же порог и та же "
+             f"причина, что у `MIN_BACKTEST_TRADES` в бэктесте).")
+    log.info(f"  {_Color.YELLOW}ТРИ ОГОВОРКИ, без которых по этой таблице "
+             f"нельзя решать:{_Color.RESET}")
+    log.info("   1. `estimate` — ИХ число. Если их модель собрана по "
+             "маркетам, где больше всего сделок, то маркет с малым оборотом "
+             "окажется «выше оценки» ПО ПОСТРОЕНИЮ, а не по спросу.")
+    log.info("   2. СОСТАВ. Дорогой маркет может быть дорог тем, ЧТО на нём "
+             "выставлено (редкие фоны), а не тем, что там больше платят.")
+    log.info("   3. Комиссии измерены только у Getgems (2%), роялти вне его "
+             "однажды было 0.45 TON. Разница в цене — ещё не разница на "
+             "руки.")
+
+    if susp["ids"]:
+        log.info("")
+        log.info(f"{_Color.YELLOW}ПОДОЗРИТЕЛЬНЫЕ СТРОКИ: {len(susp['ids'])} "
+                 f"из {len(rows)} по {len(susp['items'])} предметам"
+                 f"{_Color.RESET}")
+        log.info("  Признак: ОДИН предмет пришёл несколько раз с ОДНОЙ И ТОЙ "
+                 "ЖЕ ценой. Так сделка не выглядит: предмет переходит из рук "
+                 "в руки один раз по данной цене.")
+        top_p = sorted(susp["prices"].items(), key=lambda x: -x[1])[:5]
+        log.info("  Повторяющиеся цены: " + ", ".join(
+            f"{p} x{n}" for p, n in top_p))
+        for (slug, num), n in sorted(susp["items"].items(),
+                                     key=lambda x: -x[1])[:8]:
+            log.info(f"    {slug}-{num} x{n}")
+        for key, (nbad, med, clean) in sorted(seg_susp.items(),
+                                              key=lambda x: -x[1][0])[:8]:
+            was = f"{med:.3f}"
+            now = f"{clean:.3f}" if clean is not None else "нечего считать"
+            log.info(f"    {key[0]} / {key[1]}: медиана {was}, "
+                     f"без повторов {now} (повторов {nbad})")
+        log.info(f"  {_Color.BOLD}МЕДИАНА В ТАБЛИЦЕ НЕ ИСПРАВЛЕНА НАМЕРЕННО."
+                 f"{_Color.RESET} Выбросить дешёвые строки значит ПОДНЯТЬ "
+                 f"медиану, то есть увеличить расчётную выручку — "
+                 f"направление, которое в этом проекте требует данных, а не "
+                 f"рассуждения. Пока не измерено, что эти строки означают, "
+                 f"заниженная медиана безопаснее завышенной: по ней сделку "
+                 f"пропустишь, а не потеряешь деньги.")
+
+    log.info("")
     log.info(f"{_Color.YELLOW}ЧЕГО ЭТО ЕЩЁ НЕ ДАЁТ:{_Color.RESET} права "
              f"поднять `PREMIUM_MULT`. Для этого надо сравнить сделки по "
              f"РЕДКОМУ трейту с обычными в той же коллекции, а для такого "
