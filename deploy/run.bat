@@ -18,6 +18,13 @@ REM   deploy\run.bat --flip               vzglyad modelyu avtora video
 REM   deploy\run.bat --colors             peresobrat model_colors.json
 REM   deploy\run.bat --probe EQ...        chto parser izvlek iz otveta API
 REM
+REM OTCHET V FAIL: ne `> file.txt`, a --log-file file.txt. Kodirovku
+REM perenapravleniya zadaet obolochka: cmd pisal cp1251 i uronil kazhduyu
+REM stroku so strelkoy, PowerShell perekodiroval v UTF-16LE i kirillica
+REM prishla dvoynym musorom. Bot pishet fail sam, v UTF-8:
+REM   deploy\run.bat --seetg-arb --log-file arb-report.txt
+REM Dlya svyazok est gotovaya odna komanda:  deploy\arb.bat
+REM
 REM Vnimanie: --record i lyuboy otchet odnovremenno - eto dvoynoy rashod
 REM sutochnoy kvoty TonAPI. V logah uzhe vidny 429.
 REM

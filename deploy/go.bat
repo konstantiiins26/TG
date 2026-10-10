@@ -10,6 +10,12 @@ REM  chtoby bylo ponyatno, chto bot ne zavis: kazhdyy etap obhodit vse
 REM  kollekcii i zanimaet neskolko minut.
 REM =====================================================================
 
+REM VNIMANIE: otchet pishet sam bot cherez --log-file, a NE `>>`. Kodirovku
+REM perenapravleniya zadaet obolochka, i ona lomaet otchet: cmd pisal cp1251
+REM i uronil kazhduyu stroku so strelkoy, PowerShell perekodiroval v UTF-16LE.
+REM Zaodno v fail ne popadayut ANSI-kody, inache kazhdaya stroka v bloknote
+REM vyglyadit kak "[90m14:55:27[0m".
+
 cd /d "%~dp0.."
 call "%~dp0settings.bat"
 
@@ -37,12 +43,12 @@ if exist "%~dp0..\model_colors.json" (
   echo [1/3] model_colors.json uzhe sobran, shag propushchen >> "%LOG%"
 ) else (
   echo [1/3] Tablica cvetov modeley: --colors
-  py gift_sniper.py --colors >> "%LOG%" 2>&1
+  py gift_sniper.py --colors --log-file "%LOG%"
   echo       gotovo
 )
 
 echo [2/3] Poisk lotov po modeli avtora: --flip
-py gift_sniper.py --flip >> "%LOG%" 2>&1
+py gift_sniper.py --flip --log-file "%LOG%"
 echo       gotovo
 
 REM Ploshchadki proveryaem na PERVOY kollekcii iz spiska. Spisok zadaetsya
@@ -50,7 +56,7 @@ REM v settings.bat, poetomu adres nikuda vpisyvat ne nado.
 for /f "tokens=1 delims=," %%a in ("%TARGET_COLLECTIONS%") do set FIRST_COLL=%%a
 
 echo [3/3] Kakie ploshchadki my voobshche vidim: --probe
-py gift_sniper.py --probe %FIRST_COLL% >> "%LOG%" 2>&1
+py gift_sniper.py --probe %FIRST_COLL% --log-file "%LOG%"
 echo       gotovo
 
 echo.

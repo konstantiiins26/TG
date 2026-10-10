@@ -6395,6 +6395,86 @@ check("сверка по деньгам не ходит в сеть",
 
 
 # =============================================================================
+# [79] ОТЧЁТ В ФАЙЛ ПИШЕТ БОТ, А НЕ ОБОЛОЧКА
+# =============================================================================
+# Одна и та же команда сломалась дважды за день 10.10.2026, и по-разному:
+#   cmd        -> Python писал кодировку локали (cp1251), где нет «→», и
+#                 отчёт стал трейсбеками UnicodeEncodeError;
+#   PowerShell -> Python писал верный UTF-8, но PowerShell декодировал его
+#                 по cp866 и перекодировал в UTF-16LE: файл начался с BOM
+#                 ff fe, кириллица пришла двойным мусором.
+# Второй случай нашей кодировкой не лечится вовсе: перекодирует ПОТРЕБИТЕЛЬ,
+# уже после нас. Значит поток оболочке отдавать нельзя.
+print("\n[79] Лог-файл: UTF-8 без BOM, без ANSI, дописывает")
+
+_lf79 = os.path.join(_tmpdir, "report79.txt")
+check("лог-файл открылся", gs.add_log_file(_lf79) is True)
+gs.log.info(f"{gs._Color.GREY}«Bitcoin»: mrkt 49.98 \u2192 getgems 63.9{gs._Color.RESET}")
+gs.log.info("\U0001F4C8 ЧИСТЫМИ +1.79 TON")
+_raw79 = open(_lf79, "rb").read()
+
+# BOM БЫТЬ НЕ ДОЛЖНО: именно по нему и опознали, что файл писал PowerShell.
+check("файл без BOM", not _raw79.startswith(b"\xff\xfe")
+      and not _raw79.startswith(b"\xef\xbb\xbf"))
+_txt79 = _raw79.decode("utf-8")      # упадёт, если кодировка не UTF-8
+check("стрелка и эмодзи уцелели",
+      "\u2192" in _txt79 and "\U0001F4C8" in _txt79)
+# Двойной мусор PowerShell («╨Р╤А╨▒╨╕╤В╤А╨░╨╢» вместо «Арбитраж») узнаётся
+# по тому, что кириллица в файле НЕ читается как кириллица.
+check("кириллица читается, а не двойным мусором",
+      "ЧИСТЫМИ" in _txt79 and "Bitcoin" in _txt79 and "╨" not in _txt79)
+# ANSI в файле — мусор: блокнот рисует его как «[90m14:55:27[0m».
+check("цветовых кодов в файле нет", "\x1b[" not in _txt79)
+check("в консоли цвет остался", gs._Color.GREY in
+      gs._ColorFormatter().format(logging.LogRecord(
+          "x", logging.INFO, "f", 1, "m", None, None)))
+
+# ДОПИСЫВАЕТ, А НЕ ПЕРЕЗАПИСЫВАЕТ: go.bat склеивает в один отчёт три
+# ПРОГОНА подряд, каждый — отдельный запуск Python. Чистка файла стоит в
+# самом .bat, то есть видна глазами.
+_n79 = len(_txt79)
+gs.log.handlers = [h for h in gs.log.handlers
+                   if not isinstance(h, logging.FileHandler)]
+gs.add_log_file(_lf79)
+gs.log.info("второй прогон")
+_txt79b = open(_lf79, encoding="utf-8").read()
+check("второй запуск дописывает, а не затирает",
+      len(_txt79b) > _n79 and "ЧИСТЫМИ" in _txt79b and "второй прогон" in _txt79b)
+
+# Отчёт не пишется — прогон НЕ прерывается: он стоит запросов к see.tg, и
+# бросить его из-за файла значит потратить квоту зря.
+check("неоткрываемый путь не роняет прогон",
+      gs.add_log_file(os.path.join(_tmpdir, "нет-такого-каталога", "x.txt"))
+      is False)
+gs.log.handlers = [h for h in gs.log.handlers
+                   if not isinstance(h, logging.FileHandler)]
+
+_src79 = open("gift_sniper.py", encoding="utf-8").read()
+check("--log-file есть в разборе аргументов", '"--log-file"' in _src79)
+# Первые строки отчёта (бюджет, источник, ритм) решают, как читать
+# остальное: файл обязан открываться ДО любого режима.
+_m79 = _src79.split('args = parse_args()')[1][:400]
+check("файл открывается до запуска режимов",
+      "add_log_file(args.log_file)" in _m79)
+# .bat'ы должны звать --log-file, а не перенаправление: иначе кодировку
+# снова задаёт оболочка (одиннадцатый случай «несколько потребителей»).
+for _b79 in ("deploy/arb.bat", "deploy/go.bat"):
+    _t79 = open(_b79, encoding="utf-8").read()
+    check(f"{_b79} пишет отчёт через --log-file", "--log-file" in _t79)
+    check(f"{_b79} не перенаправляет вывод бота",
+          ">> \"%LOG%\" 2>&1" not in _t79 and "> \"%LOG%\" 2>&1" not in _t79)
+    # Правила Windows из этого проекта: в .bat только латиница (cmd в cp866
+    # покажет кириллицу мусором), и никаких «)» внутри echo — она закрывает
+    # блок if ( ... ) else ( ... ).
+    check(f"{_b79} только латиница",
+          all(ord(c) < 128 for c in _t79))
+    for _ln79 in _t79.splitlines():
+        _l = _ln79.strip().lower()
+        if _l.startswith("echo") and ")" in _ln79 and "^)" not in _ln79:
+            check(f"{_b79}: скобка в echo закрыла бы блок", False)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
