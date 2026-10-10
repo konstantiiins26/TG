@@ -3908,6 +3908,21 @@ _seetg_arb_suppressed = 0
 _seetg_arb_implausible = 0
 _seetg_arb_unconfirmed = 0
 _seetg_paced_skips = 0
+# ВОРОНКА СВЯЗОК ЗА ЧАС. Счётчики ниже называют КАЖДЫЙ отказ по отдельности,
+# но ни один не говорит, сколько пар было ДО отказов, — и вопрос «почему стало
+# находиться меньше» приходилось отвечать чтением кода. Пять чисел в одной
+# строке отвечают на него сами.
+#
+# `_seetg_rounds` тут не формальность: без него ноль пар читается как «рынок
+# пуст», хотя означать может «прогонов не было — ритм растянут квотой». Это
+# разные состояния с разными решениями, и путать их значит решить, что бот
+# сломан, когда он просто ждёт полуночи UTC.
+_seetg_rounds = 0
+_seetg_pairs_total = 0
+_seetg_pairs_looked = 0
+_seetg_above_thr = 0
+_seetg_ladder_cut = 0
+_seetg_arb_sent = 0
 _unaffordable_skips = 0
 _unaffordable_why = ""
 _bankroll_unset_warned = False
@@ -4373,6 +4388,7 @@ def notify_seetg_arb(name: str, slug: str, pair: dict,
     за эту модель реально ПЛАТЯТ, мы не знаем — истории сделок у нас нет.
     """
     global _seetg_arb_suppressed, _seetg_arb_unconfirmed
+    global _seetg_ladder_cut, _seetg_arb_sent
     if SEETG_ARB_NOTIFY_MAX_PER_HOUR <= 0:
         return False
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -4411,6 +4427,7 @@ def notify_seetg_arb(name: str, slug: str, pair: dict,
                  f"«{sell.get('market')}») — ниже порога показа"
                  f"{_Color.RESET}")
         _seetg_arb_sent_ts.pop()
+        _seetg_ladder_cut += 1
         note_seetg_near(pair["model"], name, buy, sell, profit, roi)
         return False
     if SEGMENT_MAX_ROI_PCT > 0 and roi > SEGMENT_MAX_ROI_PCT:
@@ -4526,6 +4543,8 @@ def notify_seetg_arb(name: str, slug: str, pair: dict,
             "message_id")
         if mid:
             tg_action_update(action_id, message_id=int(mid))
+    if body:
+        _seetg_arb_sent += 1
     return bool(body)
 
 
@@ -4564,7 +4583,8 @@ def scan_seetg_arbitrage(snap: dict) -> int:
     Пропуск по бюджету — не поломка, и он СЧИТАЕТСЯ: молчание без причины
     неотличимо от сломанного наблюдения.
     """
-    global _seetg_paced_skips, _seetg_cost_seen
+    global _seetg_paced_skips, _seetg_cost_seen, _seetg_rounds
+    global _seetg_pairs_total, _seetg_pairs_looked, _seetg_above_thr
     if not SEETG_TOKEN:
         return 0
     collection = snap.get("collection") or ""
@@ -4578,6 +4598,7 @@ def scan_seetg_arbitrage(snap: dict) -> int:
     # Метка ставится ДО работы: сбой не должен означать «попробуем снова
     # через секунду», иначе отказ начнёт жечь квоту быстрее успеха.
     _seetg_scan_at[collection] = time.time()
+    _seetg_rounds += 1
     spent_before = seetg_budget_load()
 
     items = snap.get("on_sale") or snap.get("candidates") or []
@@ -4602,6 +4623,7 @@ def scan_seetg_arbitrage(snap: dict) -> int:
         _seetg_cost_seen = max(_seetg_cost_seen,
                                seetg_budget_load() - spent_before)
 
+    _seetg_pairs_total += len(pairs)
     if not pairs:
         log.info(f"{_Color.GREY}see.tg «{slug}»: положительных пар маркетов "
                  f"нет — ни одна модель не даёт прибыли после комиссии и "
@@ -4613,6 +4635,7 @@ def scan_seetg_arbitrage(snap: dict) -> int:
     global _seetg_arb_implausible
     notified = 0
     for pair in pairs[:max(SEETG_ARB_LOG_TOP, SEETG_ARB_MAX_PER_COLLECTION)]:
+        _seetg_pairs_looked += 1
         top = (f" | потолок: {pair['top_market']} {pair['top_floor']} "
                f"-> {pair['top_profit']:+.4f}" if pair.get("top_market") else "")
         # ПРЕДВАРИТЕЛЬНО: это floor'ы борды, а решение принимается по
@@ -4627,6 +4650,7 @@ def scan_seetg_arbitrage(snap: dict) -> int:
         if pair["roi"] < SEETG_ARB_MIN_ROI_PCT:
             log.info(f"      ниже порога показа {SEETG_ARB_MIN_ROI_PCT}%")
             continue
+        _seetg_above_thr += 1
         if SEGMENT_MAX_ROI_PCT > 0 and pair["roi"] > SEGMENT_MAX_ROI_PCT:
             # ПОТОЛОК ПРАВДОПОДОБИЯ. Все разобранные случаи ROI такого
             # размера оказывались ошибкой ДАННЫХ, а не рынком.
@@ -6068,7 +6092,7 @@ def seetg_arb_report(limit_collections: int = 0):
     log.info(f"{_Color.BOLD}Арбитраж маркетов по see.tg: {len(colls)} "
              f"коллекций. Бюджет: осталось {seetg_budget_left()} из "
              f"{SEETG_DAILY_BUDGET}.{_Color.RESET}")
-    total, shown = 0, 0
+    total, shown, passed, fits = 0, 0, 0, 0
     for coll in colls:
         key = f"seetg_slug:{normalize_ton_address(coll) or coll}"
         slug = meta_get(key)
@@ -6129,6 +6153,13 @@ def seetg_arb_report(limit_collections: int = 0):
                 continue
             shown += 1
             ok = conf["roi"] >= SEETG_ARB_MIN_ROI_PCT
+            if ok:
+                passed += 1
+                # ПО КАРМАНУ — ТЕМ ЖЕ `owner_can_pay()`, что у уведомлений.
+                # Вторая формула потолка разошлась бы с первой в первый же
+                # день, и отчёт обещал бы то, чего в телефон не придёт.
+                if owner_can_pay(conf["buy"]["price"])[0]:
+                    fits += 1
             col = _Color.GREEN if ok else _Color.YELLOW
             log.info(f"      {col}ПО ЛЕСТНИЦЕ: купить {conf['buy']['price']} "
                      f"на «{conf['buy']['market']}» → встать под "
@@ -6148,10 +6179,17 @@ def seetg_arb_report(limit_collections: int = 0):
                     slug, pair["model"], target_sale_price(conf["sell_floor"])):
                 log.info(f"      {_ln}")
     log.info("")
-    log.info(f"{_Color.BOLD}Пар по борде: {total}, из них подтверждено "
-             f"лестницей: {shown}. Решение принимается ПО ЛЕСТНИЦЕ — борда "
-             f"не знает, сколько лотов стоит между двумя floor'ами."
-             f"{_Color.RESET}")
+    # ВОРОНКА ЦЕЛИКОМ, А НЕ ДВА ЕЁ КРАЯ. «Пар 53, подтверждено 53» звучит
+    # так, будто прошло всё, тогда как порог прошли одиннадцать, а под
+    # потолок цены — семь. Эти числа владелец считал по отчёту руками; теперь
+    # их называет отчёт. Та же строка есть в часовой сводке: у значения два
+    # читателя, и поставить её в одном значило бы повторить класс ошибки,
+    # который в этом проекте выжил одиннадцать раз.
+    log.info(f"{_Color.BOLD}Пар по борде: {total} → подтверждено лестницей: "
+             f"{shown} → ROI >= {SEETG_ARB_MIN_ROI_PCT}%: {passed} → по "
+             f"карману и потолку {MAX_NOTIFY_PRICE_TON} TON: {fits}. Решение "
+             f"принимается ПО ЛЕСТНИЦЕ — борда не знает, сколько лотов стоит "
+             f"между двумя floor'ами.{_Color.RESET}")
     log.info(f"{_Color.BOLD}Потрачено see.tg за сутки: "
              f"{seetg_budget_load()}/{SEETG_DAILY_BUDGET}. Прогон раз в "
              f"{seetg_scan_gap_sec() / 60:.0f} мин хватит до полуночи UTC."
@@ -7529,6 +7567,35 @@ def notify_heartbeat(snapshots: list, force: bool = False):
                      f"{SEETG_DAILY_BUDGET} за сутки, прогон по коллекции "
                      f"раз в {seetg_scan_gap_sec() / 60:.0f} мин — так квоты "
                      f"хватит до полуночи UTC")
+    # ВОРОНКА СВЯЗОК. Строки ниже называют КАЖДЫЙ отказ по отдельности, но
+    # «стало находиться меньше» — вопрос про воронку целиком: сколько пар было
+    # до отказов и где они осыпались. Без этой строки ответ добывался чтением
+    # кода, а читает её владелец с телефона.
+    global _seetg_rounds, _seetg_pairs_total, _seetg_pairs_looked
+    global _seetg_above_thr, _seetg_ladder_cut, _seetg_arb_sent
+    if SEETG_ONLY and SEETG_TOKEN:
+        if not _seetg_rounds:
+            # «НЕ СМОТРЕЛИ» и «НЕЧЕГО НАЙТИ» — разные состояния, и решения у
+            # них противоположные: первое проходит само к полуночи UTC,
+            # второе не лечится вовсе. Один и тот же ноль пар.
+            lines.append("🔻 Связки: прогонов за час не было — ритм растянут "
+                         "квотой see.tg. Это не поломка и не пустой рынок: "
+                         "мы просто не смотрели")
+        elif not _seetg_pairs_total:
+            lines.append(f"🔻 Связки: прогонов {_seetg_rounds}, "
+                         f"положительных пар по борде НЕТ ВОВСЕ — ни у одной "
+                         f"модели разрыв между первым и вторым лотом не "
+                         f"покрывает комиссию и газ")
+        else:
+            lines.append(f"🔻 Связки за час: прогонов {_seetg_rounds}, пар по "
+                         f"борде {_seetg_pairs_total}, из них смотрели "
+                         f"{_seetg_pairs_looked} (по "
+                         f"{SEETG_ARB_LOG_TOP} лучшим на коллекцию)")
+            lines.append(f"   порог {SEETG_ARB_MIN_ROI_PCT}% прошли "
+                         f"{_seetg_above_thr} → лестница срезала "
+                         f"{_seetg_ladder_cut} → в телефон {_seetg_arb_sent}")
+    _seetg_rounds = _seetg_pairs_total = _seetg_pairs_looked = 0
+    _seetg_above_thr = _seetg_ladder_cut = _seetg_arb_sent = 0
     if _seetg_arb_suppressed:
         lines.append(f"Арбитраж не отправлен из-за лимита: "
                      f"{_seetg_arb_suppressed}")

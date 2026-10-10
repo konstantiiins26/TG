@@ -6521,6 +6521,109 @@ check("whitelist стоит после выбора списка",
 
 
 # =============================================================================
+# [81] ВОРОНКА СВЯЗОК: ОТВЕТ НА «СТАЛО НАХОДИТЬСЯ МЕНЬШЕ»
+# =============================================================================
+# Каждый отказ в арбитраже считался и раньше по отдельности, но ни одно число
+# не говорило, сколько пар было ДО отказов, — и вопрос «почему меньше» можно
+# было решить только чтением кода. Задаёт его владелец с телефона.
+#
+# ТРИ СОСТОЯНИЯ, И ОНИ НЕ ДОЛЖНЫ ВЫГЛЯДЕТЬ ОДИНАКОВО: не смотрели (ритм
+# растянут квотой), смотрели и пар нет (рынок сошёлся), пары были и осыпались
+# на воротах. Ноль связок в телефоне у всех трёх один и тот же, а решения
+# разные: первое проходит к полуночи UTC само, второе не лечится вовсе,
+# третье лечится только списком коллекций.
+print("\n[81] Воронка связок: почему стало находиться меньше")
+
+_o81 = (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.SEETG_ONLY,
+        gs.SEETG_TOKEN, gs.requests, gs.seetg_confirm_pair, gs._last_heartbeat)
+try:
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "123:test", "42"
+    gs.SEETG_ONLY, gs.SEETG_TOKEN = True, "1:tok"
+    gs.requests = _CaptureRequests()
+
+    def _hb81():
+        """Сводка принудительно; возвращает её текст."""
+        _sent.clear()
+        gs._last_heartbeat = 0.0
+        gs.notify_heartbeat([], force=True)
+        return _sent[-1][1]["text"]
+
+    gs._seetg_rounds = gs._seetg_pairs_total = gs._seetg_pairs_looked = 0
+    gs._seetg_above_thr = gs._seetg_ladder_cut = gs._seetg_arb_sent = 0
+    _t81 = _hb81()
+    check("прогонов не было — сказано, что НЕ СМОТРЕЛИ",
+          "не смотрели" in _t81, _t81)
+    check("и пустым рынком это не объявлено", "НЕТ ВОВСЕ" not in _t81, _t81)
+
+    # Смотрели, а положительных пар нет — это ответ РЫНКА, и он другой.
+    gs._seetg_rounds = 11
+    _t81b = _hb81()
+    check("смотрели, а пар нет — отдельное состояние",
+          "НЕТ ВОВСЕ" in _t81b, _t81b)
+    check("и названо число прогонов", "11" in _t81b, _t81b)
+
+    # Полная воронка: по этой строке владелец видит, где именно осыпалось.
+    gs._seetg_rounds, gs._seetg_pairs_total = 11, 37
+    gs._seetg_pairs_looked, gs._seetg_above_thr = 15, 6
+    gs._seetg_ladder_cut, gs._seetg_arb_sent = 4, 2
+    _t81c = _hb81()
+    check("воронка названа: пары и осмотренные",
+          "пар по борде 37" in _t81c and "смотрели 15" in _t81c, _t81c)
+    check("названы порог, срез лестницей и отправленное",
+          "прошли 6" in _t81c and "срезала 4" in _t81c
+          and "в телефон 2" in _t81c, _t81c)
+    check("счётчики обнулены после сводки",
+          (gs._seetg_rounds, gs._seetg_pairs_total, gs._seetg_pairs_looked,
+           gs._seetg_above_thr, gs._seetg_ladder_cut, gs._seetg_arb_sent)
+          == (0, 0, 0, 0, 0, 0))
+
+    # ЛЕСТНИЦА СРЕЗАЛА — ГЛАВНЫЙ ОТКАЗ ПОСЛЕ 10.10.2026 (51 пара по борде ->
+    # 9 выживших), и он единственный, у которого не было числа вовсе:
+    # «Ближе всего к связке» печатает три лучших, а сколько их было — нет.
+    gs._seetg_arb_sent_ts.clear()
+    gs._seetg_ladder_cut = 0
+    gs.seetg_confirm_pair = lambda slug, model, pair: (
+        {"buy": {"price": Decimal("5"), "market": "mrkt"},
+         "sell": {"price": Decimal("5.1"), "market": "mrkt"},
+         "sell_floor": Decimal("5.1"), "profit": Decimal("-0.2"),
+         "roi": Decimal("-4"), "same_market": True,
+         "ladder": [], "top": None, "note": ""}, "")
+    _pair81 = {"model": "M", "buy_floor": Decimal("5"),
+               "sell_floor": Decimal("5.1"), "buy_market": "mrkt",
+               "sell_market": "mrkt", "markets": []}
+    check("срезанная лестницей пара в телефон не идёт",
+          gs.notify_seetg_arb("X", "S", _pair81) is False)
+    check("и она посчитана для воронки",
+          gs._seetg_ladder_cut == 1, gs._seetg_ladder_cut)
+finally:
+    (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.SEETG_ONLY,
+     gs.SEETG_TOKEN, gs.requests, gs.seetg_confirm_pair,
+     gs._last_heartbeat) = _o81
+    gs._seetg_rounds = gs._seetg_pairs_total = gs._seetg_pairs_looked = 0
+    gs._seetg_above_thr = gs._seetg_ladder_cut = gs._seetg_arb_sent = 0
+    gs._seetg_arb_sent_ts.clear()
+    gs._seetg_near.clear()
+
+# ТА ЖЕ ВОРОНКА В РУЧНОМ ОТЧЁТЕ. У значения два читателя — сводка в телефоне
+# и `--seetg-arb` на экране, — и поставить её в одном значило бы повторить
+# класс ошибки, который в этом проекте выжил одиннадцать раз.
+_src81 = open("gift_sniper.py", encoding="utf-8").read()
+_rep81 = _src81.split("def seetg_arb_report")[1].split("\ndef ")[0]
+# Подстроки берутся ТАКИМИ, КАК ОНИ ЛЕЖАТ В ИСХОДНИКЕ: f-строка разбита по
+# строкам, и «по карману и потолку» целиком в тексте не встречается — проверка
+# на него упала бы, хотя отчёт верен. Сверяем то, что непрерывно.
+check("ручной отчёт называет воронку целиком",
+      "ROI >= " in _rep81 and "карману и потолку" in _rep81
+      and "подтверждено лестницей" in _rep81)
+# Потолок считается ТЕМ ЖЕ owner_can_pay(): вторая формула разошлась бы с
+# первой в первый же день, и отчёт обещал бы то, чего в телефон не придёт.
+check("потолок в отчёте считается общей функцией",
+      "owner_can_pay(" in _rep81)
+check("второй формулы потолка в отчёте нет",
+      "MAX_NOTIFY_PRICE_TON >" not in _rep81)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
