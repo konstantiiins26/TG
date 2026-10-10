@@ -28,8 +28,34 @@ REM lotam (CANDIDATES_TO_ANALYZE), a zapis vsego 15 chasov. "Zamerla" znachit
 REM "ni odin iz pyati deshevyh ne ischez", a ne "v kollekcii ne bylo sdelok".
 REM Poetomu spisok iz 32 NE UDALEN - vernutsya mozhno, pomenyav mestami REM.
 REM
-REM --- AKTIVNO: 12 kollekciy s nenulevym oborotom ---
-set TARGET_COLLECTIONS=EQDLda715GocP1sYDkCecPhO7eFNsNvARD4pumbGSan96wvZ,EQCZ4-h65iTiWDPRPcLlS63gbcS40YBadEFLA4W-iIWUZld0,EQD9z87hRZAV7C2MV1gk39-bSg5Yfs2EdMr9HfK81IuB2Rlc,EQCBK_JBASAA5XVz1D17Pn--kQaMWm0b9wReVtsEdRO4Tgy9,EQBEngWldzev9oqzctu59Go9afX8HF8HksZ9pJ7x1bRJXsc7,EQA0EzRYX5wm_q46_NX8b7EYhtOkXfXgsr06ETbov1a7StZl,EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF,EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs,EQDc08YxzZWtlKAohSybNc3kXAkAPPtHch-jY_E6KMQ3b1mn,EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7,EQD1YFp12AGEgX6C3uiWh751EcRxPZo6GtBmHziY29jcbQzS,EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG
+REM --- AKTIVNO: 11 kollekciy ---
+REM
+REM GingerCookie UBRANA 10.10.2026 po komande vladelca. Prichina izmerena,
+REM a ne predpolozhena: za 8 chasov potoka see.tg ona dala NOL sdelok, a v
+REM otchete --seetg-arb u nee 5 modeley iz 5 bez sdelok - edinstvennaya
+REM takaya kollekciya iz dvenadcati. Pri etom imenno ona davala samye
+REM krasivye "svyazki" - Hello Cookie 30.94%, Pink Molasses 11.84%.
+REM Shirokiy razryv v stakane, gde nikto ne pokupaet, - eto ne svyazka,
+REM a dyra: pokupatelya tam net. Vernut - dopisat adres v konec stroki.
+REM GingerCookie = EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG
+REM
+REM KAKOY ADRES CHEYA KOLLEKCIYA - po poryadku v stroke nizhe.
+REM Sootvetstvie snyato s progona --seetg-arb 10.10.2026: otchet pechataet
+REM slag zagolovkom i obhodit spisok PO PORYADKU, vse 12 raspechatalis.
+REM Bez etoy tablicy adres prihoditsya ugadyvat po mestu v spiske - a
+REM ugadyvanie v etom proekte uzhe stoilo neskolkih nevernyh vyvodov.
+REM    1. SurgeBoard     EQDLda715GocP1sYDkCecPhO7eFNsNvARD4pumbGSan96wvZ
+REM    2. SpringBasket   EQCZ4-h65iTiWDPRPcLlS63gbcS40YBadEFLA4W-iIWUZld0
+REM    3. FaithAmulet    EQD9z87hRZAV7C2MV1gk39-bSg5Yfs2EdMr9HfK81IuB2Rlc
+REM    4. JesterHat      EQCBK_JBASAA5XVz1D17Pn--kQaMWm0b9wReVtsEdRO4Tgy9
+REM    5. LibertyFigure  EQBEngWldzev9oqzctu59Go9afX8HF8HksZ9pJ7x1bRJXsc7
+REM    6. PrettyPosy     EQA0EzRYX5wm_q46_NX8b7EYhtOkXfXgsr06ETbov1a7StZl
+REM    7. TimelessBook   EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF
+REM    8. CandyCane      EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs
+REM    9. ViceCream      EQDc08YxzZWtlKAohSybNc3kXAkAPPtHch-jY_E6KMQ3b1mn
+REM   10. ChillFlame     EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7
+REM   11. PoolFloat      EQD1YFp12AGEgX6C3uiWh751EcRxPZo6GtBmHziY29jcbQzS
+set TARGET_COLLECTIONS=EQDLda715GocP1sYDkCecPhO7eFNsNvARD4pumbGSan96wvZ,EQCZ4-h65iTiWDPRPcLlS63gbcS40YBadEFLA4W-iIWUZld0,EQD9z87hRZAV7C2MV1gk39-bSg5Yfs2EdMr9HfK81IuB2Rlc,EQCBK_JBASAA5XVz1D17Pn--kQaMWm0b9wReVtsEdRO4Tgy9,EQBEngWldzev9oqzctu59Go9afX8HF8HksZ9pJ7x1bRJXsc7,EQA0EzRYX5wm_q46_NX8b7EYhtOkXfXgsr06ETbov1a7StZl,EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF,EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs,EQDc08YxzZWtlKAohSybNc3kXAkAPPtHch-jY_E6KMQ3b1mn,EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7,EQD1YFp12AGEgX6C3uiWh751EcRxPZo6GtBmHziY29jcbQzS
 
 REM --- ZAPASNOY: vse 32 (ubrat REM zdes i postavit na stroku vyshe) ---
 REM set TARGET_COLLECTIONS=EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7,EQDc08YxzZWtlKAohSybNc3kXAkAPPtHch-jY_E6KMQ3b1mn,EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG,EQD1YFp12AGEgX6C3uiWh751EcRxPZo6GtBmHziY29jcbQzS,EQDLM65t0shS7gZAg0lMltGHYhsU94PzsMJHhYibmRV7kdUs,EQC2lsUy1SKxJEJBwj5ZCfVnLPvAqDqy5c26Xg8xS_pDTXGk,EQAo_snApDDqF6GKV0xe_T5oe28r842gJtgmkgPMhX0-dRkh,EQA8DCWyCWyywgOKYORerRoSVevWrUQ_FjKQgNihxY1227x7,EQB1ATaKGNYk6T5R2cA18BOF-KB_idaKKigwYI2jtjWuLg8n,EQAXHW9KVYYgDmLaUNcgzNPZ4WKGek97-ldsd0fPUHg4K7SU,EQCZ4-h65iTiWDPRPcLlS63gbcS40YBadEFLA4W-iIWUZld0,EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF,EQC8WVW9DSN4PPfFlCW2AHJkXxBUHBFsvnhXiYqSTpD7tXsp,EQD6mH9bwbn6S3M_tCRWOvqAIW8M34kRwbI01niGLRPeDPsl,EQBEngWldzev9oqzctu59Go9afX8HF8HksZ9pJ7x1bRJXsc7,EQDIruSTyxvq60gUH8j2kkj3qzoBrBaJy9WkKbeNNRasWe4j,EQBV5XozKA0e06Z5y6eL7pWrUUpEolbPhNdcNS0K4ZDk1jCs,EQAPNu648fe_uqUoeH6V_-fIDJYea_5Xu2rXn6iZFil49bMY,EQCBK_JBASAA5XVz1D17Pn--kQaMWm0b9wReVtsEdRO4Tgy9,EQC-ZdsouFU-xMa509yP8kzKceZnGV7lSQskxima1Mr3iDYB,EQDLda715GocP1sYDkCecPhO7eFNsNvARD4pumbGSan96wvZ,EQDycOgkLwcfPDokh8q-2DIUzVhPetdFuZmwrFYFP6i1nZ_u,EQCgaTxb2wA_3Bi8Ec4FFNu8CauoHo0VPpnwxdrhAgOrOXvA,EQDRrfw5pgIC4e6NafUAx52Z9Ym6q1k26xxaXR_qx0LKJJ7D,EQD9z87hRZAV7C2MV1gk39-bSg5Yfs2EdMr9HfK81IuB2Rlc,EQBAXR68f1UgRhToFR_bXY1zPJy5O6sm2St0CRTo92BTxGiH,EQBSIId7sMmlqN8oBGaMNtUeuaLeSQPUR1ByMwpnfWL3hhZq,EQAUffQWl09_yhXDTp8oN13Px8ygPm0xcyNGhHOiONV-x3om,EQDx-SqQEhP9Rzfi2cqdehTVUvQbArsUz1X7t-ul8IiKZpYb,EQA0EzRYX5wm_q46_NX8b7EYhtOkXfXgsr06ETbov1a7StZl,EQA2lHcvZWW_bN_2NMKrkEUv9xz6fx8wTE5upa8u1neZb6hJ,EQCeTSJOPXP_SSvOjILY-kui4bGHUmsa-U7TXP4DjUANTl4s
