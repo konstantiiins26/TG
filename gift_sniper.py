@@ -2303,6 +2303,41 @@ def _seetg_all_addresses(obj, depth: int = 0, out=None):
     return out
 
 
+def _looks_like_seetg_ref(s: str) -> bool:
+    """«JesterHat-110668» — слаг и номер. Адресом TON это быть не может."""
+    part = str(s).strip().rsplit("-", 1)
+    return (len(part) == 2 and len(part[0]) >= 3 and part[0].isalnum()
+            and part[1].isdigit())
+
+
+def seetg_gift_address(ref: str):
+    """
+    Адрес предмета по ссылке вида `Slug-N`. (адрес, причина). ОДИН запрос.
+
+    Нужен из-за тупика, найденного живой покупкой 10.10.2026: see.tg отдаёт
+    `giftAddress` не у каждого лота, и в этом случае уведомление честно
+    пишет «кнопки «Купил» не будет, отметить: --bought АДРЕС ЦЕНА» — а
+    адреса у владельца как раз и нет. Совет, который невозможно выполнить,
+    не отличается от его отсутствия, и купленный лот не попадает в учёт
+    ВООБЩЕ: ни PnL, ни риск-лимиты про него не знают.
+
+    `/v1/gift/{ref}` ту же карточку отдаёт, и `giftAddress` в ней есть —
+    это измерено `seetg_prove_slug()`, которая этим полем доказывает слаг.
+    """
+    try:
+        card = seetg_get(f"/gift/{ref}")
+    except RateLimited:
+        raise
+    except Exception as e:                              # noqa: BLE001
+        return None, f"see.tg не ответил по «{ref}»: {e}"
+    gift = (card or {}).get("gift") or card or {}
+    raw = normalize_ton_address(gift.get("giftAddress") or "")
+    if not raw:
+        return None, (f"в карточке «{ref}» нет giftAddress. Сырьё: "
+                      f"{str(card)[:200]}")
+    return raw, f"{ref}: адрес взят из карточки see.tg"
+
+
 def seetg_prove_slug(slug: str, items):
     """
     ТОЧНАЯ сверка слага: наш номер минта -> их карточка -> их адрес.
@@ -4539,8 +4574,20 @@ def notify_seetg_arb(name: str, slug: str, pair: dict,
              "eff_floor": sell_floor})
         payload["reply_markup"] = _find_buttons(action_id)
     else:
-        lines.append("⚠️ адреса предмета в ответе see.tg нет — кнопки "
-                     "«Купил» не будет, отметить: --bought АДРЕС ЦЕНА")
+        # РАБОЧАЯ СТРОКА, А НЕ ПЛЕЙСХОЛДЕР. Правило проекта: инструкция либо
+        # содержит команду, которую можно скопировать, либо не содержит пути
+        # вовсе. «--bought АДРЕС ЦЕНА» без адреса — плейсхолдер, причём в
+        # сообщении, которое САМО говорит, что адреса нет. Живая покупка
+        # 10.10.2026 упёрлась ровно в это: лот куплен, а занести его в учёт
+        # нечем. Ссылка `Slug-N` у нас есть всегда, и `--bought` её понимает.
+        if buy.get("num"):
+            lines.append(f"⚠️ адреса предмета в ответе see.tg нет — кнопки "
+                         f"«Купил» не будет. Отметить покупку одной строкой:")
+            lines.append(f"--bought {slug}-{buy['num']} {q(buy['price'])}")
+        else:
+            lines.append("⚠️ ни адреса, ни номера предмета see.tg не отдал — "
+                         "занести покупку в учёт нечем, кроме адреса с "
+                         "витрины: --bought АДРЕС ЦЕНА")
         payload["text"] = "\n".join(lines)
     body = _tg_call("sendMessage", payload)
     if body and action_id:
@@ -6958,8 +7005,19 @@ def record_manual_purchase(address: str, price: str, floor: str = None):
         return None
 
     raw = normalize_ton_address(address)
+    if not raw and _looks_like_seetg_ref(address):
+        # ССЫЛКА ВМЕСТО АДРЕСА. У части лотов see.tg не отдаёт giftAddress,
+        # и тогда уведомление советует команду, которую нечем заполнить.
+        # Спрашиваем адрес по той же ссылке, что видна в сообщении.
+        try:
+            raw, why = seetg_gift_address(address)
+        except RateLimited as e:
+            log.error(f"see.tg: {e}")
+            return None
+        log.info(why)
     if not raw:
-        log.error(f"Адрес «{address}» не разобран. Нужен EQ… или 0:…")
+        log.error(f"Адрес «{address}» не разобран. Нужен EQ…, 0:… или "
+                  f"ссылка see.tg вида JesterHat-110668.")
         return None
 
     with db_connect() as conn:
@@ -10414,9 +10472,10 @@ def parse_args(argv=None):
     parser.add_argument("--closed", action="store_true",
                         help="вместе с --positions показать последние закрытые")
     parser.add_argument("--bought", nargs="+",
-                        metavar=("ADDRESS PRICE", "FLOOR"),
-                        help="занести в учёт лот, купленный руками "
-                             "(у уведомлений «ДЕШЕВЛЕ СВОИХ» кнопок нет)")
+                        metavar=("ADDRESS|SLUG-N PRICE", "FLOOR"),
+                        help="занести в учёт лот, купленный руками: адрес "
+                             "EQ…/0:… ИЛИ ссылка see.tg вида JesterHat-110668 "
+                             "(у части лотов see.tg адреса не отдаёт)")
     parser.add_argument("--close", nargs=2, metavar=("POSITION_ID", "PRICE"),
                         help="закрыть позицию по ФАКТИЧЕСКОЙ цене продажи "
                              "(кнопка «Продал» ставит плановую)")

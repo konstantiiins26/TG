@@ -6619,6 +6619,55 @@ finally:
     gs._seetg_arb_sent_ts.clear()
     gs._seetg_near.clear()
 
+# --- ССЫЛКА ВМЕСТО АДРЕСА: ТУПИК ЖИВОЙ ПОКУПКИ 10.10.2026 -----------------
+# Лот куплен по уведомлению, в котором САМО сказано «адреса нет, отметить
+# --bought АДРЕС ЦЕНА». Команда без адреса невыполнима, и купленный лот не
+# попадал в учёт ВООБЩЕ. Ссылка `Slug-N` в сообщении есть всегда.
+check("ссылка see.tg опознаётся как ссылка",
+      gs._looks_like_seetg_ref("JesterHat-110668") is True)
+check("адрес ссылкой не считается",
+      gs._looks_like_seetg_ref(
+          "EQDLda715GocP1sYDkCecPhO7eFNsNvARD4pumbGSan96wvZ") is False)
+check("мусор ссылкой не считается",
+      gs._looks_like_seetg_ref("-5") is False
+      and gs._looks_like_seetg_ref("JesterHat-abc") is False)
+
+_oget82 = gs.seetg_get
+try:
+    # Их карточка отдаёт giftAddress — это ИЗМЕРЕНО: тем же полем
+    # `seetg_prove_slug()` доказывает слаг.
+    _addr82 = "0:" + "ab" * 32
+    gs.seetg_get = lambda path, params=None: (
+        {"gift": {"giftAddress": _addr82}} if path == "/gift/JesterHat-110668"
+        else {})
+    _got82, _why82 = gs.seetg_gift_address("JesterHat-110668")
+    check("адрес берётся из карточки see.tg",
+          _got82 == gs.normalize_ton_address(_addr82), (_got82, _why82))
+    # Нет поля — НЕ выдумываем адрес, а называем причину и печатаем сырьё.
+    gs.seetg_get = lambda path, params=None: {"gift": {}}
+    _none82, _whynone82 = gs.seetg_gift_address("X-1")
+    check("без giftAddress возвращается None с причиной",
+          _none82 is None and "giftAddress" in _whynone82, _whynone82)
+
+    # --bought принимает ссылку и открывает позицию по разрешённому адресу.
+    gs.seetg_get = lambda path, params=None: {"gift": {"giftAddress": _addr82}}
+    _pos82 = gs.record_manual_purchase("JesterHat-110668", "3.99")
+    check("покупка по ссылке занесена", _pos82 is not None, _pos82)
+    # ПОВТОР ТОГО ЖЕ ЛОТА ВТОРОЙ ПОЗИЦИИ НЕ ОТКРЫВАЕТ — то же правило, что у
+    # кнопки «Купил»: в учёте не должно появиться лота, которого нет.
+    check("повтор по ссылке второй позиции не открывает",
+          gs.record_manual_purchase("JesterHat-110668", "3.99") is None)
+    if _pos82:
+        gs.close_position(_pos82, Decimal("4.84"))
+finally:
+    gs.seetg_get = _oget82
+
+# В уведомлении при отсутствии адреса — РАБОЧАЯ строка, а не плейсхолдер.
+_src82 = open("gift_sniper.py", encoding="utf-8").read()
+_notif82 = _src82.split("def notify_seetg_arb")[1].split("\ndef ")[0]
+check("уведомление даёт команду со ссылкой, а не «АДРЕС ЦЕНА»",
+      "--bought {slug}-{buy['num']}" in _notif82)
+
 # ТА ЖЕ ВОРОНКА В РУЧНОМ ОТЧЁТЕ. У значения два читателя — сводка в телефоне
 # и `--seetg-arb` на экране, — и поставить её в одном значило бы повторить
 # класс ошибки, который в этом проекте выжил одиннадцать раз.
