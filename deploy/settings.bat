@@ -297,7 +297,12 @@ REM Sutochnaya kvota see.tg. U Free tarifa potolok 1000 zaprosov v sutki,
 REM poetomu 900 - s zapasom. Rashod HRANITSYA V BD: kvota zhivet na ih
 REM storone, i bot, perezapushchennyy v obed, inache schital by ee netronutoy.
 REM Ritm progonov bot schitaet SAM tak, chtoby ostatka hvatilo do polunochi
-REM UTC (12 kollekciy x 2 zaprosa = 24 na progon, to est progon raz v ~40 min).
+REM UTC. Izmereno 10.10.2026: 3 zaprosa na kollekciyu, 11 kollekciy = 33 na
+REM progon, pri polnoy kvote eto progon raz v ~18 min.
+REM VAZHNO: ruchnoy "deploy\arb.bat" EST TU ZHE KVOTU. Dva progona po ~200
+REM zaprosov rastyagivayut pauzu nablyudeniya s 18 do 31 min na ostatok sutok,
+REM to est uvedomleniy v telefon budet MENSHE. Hotite bolshe - ne zhgite
+REM kvotu otchetami.
 set SEETG_DAILY_BUDGET=900
 
 REM POTOLOK CENY LOTA V UVEDOMLENII. Pryamaya komanda vladelca 07.10.2026:
@@ -309,8 +314,19 @@ set MAX_NOTIFY_PRICE_TON=10
 
 REM Skolko soobshcheniy ob arbitrazhe marketov slat maksimum za chas i
 REM skolko s odnoy kollekcii za progon. 0 = vyklyuchit uvedomleniya.
+REM MAX_PER_COLLECTION=1 znachit: iz kollekcii v telefon idet TOLKO luchshaya
+REM para po ROI, ostalnye otbrasyvayutsya. Skolko imenno - vidno v chasovoy
+REM svodke strokoy "vtoryh po kollekcii ne otpravleno". Hotite bolshe
+REM uvedomleniy - stavte 2-3: chasovoy potolok vyshe vse ravno derzhit.
 set SEETG_ARB_NOTIFY_MAX_PER_HOUR=12
 set SEETG_ARB_MAX_PER_COLLECTION=1
+
+REM POROG POKAZA SVYAZKI. 5 procentov - eto reshenie operatora, a ne
+REM ekonomika sdelki. Chem nizhe, tem bolshe uvedomleniy i tem ONI huzhe:
+REM gaz 0.15 TON eto velichina V TONAH, poetomu na lote za 3.7 TON
+REM ROI 3 procenta = 0.11 TON chistymi, i odin konkurent ryadom s'edaet
+REM ih celikom. Nizhe 2 stavit bessmyslenno.
+set SEETG_ARB_MIN_ROI_PCT=5
 
 REM --- Pauza mezhdu zaprosami k TonAPI ---
 REM Tarify Ton Console (snyato so skrinshota 23.09.2026, REST API):

@@ -3923,6 +3923,11 @@ _seetg_pairs_looked = 0
 _seetg_above_thr = 0
 _seetg_ladder_cut = 0
 _seetg_arb_sent = 0
+# Сколько пар отброшено ПОТОЛКОМ НА КОЛЛЕКЦИЮ. Отдельно от прочих отказов
+# потому, что это единственная ручка, которая режет УЖЕ ПРОШЕДШЕЕ порог, и
+# крутят её, когда уведомлений хочется больше. Молча выброшенная вторая пара
+# скрывала, что потолок вообще что-то режет.
+_seetg_cap_skips = 0
 _unaffordable_skips = 0
 _unaffordable_why = ""
 _bankroll_unset_warned = False
@@ -4585,6 +4590,7 @@ def scan_seetg_arbitrage(snap: dict) -> int:
     """
     global _seetg_paced_skips, _seetg_cost_seen, _seetg_rounds
     global _seetg_pairs_total, _seetg_pairs_looked, _seetg_above_thr
+    global _seetg_cap_skips
     if not SEETG_TOKEN:
         return 0
     collection = snap.get("collection") or ""
@@ -4659,6 +4665,15 @@ def scan_seetg_arbitrage(snap: dict) -> int:
             _seetg_arb_implausible += 1
             continue
         if notified >= SEETG_ARB_MAX_PER_COLLECTION:
+            # Пара уже прошла порог, но из коллекции в телефон идёт лучшая.
+            # Потолок поставлен по уроку сегментного наблюдения («кто первый,
+            # тот и весь эфир»), и крутить его осмысленно только зная, сколько
+            # он режет. Это ПОТОЛОК добавки, а не обещание: банк, лестницу и
+            # выдержку повтора эти пары ещё не проходили.
+            _seetg_cap_skips += 1
+            log.info(f"      сверх {SEETG_ARB_MAX_PER_COLLECTION} на "
+                     f"коллекцию — в телефон не идёт "
+                     f"(SEETG_ARB_MAX_PER_COLLECTION)")
             continue
         if not _affordable(pair["buy_floor"], f"«{pair['model']}»"):
             continue
@@ -7594,8 +7609,15 @@ def notify_heartbeat(snapshots: list, force: bool = False):
             lines.append(f"   порог {SEETG_ARB_MIN_ROI_PCT}% прошли "
                          f"{_seetg_above_thr} → лестница срезала "
                          f"{_seetg_ladder_cut} → в телефон {_seetg_arb_sent}")
+    global _seetg_cap_skips
+    if _seetg_cap_skips:
+        lines.append(f"   ⚙️ вторых по коллекции не отправлено: "
+                     f"{_seetg_cap_skips} — это ПОТОЛОК добавки от "
+                     f"SEETG_ARB_MAX_PER_COLLECTION (банк и лестницу они ещё "
+                     f"не проходили)")
     _seetg_rounds = _seetg_pairs_total = _seetg_pairs_looked = 0
     _seetg_above_thr = _seetg_ladder_cut = _seetg_arb_sent = 0
+    _seetg_cap_skips = 0
     if _seetg_arb_suppressed:
         lines.append(f"Арбитраж не отправлен из-за лимита: "
                      f"{_seetg_arb_suppressed}")

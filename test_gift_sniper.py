@@ -6595,12 +6595,27 @@ try:
           gs.notify_seetg_arb("X", "S", _pair81) is False)
     check("и она посчитана для воронки",
           gs._seetg_ladder_cut == 1, gs._seetg_ladder_cut)
+
+    # ПОТОЛОК НА КОЛЛЕКЦИЮ — единственная ручка, которая режет УЖЕ прошедшее
+    # порог, и крутят её именно когда уведомлений хочется больше. Молча
+    # выброшенная вторая пара скрывала, что потолок вообще что-то режет.
+    gs._seetg_cap_skips = 7
+    _t81d = _hb81()
+    check("отброшенное потолком на коллекцию названо",
+          "вторых по коллекции не отправлено: 7" in _t81d, _t81d)
+    # ЧЕСТНО НАЗВАНО ПОТОЛКОМ ДОБАВКИ: банк, лестницу и выдержку эти пары
+    # ещё не проходили, поэтому обещать по этому числу уведомления нельзя.
+    check("и названо потолком добавки, а не обещанием",
+          "ПОТОЛОК добавки" in _t81d, _t81d)
+    check("счётчик потолка обнулён после сводки",
+          gs._seetg_cap_skips == 0, gs._seetg_cap_skips)
 finally:
     (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.SEETG_ONLY,
      gs.SEETG_TOKEN, gs.requests, gs.seetg_confirm_pair,
      gs._last_heartbeat) = _o81
     gs._seetg_rounds = gs._seetg_pairs_total = gs._seetg_pairs_looked = 0
     gs._seetg_above_thr = gs._seetg_ladder_cut = gs._seetg_arb_sent = 0
+    gs._seetg_cap_skips = 0
     gs._seetg_arb_sent_ts.clear()
     gs._seetg_near.clear()
 
