@@ -1,0 +1,6696 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Быстрые локальные проверки чистой логики снайпера (без сети).
+
+Запуск:  python test_gift_sniper.py
+
+Покрывает то, что можно проверить детерминированно:
+  * нормализацию адресов TON (raw <-> user-friendly, CRC16),
+  * работу whitelist,
+  * экономику сделки (комиссии с цены продажи, роялти, undercut),
+  * перцентиль floor и его устойчивость к выбросам,
+  * извлечение трейтов и оценку редкости по выборке,
+  * ликвидность (конкуренция у floor),
+  * дедупликацию с учётом цены и сдвига floor.
+
+Сетевые вызовы (TonAPI / Getgems / Claude) здесь НЕ проверяются.
+"""
+
+import base64
+import json
+import logging
+import os
+import sys
+import tempfile
+import time
+from decimal import Decimal
+
+import gift_sniper as gs
+
+
+# =============================================================================
+# ГЕРМЕТИЧНОСТЬ: тесты не должны зависеть от окружения пользователя
+# =============================================================================
+# Все настройки бота читаются из переменных окружения при импорте. Если
+# запустить тесты в том же окне cmd, где стоял `set BANKROLL_TON=10`, проверки
+# начинают мерить чужую конфигурацию вместо кода — и падают на исправном боте.
+# Реальный случай: BANKROLL_TON=10 при позиции 10 TON и резерве 1 давал
+# available_bankroll = −1, из-за чего «нормальная сделка проходит» проваливалась.
+#
+# Поэтому фиксируем ВСЕ настраиваемые величины на документированные значения
+# по умолчанию. Секции, которым нужны другие, меняют их локально и возвращают
+# обратно. «Тесты прошли» обязано означать одно и то же на любой машине.
+_PINNED = {
+    # экономика
+    "MARKETPLACE_FEE_PCT": Decimal("0.02"), "ROYALTY_PCT": Decimal("0.05"),
+    "UNDERCUT_PCT": Decimal("0.03"), "GAS_FEE_TON": Decimal("0.15"),
+    "MIN_ROI_PCT": Decimal("5"), "PREMIUM_MULT": Decimal("1.0"),
+    # floor и выборка
+    "FLOOR_PAGE_SIZE": 100, "FLOOR_SAMPLE_PAGES": 5,
+    "FLOOR_PERCENTILE": Decimal("5"), "MIN_FLOOR_SAMPLE": 40,
+    "FLOOR_CACHE_TTL_SEC": 60, "CANDIDATES_TO_ANALYZE": 5,
+    # редкость и похожие лоты
+    "RARE_TRAIT_THRESHOLD_PCT": Decimal("5"), "MIN_TRAIT_SAMPLE": 50,
+    "PEER_TRAIT": "model", "MIN_PEER_SAMPLE": 4,
+    "DEEP_DISCOUNT_PCT": Decimal("60"),
+    # ликвидность и дедупликация
+    "COMPETITION_BAND_PCT": Decimal("10"), "MAX_COMPETITION": 15,
+    "ENABLE_SALES_HISTORY": False, "LIQUIDITY_WINDOW_HOURS": 72,
+    "MIN_SALES_IN_WINDOW": 1, "SEEN_TTL_SEC": 300,
+    # риск-лимиты и банк
+    "MAX_SPEND_PER_TRADE_TON": Decimal("50"),
+    "MAX_SPEND_PER_HOUR_TON": Decimal("200"),
+    "MAX_SPEND_PER_DAY_TON": Decimal("1000"),
+    "MAX_OPEN_POSITIONS": 10, "STOP_AFTER_LOSSES": 3,
+    "BANKROLL_TON": Decimal("0"), "RESERVE_TON": Decimal("5"),
+    "MAX_POSITION_PCT": Decimal("10"), "HIGH_ROI_PCT": Decimal("100"),
+    "MAX_POSITION_PCT_HIGH_ROI": Decimal("10"),
+    # выход из позиции и бэктест
+    "ENABLE_STOP_LOSS": True, "STOP_LOSS_PCT": Decimal("25"),
+    "STOP_LOSS_MIN_HOURS": Decimal("6"), "BACKTEST_HOLD_HOURS": 24,
+    "BACKTEST_MAX_SLACK_HOURS": Decimal("6"),
+    # сеть и режимы
+    "TONAPI_MIN_INTERVAL": Decimal("1.1"), "TONAPI_MAX_RETRIES": 3,
+    "TONAPI_DAILY_BUDGET": 10000, "POLL_INTERVAL_SEC": 12,
+    "PURCHASE_GAS_TON": Decimal("0.3"), "TRADING_NETWORK": "testnet",
+    "ALLOWED_MARKETS": ["Getgems Sales"],
+    "DRY_RUN": True, "CONFIRM_LIVE_TRADING": "", "COLLECTION_WHITELIST": [],
+    "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "", "HEARTBEAT_MIN": 60,
+    "MIN_MARKET_SAMPLE": 5, "NEAR_MISS_TOP": 3,
+    "SEGMENT_NOTIFY_MAX_PER_HOUR": 12,
+    "SEGMENT_MAX_PER_COLLECTION": 1, "SEGMENT_SEEN_TTL_SEC": 21600,
+    "SEGMENT_MIN_ROI_PCT": Decimal("10"), "SEGMENT_MAX_ROI_PCT": Decimal("100"),
+    "FLIP_BUDGET_TON": Decimal("7"), "FLIP_MAX_PREMIUM": Decimal("0.20"),
+    "FLIP_BUY_SCORE": 70, "FLIP_WATCH_SCORE": 50,
+    "FLIP_TARGET_MULT": Decimal("1.5"),
+    # see.tg: источник чужих цен и его суточная квота
+    "SEETG_TOKEN": "", "SEETG_ONLY": True, "SEETG_DAILY_BUDGET": 900,
+    "SEETG_MIN_INTERVAL": Decimal("1.2"),
+    "SEETG_ARB_MAX_PER_COLLECTION": 1,
+    "SEETG_ARB_NOTIFY_MAX_PER_HOUR": 12,
+    "SEETG_ARB_SEEN_TTL_SEC": 21600, "SEETG_ARB_LOG_TOP": 5,
+    "MAX_NOTIFY_PRICE_TON": Decimal("10"),
+}
+for _name, _value in _PINNED.items():
+    setattr(gs, _name, _value)
+
+
+_failures = []
+
+
+def source_default(var_name):
+    """
+    Достаёт значение по умолчанию из `os.getenv("VAR", "default")` в исходнике.
+
+    Нужно там, где тест фиксирует ПРОЕКТНОЕ РЕШЕНИЕ («комиссия 2%»,
+    «механизм выключен»), а не текущую настройку. Сравнивать с глобальной
+    переменной нельзя: она берётся из окружения, и у пользователя со своими
+    `set ...` тест падал бы на верном коде.
+    """
+    import re as _re
+    src = open("gift_sniper.py", encoding="utf-8").read()
+    m = _re.search(rf'os\.getenv\(\s*"{_re.escape(var_name)}"\s*,\s*"([^"]*)"', src)
+    if m is None:
+        raise AssertionError(f"не нашёл значение по умолчанию для {var_name}")
+    return m.group(1)
+
+
+def source_default_const(name):
+    """
+    То же для КОНСТАНТЫ в исходнике (`NAME = value`), а не переменной окружения.
+
+    Нужно для флагов, которые настройкой быть не должны: «продажа
+    реализована» — утверждение о коде, и возможность выставить его через
+    окружение превратила бы ворота в формальность.
+    """
+    import re as _re
+    src = open("gift_sniper.py", encoding="utf-8").read()
+    m = _re.search(rf'^{_re.escape(name)}\s*=\s*(\S+)', src, _re.M)
+    if m is None:
+        raise AssertionError(f"не нашёл константу {name} в исходнике")
+    return m.group(1)
+
+
+def check(name, condition, detail=""):
+    """Мини-ассерт: копит провалы вместо остановки на первом."""
+    if condition:
+        print(f"  ok   {name}")
+    else:
+        print(f"  FAIL {name} {detail}")
+        _failures.append(name)
+
+
+def make_friendly_address(workchain: int, hash_hex: str, bounceable=True) -> str:
+    """
+    Собирает корректный user-friendly адрес TON из raw-компонентов.
+    Используется как эталон для проверки декодера.
+    """
+    flags = 0x11 if bounceable else 0x51
+    wc_byte = 0xFF if workchain == -1 else workchain
+    body = bytes([flags, wc_byte]) + bytes.fromhex(hash_hex)
+    crc = gs._crc16_xmodem(body)
+    return base64.urlsafe_b64encode(body + crc.to_bytes(2, "big")).decode()
+
+
+# =============================================================================
+print("\n[1] Нормализация адресов TON")
+# =============================================================================
+
+H = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+# --- raw-форма ---------------------------------------------------------------
+check("raw принимается", gs.normalize_ton_address(f"0:{H}") == f"0:{H}")
+check("raw в верхнем регистре приводится к нижнему",
+      gs.normalize_ton_address(f"0:{H.upper()}") == f"0:{H}")
+check("masterchain (-1) принимается", gs.normalize_ton_address(f"-1:{H}") == f"-1:{H}")
+
+# --- round-trip friendly -> raw ---------------------------------------------
+friendly = make_friendly_address(0, H)
+check("friendly декодируется в тот же raw",
+      gs.normalize_ton_address(friendly) == f"0:{H}",
+      f"got={gs.normalize_ton_address(friendly)}")
+
+# Ключевой кейс: две формы ОДНОГО адреса должны совпасть после нормализации.
+check("raw и friendly одного адреса эквивалентны",
+      gs.normalize_ton_address(friendly) == gs.normalize_ton_address(f"0:{H}"))
+
+# non-bounceable (UQ...) — тот же адрес, другой флаг.
+check("non-bounceable форма даёт тот же raw",
+      gs.normalize_ton_address(make_friendly_address(0, H, bounceable=False)) == f"0:{H}")
+
+# base64 в обычном алфавите (+/) вместо url-safe (-_).
+std_b64 = friendly.replace("-", "+").replace("_", "/")
+check("обычный base64-алфавит тоже принимается",
+      gs.normalize_ton_address(std_b64) == f"0:{H}")
+
+check("masterchain friendly round-trip",
+      gs.normalize_ton_address(make_friendly_address(-1, H)) == f"-1:{H}")
+
+# --- отказы ------------------------------------------------------------------
+broken = list(base64.urlsafe_b64decode(friendly))
+broken[10] ^= 0xFF                                    # портим хэш -> CRC не сойдётся
+bad_crc = base64.urlsafe_b64encode(bytes(broken)).decode()
+check("битый CRC отвергается", gs.normalize_ton_address(bad_crc) is None)
+
+check("мусор отвергается", gs.normalize_ton_address("не-адрес") is None)
+check("пустая строка отвергается", gs.normalize_ton_address("") is None)
+check("None отвергается", gs.normalize_ton_address(None) is None)
+check("короткий hex в raw отвергается", gs.normalize_ton_address("0:abcd") is None)
+
+
+# =============================================================================
+print("\n[2] Whitelist коллекций")
+# =============================================================================
+
+other_hash = "00" * 32
+orig_whitelist = gs.COLLECTION_WHITELIST
+
+gs.COLLECTION_WHITELIST = []
+check("пустой whitelist пропускает всё", gs.is_collection_trusted(f"0:{H}") is True)
+
+# Самое важное: в whitelist friendly-форма, а с рынка приходит raw.
+gs.COLLECTION_WHITELIST = [friendly]
+check("friendly в whitelist матчит raw с рынка",
+      gs.is_collection_trusted(f"0:{H}") is True)
+check("чужая коллекция отклоняется",
+      gs.is_collection_trusted(f"0:{other_hash}") is False)
+check("пустой адрес коллекции отклоняется при активном whitelist",
+      gs.is_collection_trusted("") is False)
+
+gs.COLLECTION_WHITELIST = orig_whitelist
+
+
+# =============================================================================
+print("\n[3] Экономика сделки")
+# =============================================================================
+
+floor = Decimal("10")
+buy = Decimal("8")
+
+sale = gs.target_sale_price(floor)
+check("undercut опускает цену продажи ниже floor", sale < floor, f"sale={sale}")
+
+profit = gs.compute_net_profit(floor, buy)
+
+# Считаем вручную по той же модели, чтобы поймать опечатку в реализации.
+expected_sale = floor * (Decimal("1") - gs.UNDERCUT_PCT)
+expected = (expected_sale * (Decimal("1") - gs.MARKETPLACE_FEE_PCT - gs.ROYALTY_PCT)
+            - buy - gs.GAS_FEE_TON)
+check("прибыль совпадает с ручным расчётом", profit == expected,
+      f"got={profit} expected={expected}")
+
+# Главное: новая формула обязана быть КОНСЕРВАТИВНЕЕ старой из ТЗ.
+old_formula = (floor - buy) - (buy * Decimal("0.05")) - Decimal("0.15")
+check("новая формула строго консервативнее старой", profit < old_formula,
+      f"new={profit:.4f} old={old_formula:.4f}")
+
+check("покупка по floor убыточна", gs.compute_net_profit(floor, floor) < 0)
+check("покупка дороже floor убыточна", gs.compute_net_profit(floor, floor * 2) < 0)
+check("глубокая скидка прибыльна", gs.compute_net_profit(floor, Decimal("5")) > 0)
+
+check("ROI при нулевой цене не делит на ноль",
+      gs.compute_roi_pct(Decimal("1"), Decimal("0")) == Decimal("0"))
+
+
+# =============================================================================
+print("\n[4] Floor: перцентиль и устойчивость к выбросам")
+# =============================================================================
+
+prices = sorted(Decimal(str(p)) for p in [10, 11, 12, 13, 14, 15, 16, 17, 18, 19])
+check("P0 == минимум", gs._percentile(prices, Decimal("0")) == Decimal("10"))
+check("P100 == максимум", gs._percentile(prices, Decimal("100")) == Decimal("19"))
+check("P50 между краями",
+      Decimal("14") <= gs._percentile(prices, Decimal("50")) <= Decimal("15"))
+
+# Ключевая причина отказа от min(): один "пылевой" лот не должен ломать floor.
+with_outlier = sorted(prices + [Decimal("0.01")])
+p5 = gs._percentile(with_outlier, Decimal("5"))
+check("выброс 0.01 не утаскивает P5 на дно", p5 > Decimal("1"), f"P5={p5}")
+check("а min() именно это и сделал бы", min(with_outlier) == Decimal("0.01"))
+
+check("пустая выборка -> 0", gs._percentile([], Decimal("5")) == Decimal("0"))
+check("один элемент -> он сам",
+      gs._percentile([Decimal("7")], Decimal("5")) == Decimal("7"))
+
+
+# =============================================================================
+print("\n[5] Красивые номера минта")
+# =============================================================================
+
+check("mint 1 красивый (топ-100)", gs.is_pretty_mint(1) is True)
+check("mint 100 красивый", gs.is_pretty_mint(100) is True)
+check("mint 777 красивый", gs.is_pretty_mint(777) is True)
+check("mint 4242 обычный", gs.is_pretty_mint(4242) is False)
+check("mint None обычный", gs.is_pretty_mint(None) is False)
+
+
+# =============================================================================
+print("\n[6] Трейты и редкость")
+# =============================================================================
+
+meta_ok = {"attributes": [
+    {"trait_type": "Model", "value": "Plush Pepe"},
+    {"trait_type": "Backdrop", "value": "Onyx Black"},
+    {"trait_type": "Number", "value": "4242"},      # служебный — не трейт
+]}
+traits = gs.extract_traits(meta_ok)
+check("трейты извлечены", traits == {"model": "Plush Pepe", "backdrop": "Onyx Black"},
+      f"got={traits}")
+check("номер минта не считается трейтом", "number" not in traits)
+check("пустые метаданные -> пусто", gs.extract_traits({}) == {})
+
+# Регрессия: подстрочный матч выбрасывал легитимные трейты, содержащие "id"
+# ("Sidekick", "Rider"). Сравнение должно идти по словам.
+tricky = gs.extract_traits({"attributes": [
+    {"trait_type": "Sidekick", "value": "Cat"},
+    {"trait_type": "Rider", "value": "Knight"},
+    {"trait_type": "Mint Number", "value": "7"},   # служебный, по слову
+    {"trait_type": "Serial ID", "value": "9"},     # служебный, по слову
+]})
+check("'Sidekick' не выброшен из-за подстроки 'id'", "sidekick" in tricky, f"got={tricky}")
+check("'Rider' не выброшен из-за подстроки 'id'", "rider" in tricky)
+check("'Mint Number' выброшен по слову", "mint number" not in tricky)
+check("'Serial ID' выброшен по слову", "serial id" not in tricky)
+
+# --- Явная редкость от площадки приоритетнее нашей оценки --------------------
+check("явная редкость читается",
+      gs._explicit_rarity_pct({"attributes": [{"trait_type": "Rarity", "value": "1.5%"}]})
+      == Decimal("1.5"))
+check("бессмысленная редкость игнорируется",
+      gs._explicit_rarity_pct({"attributes": [{"trait_type": "Rarity", "value": "нет"}]})
+      is None)
+
+# --- Оценка редкости по выборке ---------------------------------------------
+def mk(model, backdrop, price=1.0, addr="x"):
+    return gs._normalize_item(addr, "C", "0:" + "11" * 32, 1, Decimal(str(price)), True,
+                              traits={"model": model, "backdrop": backdrop})
+
+# 99 обычных + 1 редкий => редкий трейт у 1% выборки.
+sample = [mk("Common", "Blue", addr=f"a{i}") for i in range(99)]
+sample.append(mk("Common", "Onyx", addr="rare"))
+index, total = gs.build_trait_index(sample)
+check("индекс трейтов посчитан", total == 100 and index["backdrop"]["Onyx"] == 1,
+      f"total={total}")
+
+rare_pct, rare_name = gs.compute_rarity_pct(sample[-1], index, total)
+check("редкий лот -> 1%", rare_pct == Decimal("1.00"), f"got={rare_pct}")
+check("назван редчайший трейт", rare_name == "backdrop", f"got={rare_name}")
+check("редкий распознан", gs.is_rare(rare_pct) is True)
+
+common_pct, _ = gs.compute_rarity_pct(sample[0], index, total)
+check("обычный лот не редкий", gs.is_rare(common_pct) is False, f"pct={common_pct}")
+
+# Ключевой кейс безопасности: "не удалось оценить" != "обычный" и != "редкий".
+small_index, small_total = gs.build_trait_index(sample[:5])
+unknown_pct, _ = gs.compute_rarity_pct(sample[0], small_index, small_total)
+check("малая выборка -> редкость None", unknown_pct is None, f"got={unknown_pct}")
+check("None НЕ считается редким", gs.is_rare(None) is False)
+
+
+# =============================================================================
+print("\n[7] Ликвидность: конкуренция у floor")
+# =============================================================================
+
+floor = Decimal("10")
+# Полоса по умолчанию 10% => учитываются лоты <= 11.
+prices = sorted(Decimal(str(p)) for p in [10, 10.5, 11, 12, 20])
+comp = gs.compute_competition(prices, floor)
+check("конкуренты в полосе посчитаны", comp == 3, f"got={comp}")
+check("лоты далеко от floor не считаются", comp < len(prices))
+check("нулевой floor -> нет конкуренции",
+      gs.compute_competition(prices, Decimal("0")) == 0)
+
+
+# =============================================================================
+print("\n[8] Дедупликация")
+# =============================================================================
+
+gs._seen_cache.clear()
+F = Decimal("10")
+lot = {"address": "0:dead", "sale_price_ton": 5.0}
+check("первый раз лот анализируется", gs.already_analyzed(lot, F) is False)
+check("повтор того же лота пропускается", gs.already_analyzed(lot, F) is True)
+
+# Смена цены — новое торговое событие, его нужно пересчитать.
+check("смена цены снимает дедуп",
+      gs.already_analyzed({"address": "0:dead", "sale_price_ton": 4.0}, F) is False)
+check("другой лот не пропускается",
+      gs.already_analyzed({"address": "0:beef", "sale_price_ton": 5.0}, F) is False)
+
+# Ключевой кейс: реальный сдвиг floor обязан снять дедуп — лот, бывший SKIP
+# при floor=10, может стать BUY при floor=15.
+check("сдвиг floor снимает дедуп", gs.already_analyzed(lot, Decimal("15")) is False)
+# ...но дрожание floor на доли процента не должно сбрасывать кэш каждый цикл.
+check("дрожание floor не сбрасывает дедуп",
+      gs.already_analyzed(lot, Decimal("15.001")) is True)
+gs._seen_cache.clear()
+
+
+# =============================================================================
+print("\n[9] История продаж выключена по умолчанию")
+# =============================================================================
+
+# Эндпоинт не проверен из dev-среды, поэтому по умолчанию не должен ходить в сеть.
+check("ENABLE_SALES_HISTORY выключен по умолчанию", gs.ENABLE_SALES_HISTORY is False)
+check("выключенная история возвращает None (без сетевого вызова)",
+      gs.fetch_recent_sales_count("0:" + "11" * 32) is None)
+
+
+# =============================================================================
+print("\n[10] Риск-лимиты и хранилище")
+# =============================================================================
+
+import os, tempfile, time as _time
+
+_tmpdir = tempfile.mkdtemp()
+gs.DB_PATH = os.path.join(_tmpdir, "test_state.db")
+gs.db_init()
+
+check("пустая БД: нет открытых позиций", gs.open_positions_count() == 0)
+check("пустая БД: нет трат", gs.spend_since(3600) == Decimal("0"))
+check("пустая БД: нет серии убытков", gs.consecutive_losses() == 0)
+
+lot = {"address": "0:pos1", "collection_address": "0:coll"}
+pid = gs.record_purchase(lot, Decimal("10"), Decimal("12"))
+check("позиция записана", isinstance(pid, int) and pid > 0)
+check("позиция считается открытой", gs.open_positions_count() == 1)
+check("траты учтены", gs.spend_since(3600) == Decimal("10"))
+
+# --- Потолок одной сделки ----------------------------------------------------
+ok, why = gs.check_risk_limits(gs.MAX_SPEND_PER_TRADE_TON + Decimal("1"))
+check("дорогая сделка блокируется", ok is False, why)
+ok, _ = gs.check_risk_limits(Decimal("1"))
+check("нормальная сделка проходит", ok is True)
+
+# --- Часовой лимит -----------------------------------------------------------
+_orig_hour = gs.MAX_SPEND_PER_HOUR_TON
+gs.MAX_SPEND_PER_HOUR_TON = Decimal("12")   # уже потрачено 10
+ok, why = gs.check_risk_limits(Decimal("5"))
+check("часовой лимит блокирует перерасход", ok is False, why)
+ok, _ = gs.check_risk_limits(Decimal("1"))
+check("в пределах часового лимита проходит", ok is True)
+gs.MAX_SPEND_PER_HOUR_TON = _orig_hour
+
+# --- Лимит открытых позиций --------------------------------------------------
+_orig_open = gs.MAX_OPEN_POSITIONS
+gs.MAX_OPEN_POSITIONS = 1
+ok, why = gs.check_risk_limits(Decimal("1"))
+check("лимит открытых позиций блокирует", ok is False, why)
+gs.MAX_OPEN_POSITIONS = _orig_open
+
+# --- PnL и серия убытков -----------------------------------------------------
+pnl = gs.close_position(pid, Decimal("20"))
+check("PnL посчитан при закрытии", pnl is not None and pnl > 0, f"pnl={pnl}")
+check("закрытая позиция больше не открыта", gs.open_positions_count() == 0)
+
+# Ключевой кейс: N убытков подряд обязаны остановить торговлю.
+for i in range(gs.STOP_AFTER_LOSSES):
+    lid = gs.record_purchase({"address": f"0:loss{i}", "collection_address": ""},
+                             Decimal("10"), Decimal("10"))
+    gs.close_position(lid, Decimal("1"))     # продали сильно дешевле -> убыток
+    _time.sleep(0.01)                        # чтобы sell_ts различались
+check("серия убытков посчитана",
+      gs.consecutive_losses() >= gs.STOP_AFTER_LOSSES, f"got={gs.consecutive_losses()}")
+ok, why = gs.check_risk_limits(Decimal("1"))
+check("торговля остановлена после серии убытков", ok is False, why)
+
+# Прибыльная сделка обязана сбросить серию.
+wid = gs.record_purchase({"address": "0:win", "collection_address": ""},
+                         Decimal("1"), Decimal("10"))
+gs.close_position(wid, Decimal("50"))
+check("прибыль сбрасывает серию убытков", gs.consecutive_losses() == 0)
+
+
+# =============================================================================
+print("\n[11] Уведомления не роняют торговлю")
+# =============================================================================
+
+_tok, _chat = gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID
+gs.TELEGRAM_BOT_TOKEN = gs.TELEGRAM_CHAT_ID = ""
+try:
+    gs.notify("тест")
+    check("без токена notify() молча ничего не делает", True)
+except Exception as e:
+    check("без токена notify() молча ничего не делает", False, str(e))
+
+# С битым токеном сеть недоступна — notify обязан проглотить ошибку.
+gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "bad", "bad"
+try:
+    gs.notify("тест")
+    check("сетевая ошибка в notify() не пробрасывается", True)
+except Exception as e:
+    check("сетевая ошибка в notify() не пробрасывается", False, str(e))
+gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = _tok, _chat
+
+
+# =============================================================================
+print("\n[12] evaluate_trade — единая функция решения")
+# =============================================================================
+
+def mk_snap(floor, competition=0, reliable=True, index=None, total=0):
+    return {"floor": Decimal(str(floor)), "competition": competition,
+            "floor_reliable": reliable, "trait_index": index or {}, "trait_total": total}
+
+def mk_lot(price, mint=5000, addr="0:t", traits=None):
+    return gs._normalize_item(addr, "C", "0:coll", mint, Decimal(str(price)), True,
+                              traits=traits or {})
+
+# Глубокая скидка при надёжном floor — покупаем.
+ev = gs.evaluate_trade(mk_lot(5), mk_snap(10), None)
+check("выгодная сделка разрешена", ev["allowed"] is True, ev["reason"])
+
+# Каждая причина отказа срабатывает отдельно.
+check("недостоверный floor блокирует",
+      gs.evaluate_trade(mk_lot(5), mk_snap(10, reliable=False), None)["allowed"] is False)
+check("убыточная сделка блокируется",
+      gs.evaluate_trade(mk_lot(10), mk_snap(10), None)["allowed"] is False)
+check("толпа у floor блокирует",
+      gs.evaluate_trade(mk_lot(5), mk_snap(10, competition=999), None)["allowed"] is False)
+check("мёртвый рынок блокирует",
+      gs.evaluate_trade(mk_lot(5), mk_snap(10), 0)["allowed"] is False)
+
+# Покупка выше floor без премии всегда убыточна — отдельной проверки
+# "переплата" нет намеренно, расчёт прибыли её уже содержит.
+over = gs.evaluate_trade(mk_lot(11, mint=4242), mk_snap(10), None)
+check("покупка выше floor блокируется", over["allowed"] is False)
+check("причина — убыточность (переплата поглощена расчётом)",
+      "убыточно" in over["reason"], over["reason"])
+
+# --- Премия за красоту/редкость ---------------------------------------------
+# По умолчанию нейтральна: красота и редкость НЕ должны тихо завышать прибыль.
+check("премия по умолчанию выключена (1.0)",
+      gs.PREMIUM_MULT == Decimal("1.0"), f"got={gs.PREMIUM_MULT}")
+check("при нейтральной премии красота не меняет расчёт",
+      gs.compute_net_profit(Decimal("10"), Decimal("5"), premium=True)
+      == gs.compute_net_profit(Decimal("10"), Decimal("5"), premium=False))
+
+_orig_prem = gs.PREMIUM_MULT
+gs.PREMIUM_MULT = Decimal("2.0")
+rare_index, rare_total = {"backdrop": {"Onyx": 1, "Blue": 999}}, 1000
+snap_r = mk_snap(10, index=rare_index, total=rare_total)
+
+ev_rare = gs.evaluate_trade(mk_lot(11, mint=4242, traits={"backdrop": "Onyx"}),
+                            snap_r, None)
+check("с премией редкий лот выше floor покупается",
+      ev_rare["allowed"] is True, ev_rare["reason"])
+check("редкость распознана", ev_rare["is_rare"] is True)
+check("отмечено, что премия применена", ev_rare["premium_applied"] is True)
+
+ev_pretty = gs.evaluate_trade(mk_lot(11, mint=777, traits={"backdrop": "Blue"}),
+                              snap_r, None)
+check("красивый номер тоже получает премию", ev_pretty["allowed"] is True,
+      ev_pretty["reason"])
+
+ev_plain = gs.evaluate_trade(mk_lot(11, mint=4242, traits={"backdrop": "Blue"}),
+                             snap_r, None)
+check("обычный лот премии НЕ получает и остаётся убыточным",
+      ev_plain["allowed"] is False, ev_plain["reason"])
+gs.PREMIUM_MULT = _orig_prem
+
+
+# =============================================================================
+print("\n[13] Бэктест: сквозной прогон по синтетической записи")
+# =============================================================================
+
+import json as _json
+
+rec_path = os.path.join(_tmpdir, "hist.jsonl")
+now_ts = _time.time()
+
+# Сценарий: floor стабильно 10, дешёвый лот за 5 -> сделка должна найтись,
+# а через 24ч floor тот же, значит прибыль реальна.
+with open(rec_path, "w", encoding="utf-8") as f:
+    for hour in range(0, 50):
+        row = {"ts": now_ts + hour * 3600, "floor": "10", "sample_size": 100,
+               "competition": 1, "floor_reliable": True,
+               "trait_index": {}, "trait_total": 0,
+               "candidates": [mk_lot(5, addr="0:deal")] if hour == 0 else []}
+        f.write(_json.dumps(row) + "\n")
+
+res = gs.run_backtest(rec_path, hold_hours=24)
+check("бэктест нашёл сделку", res and res["trades"] == 1, str(res))
+check("сделка закрылась", res and res["closed"] == 1, str(res))
+check("сделка прибыльна", res and res["pnl"] > 0, str(res and res["pnl"]))
+check("winrate 100%", res and res["winrate"] == Decimal("100"))
+
+# Позиция без будущего в записи обязана остаться НЕзакрытой, а не считаться
+# прибыльной — иначе бэктест подгоняет результат.
+tail_path = os.path.join(_tmpdir, "tail.jsonl")
+with open(tail_path, "w", encoding="utf-8") as f:
+    f.write(_json.dumps({"ts": now_ts, "floor": "10", "sample_size": 100,
+                         "competition": 1, "floor_reliable": True,
+                         "trait_index": {}, "trait_total": 0,
+                         "candidates": [mk_lot(5, addr="0:late")]}) + "\n")
+res2 = gs.run_backtest(tail_path, hold_hours=24)
+check("сделка без будущего не закрыта", res2 and res2["unresolved"] == 1, str(res2))
+check("незакрытая сделка не попала в winrate", res2 and res2["closed"] == 0)
+
+# Битые строки не должны ронять прогон.
+broken_path = os.path.join(_tmpdir, "broken.jsonl")
+with open(broken_path, "w", encoding="utf-8") as f:
+    f.write("{не json\n")
+    f.write(_json.dumps({"ts": now_ts, "floor": "10", "sample_size": 10,
+                         "competition": 1, "floor_reliable": True,
+                         "trait_index": {}, "trait_total": 0,
+                         "candidates": []}) + "\n")
+check("битая строка пропускается без падения",
+      len(gs._load_recording(broken_path)) == 1)
+
+check("отсутствующий файл обрабатывается",
+      gs.run_backtest(os.path.join(_tmpdir, "нет.jsonl")) is None)
+
+
+# =============================================================================
+print("\n[14] Банкролл")
+# =============================================================================
+
+gs.DB_PATH = os.path.join(_tmpdir, "bankroll.db")
+gs.db_init()
+
+_ob, _or_, _op = gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT
+gs.BANKROLL_TON = Decimal("100")
+gs.RESERVE_TON = Decimal("5")
+gs.MAX_POSITION_PCT = Decimal("10")
+gs.MAX_SPEND_PER_TRADE_TON = Decimal("50")
+
+check("свободно = банк − резерв при нуле позиций",
+      gs.available_bankroll() == Decimal("95"), f"got={gs.available_bankroll()}")
+check("потолок сделки = 10% банка (меньше абсолютного)",
+      gs.max_position_size() == Decimal("10"), f"got={gs.max_position_size()}")
+
+gs.record_purchase({"address": "0:b1", "collection_address": ""}, Decimal("30"), Decimal("40"))
+check("капитал в позициях учтён", gs.deployed_capital() == Decimal("30"))
+check("свободно уменьшилось на размер позиции",
+      gs.available_bankroll() == Decimal("65"), f"got={gs.available_bankroll()}")
+
+# Резерв неприкосновенен: он не должен уходить в сделки.
+gs.record_purchase({"address": "0:b2", "collection_address": ""}, Decimal("60"), Decimal("70"))
+check("резерв не отдаётся под сделки",
+      gs.available_bankroll() == Decimal("5"), f"got={gs.available_bankroll()}")
+ok, why = gs.check_risk_limits(Decimal("9"))
+check("сделка сверх свободных средств блокируется", ok is False, why)
+
+# Доля банка должна ограничивать сильнее абсолютного лимита.
+gs.BANKROLL_TON = Decimal("20")
+check("потолок = 10% от 20 = 2", gs.max_position_size() == Decimal("2"))
+ok, why = gs.check_risk_limits(Decimal("5"))
+check("превышение доли банка блокируется", ok is False, why)
+
+# Без заданного банка доля не применяется — работает абсолютный лимит.
+gs.BANKROLL_TON = Decimal("0")
+check("без банка действует абсолютный лимит",
+      gs.max_position_size() == gs.MAX_SPEND_PER_TRADE_TON)
+check("без банка свободных средств нет", gs.available_bankroll() == Decimal("0"))
+
+gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT = _ob, _or_, _op
+
+
+# =============================================================================
+print("\n[15] Кошелёк: права на файл ключа")
+# =============================================================================
+
+import stat as _stat
+
+_owk = gs.WALLET_KEY_FILE
+key_path = os.path.join(_tmpdir, "wallet.key")
+with open(key_path, "w", encoding="utf-8") as f:
+    f.write("SECRET_KEY_MATERIAL_DO_NOT_LEAK\n")
+
+gs.WALLET_KEY_FILE = ""
+key, err = gs.load_wallet_key()
+check("без пути ключ не загружается", key is None and err is not None)
+
+gs.WALLET_KEY_FILE = os.path.join(_tmpdir, "нет.key")
+key, err = gs.load_wallet_key()
+check("отсутствующий файл ключа отвергается", key is None and "не найден" in err)
+
+gs.WALLET_KEY_FILE = key_path
+
+if os.name == "nt":
+    # На Windows POSIX-битов нет: os.chmod() управляет только флагом "только
+    # чтение", и st_mode всегда 0o666 либо 0o444. Проверка прав отвергала бы
+    # ЛЮБОЙ файл, поэтому там она заменена на громкое предупреждение.
+    print("  --   Windows: проверки POSIX-прав пропущены (битов нет)")
+    key, err = gs.load_wallet_key()
+    check("на Windows ключ читается, несмотря на отсутствие POSIX-прав",
+          key == "SECRET_KEY_MATERIAL_DO_NOT_LEAK", f"err={err}")
+else:
+    # Ключевой кейс безопасности: читаемый другими ключ обязан быть отвергнут.
+    os.chmod(key_path, 0o644)
+    key, err = gs.load_wallet_key()
+    check("ключ с правами 0644 отвергается", key is None, f"err={err}")
+    check("в ошибке названа причина и лечение",
+          err and "chmod 600" in err, err)
+    check("сам ключ в текст ошибки НЕ попал",
+          err and "SECRET_KEY_MATERIAL" not in err, err)
+
+    os.chmod(key_path, 0o600)
+    key, err = gs.load_wallet_key()
+    check("ключ с правами 0600 читается",
+          key == "SECRET_KEY_MATERIAL_DO_NOT_LEAK", f"err={err}")
+
+    os.chmod(key_path, 0o660)          # доступен группе
+    key, err = gs.load_wallet_key()
+    check("ключ, доступный группе, отвергается", key is None)
+    os.chmod(key_path, 0o600)
+
+gs.WALLET_KEY_FILE = _owk
+
+
+# =============================================================================
+print("\n[16] Ворота в живую торговлю")
+# =============================================================================
+
+_odry, _oconf, _oexec = gs.DRY_RUN, gs.CONFIRM_LIVE_TRADING, gs.REAL_EXECUTOR_AVAILABLE
+_okey, _obank, _owl = gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.COLLECTION_WHITELIST
+_oapi = gs.ANTHROPIC_API_KEY
+gs.ANTHROPIC_API_KEY = "sk-ant-test"
+gs.TARGET_COLLECTIONS = [friendly]
+
+# Симуляция должна проходить даже без кошелька и банка.
+gs.DRY_RUN = True
+check("режим симуляции не требует кошелька и банка",
+      gs.preflight_checks(require_ai=True) is True)
+
+# Исполнитель теперь определяется УСПЕХОМ ИМПОРТА tonutils, а не константой.
+# Смысл проверки прежний: если библиотеки нет, живой режим обязан быть закрыт
+# ЗАРАНЕЕ — иначе бот стартует нормально и упадёт в момент покупки, то есть
+# узнает о проблеме тогда, когда реагировать уже поздно.
+gs.DRY_RUN = False
+gs.CONFIRM_LIVE_TRADING = "I_UNDERSTAND_THE_RISK"
+gs.BANKROLL_TON = Decimal("100")
+gs.COLLECTION_WHITELIST = [friendly]
+gs.WALLET_KEY_FILE = key_path
+_real_exec = gs.REAL_EXECUTOR_AVAILABLE
+gs.REAL_EXECUTOR_AVAILABLE = False
+check("без библиотеки подписи живой режим заблокирован",
+      gs.preflight_checks(require_ai=True) is False)
+gs.REAL_EXECUTOR_AVAILABLE = _real_exec
+
+check("флаг исполнителя отражает фактический импорт, а не константу",
+      gs.REAL_EXECUTOR_AVAILABLE == (gs._EXECUTOR_IMPORT_ERROR == ""),
+      f"{gs.REAL_EXECUTOR_AVAILABLE} / {gs._EXECUTOR_IMPORT_ERROR!r}")
+
+# И даже с исполнителем — без явного подтверждения риска.
+gs.REAL_EXECUTOR_AVAILABLE = True
+gs.CONFIRM_LIVE_TRADING = ""
+check("живой режим заблокирован без подтверждения риска",
+      gs.preflight_checks(require_ai=True) is False)
+
+gs.CONFIRM_LIVE_TRADING = "I_UNDERSTAND_THE_RISK"
+gs.BANKROLL_TON = Decimal("0")
+check("живой режим заблокирован без заданного банка",
+      gs.preflight_checks(require_ai=True) is False)
+
+gs.BANKROLL_TON = Decimal("100")
+gs.COLLECTION_WHITELIST = []
+check("живой режим заблокирован с пустым whitelist",
+      gs.preflight_checks(require_ai=True) is False)
+
+# Самое важное: покупка НИКОГДА не рапортует успех, не совершив сделку.
+gs.REAL_EXECUTOR_AVAILABLE = False
+gs.DRY_RUN = False
+check("нереализованная покупка возвращает False, а не ложный успех",
+      gs.execute_blockchain_buy("0:x", Decimal("1"), "0:sale", "Getgems Sales") is False)
+gs.DRY_RUN = True
+check("в симуляции покупка возвращает True",
+      gs.execute_blockchain_buy("0:x", Decimal("1"), "0:sale", "Getgems Sales") is True)
+
+(gs.DRY_RUN, gs.CONFIRM_LIVE_TRADING, gs.REAL_EXECUTOR_AVAILABLE) = (_odry, _oconf, _oexec)
+(gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.COLLECTION_WHITELIST) = (_okey, _obank, _owl)
+gs.ANTHROPIC_API_KEY = _oapi
+
+
+# =============================================================================
+print("\n[17] Несколько коллекций")
+# =============================================================================
+
+_otc, _oak = gs.TARGET_COLLECTIONS, gs.ANTHROPIC_API_KEY
+gs.ANTHROPIC_API_KEY = "sk-ant-test"     # секция [16] вернула исходный (пустой)
+second = make_friendly_address(0, "b2" * 32)
+
+gs.TARGET_COLLECTIONS = [friendly, second]
+check("preflight принимает несколько валидных коллекций",
+      gs.preflight_checks(require_ai=True) is True)
+
+# Одна битая коллекция в списке обязана остановить старт: иначе бот молча
+# работал бы по части списка, а пользователь думал бы, что смотрит всё.
+gs.TARGET_COLLECTIONS = [friendly, "не-адрес"]
+check("битый адрес в списке блокирует старт",
+      gs.preflight_checks(require_ai=True) is False)
+
+gs.TARGET_COLLECTIONS = []
+check("пустой список коллекций блокирует старт",
+      gs.preflight_checks(require_ai=True) is False)
+
+gs.TARGET_COLLECTIONS, gs.ANTHROPIC_API_KEY = _otc, _oak
+
+
+# =============================================================================
+print("\n[18] Ранжирование коллекций по активности")
+# =============================================================================
+
+rank_path = os.path.join(_tmpdir, "rank.jsonl")
+_now = _time.time()
+_rows = []
+for h in range(48):
+    # Живая: дешёвые лоты каждый час новые.
+    _rows.append({"ts": _now + h*3600, "collection": "0:alive", "floor": "10",
+                  "sample_size": 200, "competition": 3, "floor_reliable": True,
+                  "trait_index": {}, "trait_total": 0,
+                  "candidates": [{"address": f"0:lot{h}", "sale_price_ton": 8.0}]})
+    # Замершая: лот всегда один и тот же.
+    _rows.append({"ts": _now + h*3600, "collection": "0:frozen", "floor": "50",
+                  "sample_size": 40, "competition": 1, "floor_reliable": True,
+                  "trait_index": {}, "trait_total": 0,
+                  "candidates": [{"address": "0:stuck", "sale_price_ton": 45.0}]})
+    # Офлайн: данных нет.
+    _rows.append({"ts": _now + h*3600, "collection": "0:dead", "floor": "0",
+                  "sample_size": 0, "competition": 0, "floor_reliable": False,
+                  "trait_index": {}, "trait_total": 0, "candidates": []})
+with open(rank_path, "w", encoding="utf-8") as f:
+    for r in _rows:
+        f.write(_json.dumps(r) + "\n")
+
+ranked = gs.rank_collections(rank_path)
+check("ранжирование вернуло все коллекции", ranked and len(ranked) == 3, str(ranked and len(ranked)))
+
+by_name = {st["collection"]: st for st in ranked}
+check("живая коллекция распознана", by_name["0:alive"]["status"] == "живая",
+      by_name["0:alive"]["status"])
+check("замершая отличена от живой", by_name["0:frozen"]["status"] == "замерла (оборота нет)",
+      by_name["0:frozen"]["status"])
+check("офлайн отличён от замершей", by_name["0:dead"]["status"] == "офлайн (нет данных)",
+      by_name["0:dead"]["status"])
+
+# Ключевое: у живой оборот строго выше, и она идёт первой в рейтинге.
+check("у живой оборот больше нуля", by_name["0:alive"]["turnover_per_hour"] > 0)
+check("у замершей оборот ноль", by_name["0:frozen"]["turnover_per_hour"] == 0)
+check("рейтинг отсортирован по обороту", ranked[0]["collection"] == "0:alive",
+      ranked[0]["collection"])
+
+# Наличие лотов НЕ означает активность — замершая держит 40 лотов и мертва.
+check("много лотов не делает коллекцию живой",
+      by_name["0:frozen"]["avg_listings"] == 40
+      and by_name["0:frozen"]["status"] != "живая")
+
+check("отсутствующий файл обрабатывается",
+      gs.rank_collections(os.path.join(_tmpdir, "нет.jsonl")) is None)
+
+
+# =============================================================================
+print("\n[19] Парсинг НАСТОЯЩЕГО ответа TonAPI")
+# =============================================================================
+
+# Дословный фрагмент реального ответа
+# GET /v2/nfts/collections/EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF/items
+# (коллекция Telegram Gifts "Timeless Books", получен 17.09.2026).
+# Эти проверки — единственное в наборе, что подтверждено живыми данными,
+# а не моими предположениями о форме ответа.
+REAL_NFT = {
+    "address": "0:e8ff70dd4fe2a1c3de574bef08678f0a7de9c27c763dd844e975b6670f8011c7",
+    # ВНИМАНИЕ: верхнеуровневый index — НЕ номер минта. Здесь он огромный и
+    # отрицательный. Номер лежит только в metadata.name ("... #16450").
+    "index": -181007727810587533,
+    "owner": {"address": "0:158136239adb15dd59df90c641f9efd312cfeb8664f218f4c3e5fce9d95e6c07",
+              "name": "Fragment Gift Minter", "is_scam": False, "is_wallet": True},
+    "collection": {
+        "address": "0:b6d76763aead208254178bc312157d5b730e0b1f0dc4b3ada52afb75959cf3b1",
+        "name": "Timeless Books"},
+    "verified": True,
+    "metadata": {
+        "attributes": [{"trait_type": "Model", "value": "Cookbook"},
+                       {"trait_type": "Backdrop", "value": "Malachite"},
+                       {"trait_type": "Symbol", "value": "Apple"}],
+        "name": "Timeless Book #16450",
+        "image": "https://nft.fragment.com/gift/timelessbook-16450.webp"},
+    "approved_by": ["getgems"],
+    "trust": "whitelist",
+}
+_meta = REAL_NFT["metadata"]
+
+check("номер минта берётся из имени, а не из index",
+      gs._extract_mint_index(REAL_NFT, _meta) == 16450,
+      f"got={gs._extract_mint_index(REAL_NFT, _meta)}")
+
+# Регрессия: верхнеуровневый index — мусор. Если кто-то "починит" парсер,
+# начав его использовать, номера минта станут бессмысленными.
+check("огромный отрицательный index НЕ попадает в номер минта",
+      gs._extract_mint_index(REAL_NFT, _meta) != REAL_NFT["index"])
+check("номер минта в разумных пределах",
+      0 < gs._extract_mint_index(REAL_NFT, _meta) < 1_000_000)
+
+check("трейты разобраны",
+      gs.extract_traits(_meta) == {"model": "Cookbook", "backdrop": "Malachite",
+                                   "symbol": "Apple"},
+      str(gs.extract_traits(_meta)))
+
+check("адрес коллекции на месте",
+      REAL_NFT["collection"]["address"].startswith("0:b6d7"))
+
+_owl = gs.COLLECTION_WHITELIST
+gs.COLLECTION_WHITELIST = ["EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF"]
+check("whitelist по EQ-форме матчит raw-адрес из API",
+      gs.is_collection_trusted(REAL_NFT["collection"]["address"]) is True)
+gs.COLLECTION_WHITELIST = _owl
+
+# Подтверждено на живых данных: процентов редкости в API НЕТ, хотя интерфейс
+# Getgems их показывает. Значит, оценка по выборке — единственный путь.
+check("явной редкости в ответе API нет",
+      gs._explicit_rarity_pct(_meta) is None)
+
+# Эти два предмета не выставлены — поля sale в ответе нет вообще.
+check("без поля sale лот не считается продающимся",
+      bool((REAL_NFT.get("sale") or {}).get("price")) is False)
+
+
+# =============================================================================
+print("\n[20] Парсинг ВЫСТАВЛЕННЫХ лотов (реальные sale из TonAPI)")
+# =============================================================================
+
+# Дословные блоки sale из того же ответа (limit=50): из 50 предметов
+# выставлены были ровно 4. Они закрывают то, чего не было в секции [19]:
+# цену, адрес контракта продажи и площадку.
+#
+# ВАЖНОЕ, подтверждённое этими данными: "Gram" в price.token_name — это
+# НЕ отдельный жетон. Рядом стоят currency_type="native" и decimals=9,
+# то есть это нативная монета TON, а значение — нанотоны. Интерфейс Getgems
+# подписывает цены как GRAM, расчёт в коде ведётся в TON — это одно и то же.
+REAL_SALE_RESPONSE = {"nft_items": [
+    {   # Getgems Sales, 50 TON
+        "address": "0:21fb89b58c779dd566b4eae44590542d76234bdbae879cf2ed0c97ecc328d08b",
+        "collection": {"address": "0:b6d76763aead208254178bc312157d5b730e0b1f0dc4b3ada52afb75959cf3b1",
+                       "name": "Timeless Books"},
+        "metadata": {"name": "Timeless Book #45129",
+                     "attributes": [{"trait_type": "Model", "value": "Cookbook"}]},
+        "sale": {
+            "address": "0:972df524a3aafd933ea65c6554f26915be8f26625dfac58406045af350aaa440",
+            "market": {"address": "0:584ee61b2dff0837116d0fcb5078d93964bcbe9c05fd6a141b1bfca5d6a43e18",
+                       "name": "Getgems Sales", "is_scam": False, "is_wallet": False},
+            "price": {"currency_type": "native", "value": "50000000000",
+                      "decimals": 9, "token_name": "Gram", "verification": "whitelist"}},
+    },
+    {   # Другая площадка: Marketapp Marketplace, 555 TON
+        "address": "0:8f5e4206d3995f1fd595e738ec334ec1cc3f039758b5db362051bf08e0572dfc",
+        "collection": {"address": "0:b6d76763aead208254178bc312157d5b730e0b1f0dc4b3ada52afb75959cf3b1",
+                       "name": "Timeless Books"},
+        "metadata": {"name": "Timeless Book #13398", "attributes": []},
+        "sale": {
+            "address": "0:626e7a4210c8240b42ec86cbd9380eb521d01bac71d1fd4fa98c52bfbaedf5f5",
+            "market": {"address": "0:9a9cb80adfbd1662f5108766d73355ac2c03304fda1d25a479670e34efcd72b3",
+                       "name": "Marketapp Marketplace", "is_scam": False, "is_wallet": True},
+            "price": {"currency_type": "native", "value": "555000000000",
+                      "decimals": 9, "token_name": "Gram", "verification": "whitelist"}},
+    },
+    {   # Getgems Sales, 150 TON
+        "address": "0:89fd8449a17ae4f763652e3fb404b294a104ec217c9c6361c5e199c038416f8a",
+        "collection": {"address": "0:b6d76763aead208254178bc312157d5b730e0b1f0dc4b3ada52afb75959cf3b1",
+                       "name": "Timeless Books"},
+        "metadata": {"name": "Timeless Book #21935", "attributes": []},
+        "sale": {
+            "address": "0:6b10025d989a8f18ededc97c0cd333386be9dcf54c42608b70b94c0160ffafe9",
+            "market": {"address": "0:584ee61b2dff0837116d0fcb5078d93964bcbe9c05fd6a141b1bfca5d6a43e18",
+                       "name": "Getgems Sales", "is_scam": False, "is_wallet": False},
+            "price": {"currency_type": "native", "value": "150000000000",
+                      "decimals": 9, "token_name": "Gram", "verification": "whitelist"}},
+    },
+    {   # Не выставлен: поля sale нет вовсе.
+        "address": "0:e8ff70dd4fe2a1c3de574bef08678f0a7de9c27c763dd844e975b6670f8011c7",
+        "collection": {"address": "0:b6d76763aead208254178bc312157d5b730e0b1f0dc4b3ada52afb75959cf3b1",
+                       "name": "Timeless Books"},
+        "metadata": {"name": "Timeless Book #16450", "attributes": []},
+    },
+]}
+
+
+class _FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+        self.headers = {}
+        self.text = ""
+        # `ok` нужен notify(): он проверяет статус ответа, потому что
+        # requests.post на HTTP-ошибку исключения не бросает.
+        self.ok = 200 <= status_code < 300
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeRequests:
+    """Подменяет только requests.get: сети в тестах нет и быть не должно."""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def get(self, *args, **kwargs):
+        return _FakeResponse(self.payload)
+
+
+_real_requests = gs.requests
+_real_interval = gs.TONAPI_MIN_INTERVAL
+gs.requests = _FakeRequests(REAL_SALE_RESPONSE)
+gs.TONAPI_MIN_INTERVAL = Decimal("0")     # в тестах ждать нечего и некого
+try:
+    parsed = gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+finally:
+    gs.requests = _real_requests
+    gs.TONAPI_MIN_INTERVAL = _real_interval
+
+check("разобраны все 4 предмета", len(parsed) == 4, f"got={len(parsed)}")
+
+on_sale = [i for i in parsed if i["is_on_sale"]]
+check("выставленными считаются ровно 3", len(on_sale) == 3, f"got={len(on_sale)}")
+
+check("нанотоны переводятся в TON",
+      [i["sale_price_ton"] for i in on_sale] == [Decimal("50"), Decimal("555"), Decimal("150")],
+      str([str(i["sale_price_ton"]) for i in on_sale]))
+
+# Регрессия на главный пробел: платёж уходит на контракт продажи, а не на NFT.
+check("адрес контракта продажи сохранён",
+      on_sale[0]["sale_address"] ==
+      "0:972df524a3aafd933ea65c6554f26915be8f26625dfac58406045af350aaa440",
+      on_sale[0]["sale_address"])
+check("адрес продажи НЕ совпадает с адресом предмета",
+      all(i["sale_address"] != i["address"] for i in on_sale))
+
+# Площадки разные, и протокол покупки у них может отличаться. Пока это только
+# фиксируется в данных, но без этого поля различить их будет нечем.
+check("площадка сохранена",
+      [i["sale_market"] for i in on_sale] ==
+      ["Getgems Sales", "Marketapp Marketplace", "Getgems Sales"],
+      str([i["sale_market"] for i in on_sale]))
+
+not_on_sale = [i for i in parsed if not i["is_on_sale"]][0]
+check("у невыставленного лота адрес продажи пуст",
+      not_on_sale["sale_address"] == "" and not_on_sale["sale_market"] == "")
+
+check("номер минта разобран и у выставленных лотов",
+      [i["mint_index"] for i in on_sale] == [45129, 13398, 21935],
+      str([i["mint_index"] for i in on_sale]))
+
+# --- Без адреса контракта продажи покупка невозможна в принципе -------------
+# Проверка стоит ДО ветки DRY_RUN, поэтому симуляция тоже обязана отказать:
+# "успешная" симуляция покупки, которую в живом режиме совершить нельзя,
+# создаёт ложную уверенность в готовности бота.
+_odry = gs.DRY_RUN
+gs.DRY_RUN = True
+try:
+    check("покупка без адреса продажи отклоняется даже в DRY_RUN",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "") is False)
+    check("покупка с адресом продажи в DRY_RUN проходит",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale",
+                                    "Getgems Sales") is True)
+finally:
+    gs.DRY_RUN = _odry
+
+
+# =============================================================================
+print("\n[21] Лимит частоты TonAPI: пауза и ретраи на 429")
+# =============================================================================
+
+# Живой прогон 17.09.2026 поймал 429 на страницах 11-15 из 15: интервал цикла
+# разносит ПАЧКИ запросов, а не запросы внутри пачки, а TonAPI без ключа
+# лимитирует по секундам. Потерянная страница опасна не сама по себе —
+# она молча прореживает выборку, а floor по тонкой выборке завышается.
+
+class _SeqRequests:
+    """Отдаёт заранее заданную последовательность ответов."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def get(self, *args, **kwargs):
+        self.calls += 1
+        return self.responses.pop(0)
+
+
+class _TooManyRequests(_FakeResponse):
+    def __init__(self, retry_after=None, text="rate limit: too many requests"):
+        super().__init__({}, status_code=429)
+        self.text = text
+        if retry_after is not None:
+            self.headers = {"Retry-After": str(retry_after)}
+
+    def raise_for_status(self):
+        raise RuntimeError("429 Client Error: Too Many Requests")
+
+
+_real_requests = gs.requests
+_real_interval = gs.TONAPI_MIN_INTERVAL
+_real_retries = gs.TONAPI_MAX_RETRIES
+gs.TONAPI_MIN_INTERVAL = Decimal("0")
+gs.TONAPI_MAX_RETRIES = 3
+try:
+    # 429 с Retry-After, затем успех: страница обязана прийти, а не потеряться.
+    seq = _SeqRequests([_TooManyRequests(retry_after=0),
+                        _FakeResponse(REAL_SALE_RESPONSE)])
+    gs.requests = seq
+    recovered = gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+    check("после 429 запрос повторяется и страница приходит",
+          len(recovered) == 4 and seq.calls == 2, f"calls={seq.calls}")
+
+    # Лимит попыток конечен: бесконечно долбить API нельзя.
+    seq = _SeqRequests([_TooManyRequests(retry_after=0) for _ in range(3)])
+    gs.requests = seq
+    try:
+        gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+        raised = _msg = False
+    except gs.RateLimited as e:
+        raised, _msg = True, str(e)
+    check("непрерывный 429 в итоге бросает исключение, а не молчит", raised)
+    # Сообщение обязано называть лечение: без ключа квота анонимного доступа
+    # так мала, что «подождать» не помогает — нужен TONAPI_KEY.
+    check("в сообщении названо лечение (ключ TonAPI)",
+          _msg and "TONAPI_KEY" in _msg and "tonconsole" in _msg, str(_msg))
+    check("попыток ровно TONAPI_MAX_RETRIES", seq.calls == 3, f"calls={seq.calls}")
+
+    # Пауза между запросами реально выдерживается.
+    gs.TONAPI_MIN_INTERVAL = Decimal("0.2")
+    gs._tonapi_last_call = 0.0
+    gs.requests = _SeqRequests([_FakeResponse(REAL_SALE_RESPONSE) for _ in range(3)])
+    _t0 = time.monotonic()
+    for _ in range(3):
+        gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+    _elapsed = time.monotonic() - _t0
+    check("между запросами выдерживается пауза",
+          _elapsed >= 0.4, f"elapsed={_elapsed:.2f}s")
+finally:
+    gs.requests = _real_requests
+    gs.TONAPI_MIN_INTERVAL = _real_interval
+    gs.TONAPI_MAX_RETRIES = _real_retries
+    gs._tonapi_last_call = 0.0
+
+
+# =============================================================================
+print("\n[22] Прерывистая запись: дыра != закрытая позиция")
+# =============================================================================
+
+# Сценарий пользователя: ПК работает с утра до вечера, ночью выключен.
+# Покупка вечером ищет floor через 24 часа — а ближайший снапшот находится
+# только следующим утром. Без проверки зазора бэктест назвал бы результат
+# 33-часового удержания результатом суточного, и шапка отчёта врала бы.
+_snaps_gap = [
+    {"ts": 1000.0, "floor": Decimal("5")},                    # покупка здесь
+    {"ts": 1000.0 + 24 * 3600 + 3600, "floor": Decimal("6")},  # +25ч: зазор 1ч
+]
+_floor, _why = gs._future_floor(_snaps_gap, 1000.0 + 24 * 3600, max_slack_sec=6 * 3600)
+check("снапшот в пределах допуска закрывает позицию",
+      _floor == Decimal("6") and _why is None, f"{_floor} {_why}")
+
+_snaps_hole = [
+    {"ts": 1000.0, "floor": Decimal("5")},
+    {"ts": 1000.0 + 33 * 3600, "floor": Decimal("6")},         # +33ч: зазор 9ч
+]
+_floor, _why = gs._future_floor(_snaps_hole, 1000.0 + 24 * 3600, max_slack_sec=6 * 3600)
+check("слишком поздний снапшот НЕ закрывает позицию",
+      _floor is None and _why == "gap", f"{_floor} {_why}")
+
+# Конец записи и дыра — разные вещи: первое лечится ожиданием, второе нет.
+_floor, _why = gs._future_floor([{"ts": 1000.0, "floor": Decimal("5")}],
+                                1000.0 + 24 * 3600, max_slack_sec=6 * 3600)
+check("конец записи отличается от дыры",
+      _floor is None and _why == "end", f"{_floor} {_why}")
+
+# Регрессия на подгонку: дыра не должна тихо превратиться в прибыль.
+# Floor вырос с 5 до 6 — засчитав такую позицию, бэктест показал бы плюс,
+# которого не было.
+check("дыра не даёт бэктесту засчитать выгодный исход",
+      gs._future_floor(_snaps_hole, 1000.0 + 24 * 3600,
+                       max_slack_sec=6 * 3600)[0] is None)
+
+
+# =============================================================================
+print("\n[23] Доступность коллекции банку")
+# =============================================================================
+
+_ob, _or_, _op = gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT
+gs.BANKROLL_TON = Decimal("10")
+gs.RESERVE_TON = Decimal("5")
+gs.MAX_POSITION_PCT = Decimal("10")
+try:
+    # Граница выводится из формулы прибыли, а не подбирается: покупка ровно
+    # по Buy_max даёт ноль, на копейку дороже — убыток.
+    _floor = Decimal("4.72")
+    _bmax = gs.max_profitable_buy(_floor)
+    check("покупка по Buy_max даёт около нуля",
+          abs(gs.compute_net_profit(_floor, _bmax)) < Decimal("0.000001"),
+          str(gs.compute_net_profit(_floor, _bmax)))
+    check("на копейку дороже Buy_max — уже убыток",
+          gs.compute_net_profit(_floor, _bmax + Decimal("0.01")) < 0)
+
+    # Тот самый случай пользователя: банк 10 TON против floor 4.72.
+    _aff = gs.affordability(_floor)
+    check("потолок сделки при банке 10 TON равен 1 TON",
+          _aff["cap"] == Decimal("1"), str(_aff["cap"]))
+    check("коллекция с floor 4.72 банку недоступна",
+          _aff["verdict"] == "нет", _aff["verdict"])
+    check("требуемая скидка честно огромная",
+          _aff["discount_pct"] > 75, f"{_aff['discount_pct']:.0f}%")
+
+    # Дешёвая коллекция доступна, но газ поднимает требуемую скидку —
+    # «чем дешевле, тем лучше» неверно.
+    check("floor 1.0 банку доступен",
+          gs.affordability(Decimal("1.0"))["verdict"] == "да")
+    check("газ делает совсем дешёвую коллекцию хуже средней",
+          gs.affordability(Decimal("0.3"))["discount_pct"] >
+          gs.affordability(Decimal("1.0"))["discount_pct"])
+
+    # Без банка вердикта нет: молчаливое "да" отправило бы торговать вслепую.
+    gs.BANKROLL_TON = Decimal("0")
+    check("без заданного банка вердикт не выносится",
+          gs.affordability(_floor)["verdict"] == "банк не задан")
+    check("--afford без банка ничего не печатает",
+          gs.show_affordability() is None)
+finally:
+    gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT = _ob, _or_, _op
+
+
+# =============================================================================
+print("\n[24] Повышенный лимит для исключительно выгодных сделок")
+# =============================================================================
+
+# Читаем ЗНАЧЕНИЕ ПО УМОЛЧАНИЮ из исходника: у пользователя, включившего
+# механизм своим `set`, глобальная переменная другая — и тест падал бы на
+# совершенно верном коде.
+# Решение: по умолчанию повышенный лимит РАВЕН обычному, то есть выключен.
+# В исходнике это записано как os.getenv(..., str(MAX_POSITION_PCT)), поэтому
+# проверяем именно это, а не значение глобальной переменной: у пользователя,
+# включившего механизм своим `set`, она другая — и тест падал бы на верном коде.
+_src_high_roi = open("gift_sniper.py", encoding="utf-8").read()
+check("по умолчанию механизм ВЫКЛЮЧЕН (равен обычному лимиту)",
+      'os.getenv("MAX_POSITION_PCT_HIGH_ROI", str(MAX_POSITION_PCT))' in _src_high_roi)
+
+# И семантика: равные проценты обязаны означать "механизм не действует".
+_op_hi, _oh_hi = gs.MAX_POSITION_PCT, gs.MAX_POSITION_PCT_HIGH_ROI
+gs.MAX_POSITION_PCT = gs.MAX_POSITION_PCT_HIGH_ROI = Decimal("10")
+check("при равных процентах высокий ROI потолок не поднимает",
+      gs.position_pct_for(Decimal("999")) == gs.position_pct_for(None))
+gs.MAX_POSITION_PCT, gs.MAX_POSITION_PCT_HIGH_ROI = _op_hi, _oh_hi
+
+_f = Decimal("3.0")
+check("граница ROI=0 совпадает с границей безубыточности",
+      gs.max_buy_at_roi(_f, Decimal("0")) == gs.max_profitable_buy(_f))
+
+# Цена, выведенная для ROI=100%, обязана давать ровно 100% при обратном счёте.
+_b100 = gs.max_buy_at_roi(_f, Decimal("100"))
+_roi_back = gs.compute_roi_pct(gs.compute_net_profit(_f, _b100), _b100)
+check("цена для ROI=100% действительно даёт 100%",
+      abs(_roi_back - Decimal("100")) < Decimal("0.05"), str(_roi_back))
+
+# Регрессия на ошибку, которую я сам допустил: нельзя считать повышенный
+# потолок против границы БЕЗУБЫТОЧНОСТИ. Требование ROI>=100% режет цену
+# вдвое, и смешение этих двух порогов обещало бы доступность там, где её нет.
+check("требование высокого ROI ужимает цену сильнее безубыточности",
+      _b100 < gs.max_profitable_buy(_f) / Decimal("1.9"),
+      f"{_b100} vs {gs.max_profitable_buy(_f)}")
+
+_ob, _or_, _op, _oh, _ohr = (gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT,
+                             gs.HIGH_ROI_PCT, gs.MAX_POSITION_PCT_HIGH_ROI)
+gs.BANKROLL_TON = Decimal("10")
+gs.RESERVE_TON = Decimal("5")
+gs.MAX_POSITION_PCT = Decimal("10")
+gs.HIGH_ROI_PCT = Decimal("100")
+gs.MAX_POSITION_PCT_HIGH_ROI = Decimal("30")
+
+# Предыдущие секции оставили позиции в тестовой БД. Здесь проверяются
+# ИМЕННО лимиты по цене, поэтому состояние БД подменяем на чистое —
+# иначе тест падал бы из-за чужих данных, а не из-за логики.
+_db_stubs = {name: getattr(gs, name) for name in
+             ("deployed_capital", "consecutive_losses",
+              "open_positions_count", "spend_since")}
+gs.deployed_capital = lambda: Decimal("0")
+gs.consecutive_losses = lambda: 0
+gs.open_positions_count = lambda: 0
+gs.spend_since = lambda _sec: Decimal("0")
+try:
+    check("обычная сделка ограничена обычным потолком",
+          gs.max_position_size(Decimal("20")) == Decimal("1"),
+          str(gs.max_position_size(Decimal("20"))))
+    check("сделка с ROI выше порога получает повышенный потолок",
+          gs.max_position_size(Decimal("150")) == Decimal("3"),
+          str(gs.max_position_size(Decimal("150"))))
+    check("ровно на пороге повышенный лимит уже действует",
+          gs.max_position_size(Decimal("100")) == Decimal("3"))
+    check("без указания ROI потолок остаётся обычным",
+          gs.max_position_size() == Decimal("1"))
+
+    # Главное: повышенный потолок НЕ отменяет остальные лимиты. Свободно
+    # 5 TON (банк 10 минус резерв 5), и 6 TON не пройдут ни при каком ROI.
+    _ok, _why = gs.check_risk_limits(Decimal("2.5"), Decimal("150"))
+    check("дорогая сделка с высоким ROI проходит потолок", _ok, _why)
+    _ok, _why = gs.check_risk_limits(Decimal("2.5"), Decimal("20"))
+    check("та же цена при обычном ROI отсекается", not _ok, _why)
+
+    gs.MAX_POSITION_PCT_HIGH_ROI = Decimal("90")
+    _ok, _why = gs.check_risk_limits(Decimal("6"), Decimal("500"))
+    check("резерв не обходится даже при исключительном ROI", not _ok, _why)
+    check("причина отказа указывает на банк, а не на потолок",
+          "резерв" in _why, _why)
+finally:
+    (gs.BANKROLL_TON, gs.RESERVE_TON, gs.MAX_POSITION_PCT,
+     gs.HIGH_ROI_PCT, gs.MAX_POSITION_PCT_HIGH_ROI) = _ob, _or_, _op, _oh, _ohr
+    for _name, _fn in _db_stubs.items():
+        setattr(gs, _name, _fn)
+
+
+# =============================================================================
+print("\n[25] Оценка по похожим лотам: ошибка продавца или ловушка")
+# =============================================================================
+
+# Сегменты: Cookbook дешёвый, Bible дорогой. Floor коллекции определяется
+# дешёвым сегментом, и именно поэтому оценивать по нему лот из дорогого
+# сегмента — ошибка, а из дешёвого — самообман.
+def mk_peer_item(model, price, addr="0:p"):
+    return {"address": addr, "sale_price_ton": Decimal(str(price)),
+            "is_on_sale": True, "mint_index": 5000,
+            "traits": {"model": model, "backdrop": "Grey"}}
+
+
+_pool = ([mk_peer_item("Cookbook", p) for p in ("1.0", "1.1", "1.2", "1.3", "1.5")] +
+         [mk_peer_item("Bible", p) for p in ("8.0", "8.5", "9.0", "9.5", "10.0")])
+_peers = gs.build_peer_prices(_pool)
+
+check("сегменты разделены по ключевому трейту",
+      sorted(_peers) == ["Bible", "Cookbook"], str(sorted(_peers)))
+_pf, _pn = gs.peer_floor(mk_peer_item("Bible", "9"), _peers)
+check("floor дорогого сегмента выше floor коллекции",
+      _pf is not None and _pf > Decimal("1.5"), str(_pf))
+check("размер выборки сегмента возвращается", _pn == 5, str(_pn))
+
+# Меньше MIN_PEER_SAMPLE — сравнивать не с чем, и это НЕ "всё хорошо".
+_thin = gs.build_peer_prices([mk_peer_item("Rare", "3.0")])
+_pf, _pn = gs.peer_floor(mk_peer_item("Rare", "1.0"), _thin)
+check("тонкий сегмент не даёт оценки", _pf is None and _pn == 1, f"{_pf} {_pn}")
+_pf, _pn = gs.peer_floor({"traits": {}}, _peers)
+check("лот без ключевого трейта не сравнивается", _pf is None and _pn == 0)
+
+# --- Развилка целиком -------------------------------------------------------
+_snap_peers = {"floor": Decimal("1.0"), "floor_reliable": True, "competition": 0,
+               "trait_index": {}, "trait_total": 0, "peer_prices": _peers}
+
+# Лот из ДОРОГОГО сегмента по цене дешёвого сегмента — ошибка продавца.
+# Оценка берёт минимум, то есть floor коллекции: прибыль не завышается.
+_ev = gs.evaluate_trade(mk_peer_item("Bible", "0.3", "0:mistake"), _snap_peers, None)
+check("дешёвый лот из дорогого сегмента считается по floor коллекции",
+      _ev["eff_floor"] == Decimal("1.0"), str(_ev["eff_floor"]))
+check("оценка по сегменту НЕ завышает прибыль",
+      _ev["eff_floor"] <= _snap_peers["floor"])
+
+# Лот из дешёвого сегмента: floor сегмента выше floor коллекции, берём floor.
+_ev = gs.evaluate_trade(mk_peer_item("Cookbook", "0.5", "0:cheapseg"), _snap_peers, None)
+check("лот дешёвого сегмента оценивается не выше floor коллекции",
+      _ev["eff_floor"] <= Decimal("1.0"), str(_ev["eff_floor"]))
+
+# Главное: глубокая скидка БЕЗ данных о похожих — отказ, а не покупка.
+_snap_blind = dict(_snap_peers, floor=Decimal("10"), peer_prices={})
+_ev = gs.evaluate_trade(mk_peer_item("Unknown", "1.0", "0:blind"), _snap_blind, None)
+check("скидка 90% без похожих лотов отклоняется",
+      not _ev["allowed"] and "сравнить не с чем" in _ev["reason"], _ev["reason"])
+check("скидка посчитана верно",
+      _ev["discount_pct"] == Decimal("90.0"), str(_ev["discount_pct"]))
+
+# Та же скидка, но похожие лоты есть и подтверждают её — сделка проходит.
+_confirm = gs.build_peer_prices([mk_peer_item("Solid", p) for p in
+                                 ("9.0", "9.5", "10.0", "10.5", "11.0")])
+_snap_ok = dict(_snap_peers, floor=Decimal("10"), peer_prices=_confirm)
+_ev = gs.evaluate_trade(mk_peer_item("Solid", "1.0", "0:real"), _snap_ok, None)
+check("та же скидка с подтверждением по похожим разрешена",
+      _ev["allowed"], _ev["reason"])
+
+# Умеренная скидка без данных о похожих проходит как раньше: ворота
+# ставились именно на ГЛУБОКУЮ скидку, а не на любую.
+_snap_mid = dict(_snap_peers, floor=Decimal("10"), peer_prices={})
+_ev = gs.evaluate_trade(mk_peer_item("Unknown", "5.0", "0:mid"), _snap_mid, None)
+check("умеренная скидка без похожих не блокируется",
+      _ev["allowed"], _ev["reason"])
+
+
+# =============================================================================
+print("\n[26] Выход из позиции: держим до floor, стоп при обвале")
+# =============================================================================
+
+_buy = Decimal("10")
+
+# Основной сценарий: ждём покупателя, пока не вышел срок.
+_d = gs.decide_exit(_buy, Decimal("12"), held_hours=5, hold_hours=24)
+check("пока floor держится — держим позицию", _d["action"] == "hold", _d["reason"])
+check("при удержании цена продажи не назначается", _d["sell_price"] is None)
+
+_d = gs.decide_exit(_buy, Decimal("12"), held_hours=24, hold_hours=24)
+check("по истечении срока продаём", _d["action"] == "sell", _d["reason"])
+check("продаём ниже floor (undercut)",
+      _d["sell_price"] < Decimal("12"), str(_d["sell_price"]))
+
+# Стоп-лосс: floor уехал ниже цены ПОКУПКИ более чем на порог.
+_d = gs.decide_exit(_buy, Decimal("7"), held_hours=10, hold_hours=24)
+check("обвал floor включает стоп-лосс", _d["action"] == "stop", _d["reason"])
+check("в причине названы цифры, а не просто 'стоп'",
+      "30.0%" in _d["reason"] and "порог" in _d["reason"], _d["reason"])
+
+# Выдержка: та же просадка, но позиция слишком молодая. На тонком рынке floor
+# скачет от одного снятого лота, и мгновенный стоп фиксировал бы убыток там,
+# где floor вернулся бы сам.
+_d = gs.decide_exit(_buy, Decimal("7"), held_hours=1, hold_hours=24)
+check("ранняя просадка не фиксируется", _d["action"] == "hold", _d["reason"])
+check("но причина объясняет, что стоп отложен",
+      "стоп с" in _d["reason"], _d["reason"])
+
+# Стоп проверяется РАНЬШЕ срока удержания: досиживать в убытке бессмысленно.
+_d = gs.decide_exit(_buy, Decimal("5"), held_hours=48, hold_hours=24)
+check("при обвале выход помечается стопом, а не плановой продажей",
+      _d["action"] == "stop", _d["reason"])
+
+# Порог считается от цены ПОКУПКИ, а не от floor на входе, и он точный:
+# при покупке за 4 стоп начинается ровно с floor 3.0 (падение 25%).
+_d = gs.decide_exit(Decimal("4"), Decimal("3.0"), held_hours=10, hold_hours=24)
+check("падение ровно на порог включает стоп", _d["action"] == "stop", _d["reason"])
+_d = gs.decide_exit(Decimal("4"), Decimal("2.9"), held_hours=10, hold_hours=24)
+check("падение глубже порога тоже включает стоп", _d["action"] == "stop")
+_d = gs.decide_exit(Decimal("4"), Decimal("3.1"), held_hours=10, hold_hours=24)
+check("падение чуть меньше порога стоп НЕ включает",
+      _d["action"] == "hold", _d["reason"])
+
+# Выключенный стоп-лосс возвращает поведение "держать до срока".
+_oen = gs.ENABLE_STOP_LOSS
+gs.ENABLE_STOP_LOSS = False
+try:
+    _d = gs.decide_exit(_buy, Decimal("5"), held_hours=10, hold_hours=24)
+    check("с выключенным стопом позиция держится", _d["action"] == "hold", _d["reason"])
+finally:
+    gs.ENABLE_STOP_LOSS = _oen
+
+# --- Бэктест обязан вызывать ЭТУ ЖЕ функцию --------------------------------
+_exit_snaps = [{"ts": 0.0, "floor": Decimal("10")},
+               {"ts": 10 * 3600, "floor": Decimal("5")}]     # обвал через 10ч
+_res = gs._simulate_exit(_exit_snaps, 0.0, Decimal("10"), 24, False)
+check("бэктест закрывает позицию по стопу, а не ждёт срока",
+      _res["status"] == "closed" and _res["exit"] == "stop", str(_res))
+check("стоп фиксирует убыток, а не рисует прибыль",
+      _res["pnl"] < 0, str(_res.get("pnl")))
+
+_ok_snaps = [{"ts": 0.0, "floor": Decimal("10")},
+             {"ts": 25 * 3600, "floor": Decimal("11")}]
+_res = gs._simulate_exit(_ok_snaps, 0.0, Decimal("5"), 24, False)
+check("нормальный выход помечается как плановая продажа",
+      _res["status"] == "closed" and _res["exit"] == "sell", str(_res))
+
+# Дыра обесценивает выход ПО СРОКУ, но не должна маскировать стоп.
+_gap_snaps = [{"ts": 0.0, "floor": Decimal("10")},
+              {"ts": 70 * 3600, "floor": Decimal("11")}]
+_res = gs._simulate_exit(_gap_snaps, 0.0, Decimal("5"), 24, False)
+check("плановый выход через дыру не засчитывается",
+      _res["status"] == "open" and _res["missing"] == "gap", str(_res))
+
+
+# =============================================================================
+print("\n[27] Уведомления в Telegram")
+# =============================================================================
+
+_sent = []
+
+
+class _CaptureRequests:
+    """Перехватывает исходящие сообщения вместо похода в сеть."""
+
+    def post(self, url, json=None, timeout=None):
+        _sent.append((url, json))
+        return _FakeResponse({"ok": True})
+
+
+_otok, _ochat, _ohb = (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.HEARTBEAT_MIN)
+_oreq = gs.requests
+try:
+    # Без токена — полная тишина, и это не ошибка: уведомления необязательны.
+    gs.TELEGRAM_BOT_TOKEN = ""
+    gs.requests = _CaptureRequests()
+    check("без токена сводка не шлётся",
+          gs.notify_heartbeat([], force=True) is False and not _sent)
+    check("без токена стартовое сообщение не шлётся",
+          gs.notify_startup(["0:a"]) is False and not _sent)
+
+    gs.TELEGRAM_BOT_TOKEN = "123:test"
+    gs.TELEGRAM_CHAT_ID = "42"
+    gs.HEARTBEAT_MIN = 60
+    gs._last_heartbeat = 0.0
+
+    _snap = {"collection": "0:abcdef0123456789", "floor": Decimal("4.72"),
+             "sample_size": 120, "floor_reliable": True}
+    check("сводка уходит при force", gs.notify_heartbeat([_snap], force=True) is True)
+    _body = _sent[-1][1]["text"]
+    check("в сводке есть floor и размер выборки",
+          "4.72" in _body and "120" in _body, _body)
+
+    # Второй вызов подряд должен промолчать: уведомление каждую минуту
+    # перестают читать, и тогда теряется то единственное, ради чего оно есть.
+    _before = len(_sent)
+    check("сводка не повторяется до истечения интервала",
+          gs.notify_heartbeat([_snap]) is False and len(_sent) == _before)
+
+    # Недостоверный floor обязан быть виден в телефоне, а не только в логе.
+    gs._last_heartbeat = 0.0
+    gs.notify_heartbeat([dict(_snap, floor_reliable=False)], force=True)
+    check("мала выборка отмечается в сводке",
+          "выборка мала" in _sent[-1][1]["text"], _sent[-1][1]["text"])
+
+    gs._last_heartbeat = 0.0
+    gs.notify_heartbeat([{"collection": "0:dead", "sample_size": 0}], force=True)
+    check("коллекция без данных отмечается отдельно",
+          "данных нет" in _sent[-1][1]["text"], _sent[-1][1]["text"])
+
+    # Стартовое сообщение должно называть режим и предупреждать про whitelist:
+    # настройки на Windows теряются при перезапуске, и тихий старт с чужими
+    # значениями — самый дешёвый способ испортить запись.
+    _owl, _odry = gs.COLLECTION_WHITELIST, gs.DRY_RUN
+    gs.COLLECTION_WHITELIST, gs.DRY_RUN = [], True
+    gs.notify_startup(["0:a", "0:b"])
+    _body = _sent[-1][1]["text"]
+    check("в старте указан режим симуляции", "СИМУЛЯЦИЯ" in _body, _body)
+    check("в старте указано число коллекций", "Коллекций: 2" in _body, _body)
+    check("пустой whitelist попадает в уведомление",
+          "whitelist пуст" in _body, _body)
+    gs.COLLECTION_WHITELIST, gs.DRY_RUN = _owl, _odry
+
+    # Токен не должен утечь в текст сообщения — только в URL запроса.
+    check("токен не попадает в тело сообщения",
+          all("123:test" not in (j or {}).get("text", "") for _, j in _sent))
+finally:
+    (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+     gs.HEARTBEAT_MIN) = _otok, _ochat, _ohb
+    gs.requests = _oreq
+    gs._last_heartbeat = 0.0
+
+
+# =============================================================================
+print("\n[28] Поиск коллекций под банк (--discover)")
+# =============================================================================
+
+_ob = gs.BANKROLL_TON
+_oreq = gs.requests
+_osnap = gs.get_market_snapshot
+_oint = gs.TONAPI_MIN_INTERVAL
+gs.TONAPI_MIN_INTERVAL = Decimal("0")
+try:
+    gs.BANKROLL_TON = Decimal("0")
+    check("без банка поиск не запускается", gs.discover_collections() is None)
+
+    gs.BANKROLL_TON = Decimal("10")
+    gs.RESERVE_TON = Decimal("5")
+    gs.MAX_POSITION_PCT = Decimal("10")
+
+    # Форма ответа этого эндпоинта НЕ проверена на живых данных. Главное
+    # требование: при неожиданном ответе честно сказать "не разобрал", а не
+    # вернуть пустой список — пустой список читается как "подходящих нет",
+    # и это увело бы поиск не в ту сторону.
+    gs.requests = _FakeRequests({"unexpected_key": [1, 2, 3]})
+    check("неразобранный ответ возвращает None, а не пустой список",
+          gs.discover_collections() is None)
+
+    _api = {"nft_collections": [
+        {"address": "0:cheap", "metadata": {"name": "Cheap Gifts"}},
+        {"address": "0:rich", "metadata": {"name": "Expensive Gifts"}},
+        {"address": "0:thin", "metadata": {"name": "No Data"}},
+    ]}
+    _floors = {"0:cheap": Decimal("1.0"), "0:rich": Decimal("50.0"),
+               "0:thin": Decimal("0")}
+
+    def _fake_snapshot(addr):
+        floor = _floors[addr]
+        return {"floor": floor, "sample_size": 100 if floor > 0 else 0,
+                "floor_reliable": floor > 0}
+
+    gs.requests = _FakeRequests(_api)
+    gs.get_market_snapshot = _fake_snapshot
+    _found = gs.discover_collections()
+
+    check("найдена только доступная банку коллекция",
+          [c["address"] for c in _found] == ["0:cheap"],
+          str([c["address"] for c in _found]))
+    check("дорогая коллекция отсеяна по банку",
+          all(c["address"] != "0:rich" for c in _found))
+    check("коллекция без достоверного floor отсеяна",
+          all(c["address"] != "0:thin" for c in _found))
+    check("имя коллекции взято из metadata",
+          _found[0]["name"] == "Cheap Gifts", _found[0]["name"])
+
+    # Ни одной подходящей — это [] (искали и не нашли), а не None
+    # (не смогли разобрать). Разница определяет, что делать дальше.
+    _floors["0:cheap"] = Decimal("50.0")
+    gs.requests = _FakeRequests(_api)
+    check("'не нашлось' отличается от 'не разобрал'",
+          gs.discover_collections() == [])
+finally:
+    gs.BANKROLL_TON = _ob
+    gs.requests = _oreq
+    gs.get_market_snapshot = _osnap
+    gs.TONAPI_MIN_INTERVAL = _oint
+
+
+# =============================================================================
+print("\n[29] Площадки: floor по каждой и арбитраж между ними")
+# =============================================================================
+
+def mk_market_item(market, price, addr="0:m"):
+    return {"address": addr, "sale_price_ton": Decimal(str(price)),
+            "is_on_sale": True, "sale_market": market, "traits": {}}
+
+
+# TonAPI читает блокчейн, поэтому лоты разных площадок приходят вперемешку
+# в одном ответе. Общий floor их усредняет — и прячет разницу.
+_mixed = ([mk_market_item("Getgems Sales", p) for p in
+           ("10.0", "10.5", "11.0", "11.5", "12.0")] +
+          [mk_market_item("Marketapp Marketplace", p) for p in
+           ("6.0", "6.5", "7.0", "7.5", "8.0")])
+_mf = gs.build_market_floors(_mixed)
+
+check("площадки разделены", sorted(_mf) == ["Getgems Sales", "Marketapp Marketplace"],
+      str(sorted(_mf)))
+check("у каждой площадки свой floor",
+      _mf["Marketapp Marketplace"]["floor"] < _mf["Getgems Sales"]["floor"],
+      f"{_mf['Marketapp Marketplace']['floor']} vs {_mf['Getgems Sales']['floor']}")
+check("размер выборки по площадке сохранён",
+      _mf["Getgems Sales"]["n"] == 5, str(_mf["Getgems Sales"]["n"]))
+
+# Общий floor лежит МЕЖДУ floor площадок — это и есть усреднение, из-за
+# которого разница была не видна.
+_all_prices = sorted(Decimal(str(i["sale_price_ton"])) for i in _mixed)
+_common = gs._percentile(_all_prices, gs.FLOOR_PERCENTILE)
+check("общий floor маскирует разницу между площадками",
+      _mf["Marketapp Marketplace"]["floor"] <= _common <= _mf["Getgems Sales"]["floor"],
+      str(_common))
+
+# Тонкая выборка по площадке -> floor не считается. Одна цена не floor.
+_thin = gs.build_market_floors([mk_market_item("Rare Market", "1.0")])
+check("по одному лоту floor площадки не считается",
+      _thin["Rare Market"]["floor"] is None and _thin["Rare Market"]["n"] == 1)
+
+# Лот без названия площадки не теряется: он попадает в отдельную корзину,
+# а не исчезает из выборки молча.
+_noname = gs.build_market_floors([mk_market_item("", p) for p in
+                                  ("1.0", "1.1", "1.2", "1.3")])
+check("лоты без площадки не теряются",
+      "(площадка неизвестна)" in _noname, str(list(_noname)))
+
+# --- Отчёт по записи --------------------------------------------------------
+import tempfile as _tf
+_mdir = _tf.mkdtemp()
+_mpath = os.path.join(_mdir, "markets.jsonl")
+
+
+def _mk_market_snap(ts, cheap_floor, rich_floor):
+    return {"ts": ts, "collection": "0:coll", "floor": str(cheap_floor),
+            "sample_size": 100, "competition": 0, "floor_reliable": True,
+            "trait_index": {}, "trait_total": 0, "peer_prices": {},
+            "candidates": [],
+            "market_floors": {
+                "Marketapp Marketplace": {"n": 20, "floor": str(cheap_floor)},
+                "Getgems Sales": {"n": 20, "floor": str(rich_floor)}}}
+
+
+with open(_mpath, "w", encoding="utf-8") as f:
+    for i in range(10):
+        f.write(_json.dumps(_mk_market_snap(i * 3600, "6.0", "10.0")) + "\n")
+
+_rep = gs.market_report(_mpath)
+check("отчёт по площадкам построен", _rep and len(_rep) == 1, str(_rep))
+check("дешёвая площадка определена верно",
+      _rep[0]["cheapest"] == "Marketapp Marketplace", _rep[0]["cheapest"])
+check("дорогая площадка определена верно",
+      _rep[0]["richest"] == "Getgems Sales", _rep[0]["richest"])
+check("разброс посчитан",
+      abs(_rep[0]["spread_pct"] - Decimal("66.67")) < Decimal("0.1"),
+      str(_rep[0]["spread_pct"]))
+check("арбитраж считается ТОЙ ЖЕ экономикой, что и обычная сделка",
+      _rep[0]["profit"] == gs.compute_net_profit(Decimal("10.0"), Decimal("6.0")),
+      str(_rep[0]["profit"]))
+
+# Разброс меньше комиссий — это не арбитраж, и отчёт обязан так и сказать.
+_narrow = os.path.join(_mdir, "narrow.jsonl")
+with open(_narrow, "w", encoding="utf-8") as f:
+    for i in range(10):
+        f.write(_json.dumps(_mk_market_snap(i * 3600, "10.0", "10.2")) + "\n")
+_rep = gs.market_report(_narrow)
+check("узкий разброс не выдаётся за прибыль", _rep[0]["profit"] < 0,
+      str(_rep[0]["profit"]))
+
+# Старая запись без market_floors: честный отказ, а не пустой отчёт.
+_old = os.path.join(_mdir, "old.jsonl")
+with open(_old, "w", encoding="utf-8") as f:
+    f.write(_json.dumps({"ts": 0, "collection": "0:c", "floor": "1.0",
+                        "sample_size": 10, "competition": 0,
+                        "floor_reliable": True, "candidates": []}) + "\n")
+check("запись без данных о площадках распознаётся",
+      gs.market_report(_old) is None)
+
+
+# =============================================================================
+print("\n[32] Лимит квоты прекращает обход страниц, а не грызёт их дальше")
+# =============================================================================
+
+# Живой прогон 17.09.2026: 429 на ПЕРВОЙ же странице, все три попытки. Это не
+# темп запросов, а исчерпанная квота анонимного доступа. Продолжать обход
+# оставшихся 14 страниц бессмысленно — при пяти коллекциях это 70 заведомо
+# мусорных запросов за цикл, которые только углубляют блокировку.
+
+class _AlwaysLimited:
+    def __init__(self):
+        self.calls = 0
+
+    def get(self, *a, **k):
+        self.calls += 1
+        return _TooManyRequests(retry_after=0)
+
+
+_oreq32 = gs.requests
+_oint32 = gs.TONAPI_MIN_INTERVAL
+_opages = gs.FLOOR_SAMPLE_PAGES
+gs.TONAPI_MIN_INTERVAL = Decimal("0")
+gs.FLOOR_SAMPLE_PAGES = 15
+try:
+    _lim = _AlwaysLimited()
+    gs.requests = _lim
+    _items, _source, _exh = gs._collect_sample(
+        "EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF")
+
+    # 3 попытки на первую страницу + 1 запрос к Getgems-фолбэку = 4.
+    # Если бы обход продолжался, было бы 15 x 3 = 45 запросов.
+    check("после лимита остальные страницы НЕ запрашиваются",
+          _lim.calls <= 4, f"запросов={_lim.calls}")
+    check("выборка пуста, а не наполовину собрана", _items == [])
+    check("источник помечен как недоступный", _source == "none", _source)
+    # Упёрлись в квоту — это НЕ «дошли до конца коллекции». Иначе оборванный
+    # лимитом обход объявил бы покрытие 100% по огрызку выборки, то есть
+    # ровно та ошибка, от которой покрытие и заводилось.
+    check("лимит НЕ засчитывается как полный обход", _exh is False)
+finally:
+    gs.requests = _oreq32
+    gs.TONAPI_MIN_INTERVAL = _oint32
+    gs.FLOOR_SAMPLE_PAGES = _opages
+
+
+# =============================================================================
+print("\n[33] Суточная квота: ждать надо часы, а не секунды")
+# =============================================================================
+
+# Дословный ответ TonAPI, снятый пользователем в браузере 17.09.2026:
+#   {"error":"rate limit: anonymous tier daily traffic is spent,
+#             resets at UTC midnight"}
+# Это НЕ «слишком часто» — это «на сегодня всё». Ретраить бессмысленно, а
+# продолжать слать запросы до полуночи UTC — жечь исчерпанный лимит и
+# засорять лог.
+_DAILY_BODY = ('{"error":"rate limit: anonymous tier daily traffic is spent, '
+               'resets at UTC midnight"}')
+
+_oreq33, _oint33 = gs.requests, gs.TONAPI_MIN_INTERVAL
+_oquota = gs._tonapi_quota_until
+gs.TONAPI_MIN_INTERVAL = Decimal("0")
+gs._tonapi_quota_until = 0.0
+try:
+    _daily = _SeqRequests([_TooManyRequests(retry_after=0, text=_DAILY_BODY)])
+    gs.requests = _daily
+    try:
+        gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+        _raised, _why = False, ""
+    except gs.RateLimited as e:
+        _raised, _why = True, str(e)
+
+    check("суточная квота распознана", _raised, _why)
+    check("на суточную квоту НЕ тратятся ретраи",
+          _daily.calls == 1, f"запросов={_daily.calls}")
+    check("в сообщении назван срок сброса",
+          "полночь UTC" in _why, _why)
+    check("в сообщении названо лечение",
+          "TONAPI_KEY" in _why, _why)
+
+    # Метка выставлена — следующий запрос не должен даже уйти в сеть.
+    check("после суточной квоты запросы не уходят вовсе",
+          gs._tonapi_quota_until > time.time())
+    _after = _SeqRequests([_FakeResponse(REAL_SALE_RESPONSE)])
+    gs.requests = _after
+    try:
+        gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)
+        _blocked = False
+    except gs.RateLimited:
+        _blocked = True
+    check("запрос до сброса квоты даже не отправляется",
+          _blocked and _after.calls == 0, f"запросов={_after.calls}")
+
+    # Сброс квоты возвращает бота к работе сам, без перезапуска.
+    gs._tonapi_quota_until = 0.0
+    gs.requests = _SeqRequests([_FakeResponse(REAL_SALE_RESPONSE)])
+    check("после сброса квоты работа возобновляется",
+          len(gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)) == 4)
+
+    # Обычный 429 («слишком часто») ретраится как раньше — путать нельзя.
+    gs._tonapi_quota_until = 0.0
+    _burst = _SeqRequests([_TooManyRequests(retry_after=0),
+                           _FakeResponse(REAL_SALE_RESPONSE)])
+    gs.requests = _burst
+    check("обычный 429 по-прежнему ретраится",
+          len(gs.fetch_items_tonapi("EQC212djrq0gglQXi8MSFX1bcw4LHw3Es62lKvt1lZzzsYuF", 50)) == 4
+          and _burst.calls == 2, f"запросов={_burst.calls}")
+    check("обычный 429 НЕ выставляет суточную метку",
+          gs._tonapi_quota_until == 0.0)
+finally:
+    gs.requests = _oreq33
+    gs.TONAPI_MIN_INTERVAL = _oint33
+    gs._tonapi_quota_until = _oquota
+
+
+# =============================================================================
+print("\n[34] Покупка только на проверенных площадках")
+# =============================================================================
+
+# Карточки Getgems, снятые 18.09.2026, дали два наблюдения:
+#   * Creator Fee = 0 GRAM на трёх лотах из разных коллекций подарков,
+#     комиссия площадки 0.11/5.5, 1.48/74 и 0.09/4.89 — везде ~2%;
+#   * лот на площадке "Other": Creator Fee 0.45 GRAM, комиссия площадки 0,
+#     и адрес контракта продажи СОВПАДАЛ с адресом самого предмета.
+# Второе означает, что у другой площадки другой протокол. Платить туда по
+# нашей схеме — отправлять деньги вслепую, и потерять можно всю сумму.
+
+check("роялти по умолчанию 0 (Creator Fee на карточках Getgems = 0)",
+      source_default("ROYALTY_PCT") == "0", source_default("ROYALTY_PCT"))
+check("по умолчанию разрешена только проверенная площадка",
+      source_default("ALLOWED_MARKETS") == "Getgems Sales",
+      source_default("ALLOWED_MARKETS"))
+
+_odry34, _oexec34, _omk = gs.DRY_RUN, gs.REAL_EXECUTOR_AVAILABLE, gs.ALLOWED_MARKETS
+try:
+    gs.DRY_RUN = True
+    gs.ALLOWED_MARKETS = ["Getgems Sales"]
+
+    check("покупка на проверенной площадке проходит",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale",
+                                    "Getgems Sales") is True)
+    check("покупка на непроверенной площадке отклоняется",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale",
+                                    "Marketapp Marketplace") is False)
+    check("пустая площадка тоже отклоняется",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale", "") is False)
+
+    # Проверка стоит ДО ветки DRY_RUN: симуляция, рапортующая успех там, где
+    # живая покупка ушла бы по непроверенному протоколу, врёт о готовности.
+    gs.DRY_RUN = False
+    gs.REAL_EXECUTOR_AVAILABLE = True
+    check("в живом режиме непроверенная площадка тоже отклоняется",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale", "Other") is False)
+
+    # Список расширяем осознанно — значит он должен реально расширяться.
+    gs.DRY_RUN = True
+    gs.ALLOWED_MARKETS = ["Getgems Sales", "Marketapp Marketplace"]
+    check("добавленная в список площадка разрешается",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale",
+                                    "Marketapp Marketplace") is True)
+
+    # Пустой список = проверка отключена. Это осознанный выбор оператора,
+    # а не случайность, поэтому поведение фиксируем.
+    gs.ALLOWED_MARKETS = []
+    check("пустой список отключает проверку площадки",
+          gs.execute_blockchain_buy("0:i", Decimal("1"), "0:sale", "Что угодно") is True)
+finally:
+    gs.DRY_RUN, gs.REAL_EXECUTOR_AVAILABLE, gs.ALLOWED_MARKETS = _odry34, _oexec34, _omk
+
+
+# =============================================================================
+print("\n[35] Суточный бюджет запросов растягивает интервал")
+# =============================================================================
+
+# 5 коллекций x 15 страниц каждые 120с = 54 000 запросов в сутки. Живой прогон
+# 18.09.2026 сжёг квоту даже С КЛЮЧОМ и ушёл в слепоту до полуночи. Дыра в
+# записи хуже редкого шага: она обесценивает сделки в бэктесте, а редкий шаг
+# всего лишь огрубляет наблюдение.
+
+_ob35 = (gs.TONAPI_DAILY_BUDGET, gs.POLL_INTERVAL_SEC, gs.FLOOR_SAMPLE_PAGES,
+         gs._tonapi_used_today, gs._tonapi_budget_day)
+try:
+    gs.POLL_INTERVAL_SEC = 120
+    gs.FLOOR_SAMPLE_PAGES = 15
+    gs.TONAPI_DAILY_BUDGET = 10000
+    gs._tonapi_used_today = 0
+
+    # Результат зависит от того, сколько осталось до полуночи UTC, поэтому
+    # момент фиксируем. Иначе тест проходил бы утром и падал вечером — а
+    # тест, зависящий от часа запуска, ничего не проверяет.
+    _real_midnight = gs._next_utc_midnight
+    SECONDS_LEFT = 12 * 3600          # ровно полсуток до сброса квоты
+    gs._next_utc_midnight = lambda: time.time() + SECONDS_LEFT
+    try:
+        iv = gs.budget_paced_interval(5)
+        check("при большой нагрузке интервал растягивается",
+              iv > gs.POLL_INTERVAL_SEC, f"{iv:.0f}с при пороге {gs.POLL_INTERVAL_SEC}")
+
+        # Бюджета должно хватить ровно до полуночи, не меньше и не сильно больше.
+        cycles = SECONDS_LEFT / iv
+        check("запросов при таком интервале не больше бюджета",
+              cycles * 5 * 15 <= gs.TONAPI_DAILY_BUDGET * 1.01,
+              f"{cycles*75:.0f} против {gs.TONAPI_DAILY_BUDGET}")
+
+        # Уже потраченное учитывается: остаток бюджета меньше — интервал больше.
+        gs._tonapi_used_today = 9000
+        check("потраченный бюджет удлиняет интервал",
+              gs.budget_paced_interval(5) > iv,
+              f"{gs.budget_paced_interval(5):.0f} против {iv:.0f}")
+        gs._tonapi_used_today = 0
+    finally:
+        gs._next_utc_midnight = _real_midnight
+
+    # Механизм умеет только ЗАМЕДЛЯТЬ: разгонять бота он не должен.
+    gs.FLOOR_SAMPLE_PAGES = 1
+    check("при малой нагрузке интервал НЕ становится меньше заданного",
+          gs.budget_paced_interval(1) == gs.POLL_INTERVAL_SEC,
+          str(gs.budget_paced_interval(1)))
+
+    # Нулевой бюджет = ограничение выключено.
+    gs.TONAPI_DAILY_BUDGET = 0
+    gs.FLOOR_SAMPLE_PAGES = 15
+    check("нулевой бюджет отключает растягивание",
+          gs.budget_paced_interval(5) == gs.POLL_INTERVAL_SEC)
+
+    # Счётчик привязан к суткам UTC и обнуляется вместе с квотой.
+    gs.TONAPI_DAILY_BUDGET = 10000
+    gs._tonapi_used_today = 0
+    gs._tonapi_budget_day = None
+    gs._count_tonapi_request()
+    check("запросы считаются", gs._tonapi_used_today == 1)
+    gs._tonapi_budget_day = None            # имитируем наступление новых суток
+    gs._count_tonapi_request()
+    check("в новые сутки счётчик обнуляется", gs._tonapi_used_today == 1)
+finally:
+    (gs.TONAPI_DAILY_BUDGET, gs.POLL_INTERVAL_SEC, gs.FLOOR_SAMPLE_PAGES,
+     gs._tonapi_used_today, gs._tonapi_budget_day) = _ob35
+
+
+# =============================================================================
+print("\n[36] Расход бюджета переживает перезапуск")
+# =============================================================================
+
+from datetime import datetime, timezone, timedelta
+
+# Квота живёт на стороне TonAPI, а счётчик — в памяти процесса. Бот,
+# перезапущенный в обед, без сохранения считает бюджет нетронутым, разгоняется
+# до POLL_INTERVAL_SEC и добивает остаток квоты — ровно та слепота, ради
+# которой бюджет и вводился. Правило файла: лимит, обнуляющийся при рестарте,
+# — не лимит.
+
+_ob36 = (gs.DB_PATH, gs._tonapi_used_today, gs._tonapi_budget_day,
+         gs.TONAPI_DAILY_BUDGET)
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "budget.db")
+    gs.TONAPI_DAILY_BUDGET = 10000
+    gs.db_init()
+
+    _today = datetime.now(timezone.utc).date()
+    gs._tonapi_budget_day, gs._tonapi_used_today = _today, 4321
+    gs.budget_flush()
+
+    # «Перезапуск»: память обнулили, из БД расход обязан вернуться.
+    gs._tonapi_used_today, gs._tonapi_budget_day = 0, None
+    gs.budget_restore()
+    check("расход суток восстанавливается после перезапуска",
+          gs._tonapi_used_today == 4321, str(gs._tonapi_used_today))
+
+    # Вчерашний расход к сегодняшнему бюджету отношения не имеет: квота
+    # сбрасывается в полночь UTC. Подставить его = зря замедлить бота на сутки.
+    with gs.db_connect() as _c:
+        _c.execute("DELETE FROM api_budget")
+        _c.execute("INSERT INTO api_budget (day, used) VALUES (?, ?)",
+                   ((_today - timedelta(days=1)).isoformat(), 9999))
+    gs._tonapi_used_today, gs._tonapi_budget_day = 0, None
+    gs.budget_restore()
+    check("вчерашний расход НЕ переносится на сегодня",
+          gs._tonapi_used_today == 0, str(gs._tonapi_used_today))
+
+    # Пустая БД (первый запуск) — не ошибка и не «бюджет потрачен».
+    with gs.db_connect() as _c:
+        _c.execute("DELETE FROM api_budget")
+    gs._tonapi_used_today, gs._tonapi_budget_day = 0, None
+    gs.budget_restore()
+    check("первый запуск начинает сутки с нуля", gs._tonapi_used_today == 0)
+
+    # Счётчик сам сбрасывается на диск, а не только в конце цикла: иначе
+    # падение посреди цикла теряет весь его расход.
+    gs._tonapi_budget_day = _today
+    gs._tonapi_used_today = gs._BUDGET_FLUSH_EVERY - 1
+    gs._count_tonapi_request()
+    with gs.db_connect() as _c:
+        _row = _c.execute("SELECT used FROM api_budget WHERE day = ?",
+                          (_today.isoformat(),)).fetchone()
+    check("счётчик сбрасывается на диск сам, без конца цикла",
+          _row is not None and _row["used"] == gs._BUDGET_FLUSH_EVERY,
+          str(_row["used"]) if _row else "нет записи")
+
+    # Сбой записи не роняет наблюдение: данные рынка важнее учёта запросов.
+    gs.DB_PATH = os.path.join(_tmpdir, "нет-такой-папки", "budget.db")
+    try:
+        gs.budget_flush()
+        _survived = True
+    except Exception:
+        _survived = False
+    check("недоступная БД не роняет бота на сохранении счётчика", _survived)
+finally:
+    (gs.DB_PATH, gs._tonapi_used_today, gs._tonapi_budget_day,
+     gs.TONAPI_DAILY_BUDGET) = _ob36
+
+
+# =============================================================================
+print("\n[37] Живой режим закрыт, пока нет продажи")
+# =============================================================================
+
+# Покупка открывает позицию в БД, а закрыть её некому: decide_exit() вызывает
+# только бэктест, close_position() не вызывает никто. Пущенный вживую бот
+# скупал бы лоты и не продал бы ни одного — деньги в одну сторону.
+#
+# Остальные ворота смотрят на ключ, сеть и подтверждение риска, то есть на
+# способность ПОТРАТИТЬ. Ни одни из них не спрашивают, сможем ли мы вернуть
+# потраченное, поэтому проверка нужна отдельная.
+
+check("по умолчанию продажа НЕ считается реализованной",
+      source_default_const("SELLING_IMPLEMENTED") == "False",
+      source_default_const("SELLING_IMPLEMENTED"))
+
+_ob37 = (gs.DRY_RUN, gs.SELLING_IMPLEMENTED, gs.CONFIRM_LIVE_TRADING,
+         gs.REAL_EXECUTOR_AVAILABLE, gs.COLLECTION_WHITELIST, gs.TARGET_COLLECTIONS,
+         gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.RESERVE_TON, gs.TRADING_NETWORK,
+         gs.ANTHROPIC_AVAILABLE, gs.ANTHROPIC_API_KEY)
+try:
+    # Всё остальное намеренно приводим в «готовое к бою» состояние, чтобы
+    # единственной причиной отказа осталась именно продажа.
+    _good = "EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7"
+    gs.DRY_RUN = False
+    gs.CONFIRM_LIVE_TRADING = "I_UNDERSTAND_THE_RISK"
+    gs.REAL_EXECUTOR_AVAILABLE = True
+    gs.TARGET_COLLECTIONS = [_good]
+    gs.COLLECTION_WHITELIST = [_good]
+    gs.BANKROLL_TON = Decimal("10")
+    gs.RESERVE_TON = Decimal("1")
+    gs.TRADING_NETWORK = "testnet"
+    gs.ANTHROPIC_AVAILABLE = True
+    gs.ANTHROPIC_API_KEY = "sk-test-not-a-real-key"
+
+    _keyfile = os.path.join(_tmpdir, "wallet37.key")
+    with open(_keyfile, "w", encoding="utf-8") as fh:
+        fh.write("word " * 24)
+    if os.name != "nt":
+        os.chmod(_keyfile, 0o600)
+    gs.WALLET_KEY_FILE = _keyfile
+
+    # Сначала убеждаемся, что причина отказа — ИМЕННО продажа: с ней всё
+    # проходит. Иначе тест доказывал бы лишь то, что preflight всегда против.
+    gs.SELLING_IMPLEMENTED = True
+    _passes_with_selling = gs.preflight_checks(require_ai=True)
+
+    gs.SELLING_IMPLEMENTED = False
+    check("без продажи живой режим НЕ стартует",
+          gs.preflight_checks(require_ai=True) is False)
+
+    check("с реализованной продажей те же настройки проходят",
+          _passes_with_selling is True, str(_passes_with_selling))
+finally:
+    (gs.DRY_RUN, gs.SELLING_IMPLEMENTED, gs.CONFIRM_LIVE_TRADING,
+     gs.REAL_EXECUTOR_AVAILABLE, gs.COLLECTION_WHITELIST, gs.TARGET_COLLECTIONS,
+     gs.WALLET_KEY_FILE, gs.BANKROLL_TON, gs.RESERVE_TON, gs.TRADING_NETWORK,
+     gs.ANTHROPIC_AVAILABLE, gs.ANTHROPIC_API_KEY) = _ob37
+
+
+# =============================================================================
+print("\n[38] Смена цены: сверка с живой транзакцией")
+# =============================================================================
+
+# Раскладка сообщения не реконструируется по документации — её у контракта
+# нет. Она проверяется СХОДИМОСТЬЮ: собранная ячейка обязана совпасть байт в
+# байт с телом операции, которая реально прошла в блокчейне (владелец
+# поставил 77 TON). Тот же критерий, из-за которого op 0xfd135f7b сначала
+# опознали неверно как «снятие с продажи».
+#
+# Дословное тело, снятое кнопкой «Copy Raw body» (18.09.2026):
+LIVE_SET_PRICE_BOC = "b5ee9c72010101010014000023fd135f7b76a486ee80061f24511ed8ec2004"
+LIVE_QUERY_ID = 8549106351564267300
+LIVE_PRICE = Decimal("77")
+
+if gs.REAL_EXECUTOR_AVAILABLE:
+    _cell = gs.build_set_price_body(LIVE_PRICE, LIVE_QUERY_ID)
+    check("сборка цены совпадает с живой транзакцией побайтово",
+          _cell.to_boc().hex() == LIVE_SET_PRICE_BOC,
+          _cell.to_boc().hex())
+
+    # Цена обязана попадать в тело: ячейка, одинаковая при разных ценах,
+    # означала бы, что цена никуда не записалась.
+    _other = gs.build_set_price_body(Decimal("5"), LIVE_QUERY_ID)
+    check("другая цена даёт другое тело",
+          _other.to_boc().hex() != LIVE_SET_PRICE_BOC)
+else:
+    print("  --   tonutils не установлен: сверка байтов пропущена")
+    try:
+        gs.build_set_price_body(Decimal("5"))
+        _clear38 = False
+    except RuntimeError as e:
+        _clear38 = "tonutils" in str(e) and "pip install" in str(e)
+    except NameError:
+        _clear38 = False
+    check("без библиотеки сборка даёт понятную ошибку, а не NameError", _clear38)
+
+# Отказы. Смена цены тратит газ, поэтому «успех» без отправки так же вреден,
+# как и у покупки: он сказал бы, что лот перевыставлен, когда он не тронут.
+_ob38 = (gs.DRY_RUN, gs.REAL_EXECUTOR_AVAILABLE)
+try:
+    gs.DRY_RUN = True          # даже в симуляции мусорный адрес — не успех
+    check("нераспознанный адрес контракта = False",
+          gs.execute_set_price("не-адрес", "5") is False)
+    check("пустой адрес контракта = False",
+          gs.execute_set_price("", "5") is False)
+    check("нулевая цена = False",
+          gs.execute_set_price(_GOOD_ADDR38 := "EQBlBJ4n01pmYez5VPd8Wo598s8agbQCyVOjucXKxLDAi9r7",
+                               "0") is False)
+    check("отрицательная цена = False",
+          gs.execute_set_price(_GOOD_ADDR38, "-5") is False)
+    check("в симуляции корректный вызов проходит",
+          gs.execute_set_price(_GOOD_ADDR38, "5") is True)
+
+    # Без библиотеки подписи живой режим обязан отказать, а не притвориться.
+    gs.DRY_RUN = False
+    gs.REAL_EXECUTOR_AVAILABLE = False
+    check("без исполнителя живая смена цены = False",
+          gs.execute_set_price(_GOOD_ADDR38, "5") is False)
+finally:
+    (gs.DRY_RUN, gs.REAL_EXECUTOR_AVAILABLE) = _ob38
+
+# Газ на смену цены — величина, отличная от газа покупки, и НЕ измеренная.
+# Тест фиксирует, что её не приравняли к покупочной «чтобы было единообразно».
+check("газ смены цены задан отдельно от газа покупки",
+      source_default("SET_PRICE_GAS_TON") != source_default("PURCHASE_GAS_TON"),
+      f'{source_default("SET_PRICE_GAS_TON")} / {source_default("PURCHASE_GAS_TON")}')
+
+
+# =============================================================================
+print("\n[39] Хранилище контракта продажи: сверка с задеплоенным контрактом")
+# =============================================================================
+
+# Раскладка v4 нигде не документирована, поэтому проверяется СХОДИМОСТЬЮ:
+# собранная из полей живого листинга ячейка обязана дать хеш того хранилища,
+# которое реально лежит в блокчейне. Хеш data входит в хеш StateInit, а тот
+# И ЕСТЬ адрес контракта — ошибка хоть в одном бите дала бы другой адрес.
+#
+# Поля сняты с листинга Xmas Stocking #91332 (18.09.2026), контракт
+# EQCcWUC7KPl_MXXsDHGt5GxJyP9Eo_54C88xBK89kSKKFSO1.
+LIVE_NFT      = "0:48de39a63d627d30d2d62e7da41f793da94c5b3f3893864fe93c0617b36b708d"
+LIVE_OWNER    = "0:05ea962de15b8115bdbd5eda1be44986d1eaa9d8527dbc6fcd249fd2a08651e3"
+LIVE_ROYALTY  = "0:68f3a076d3451a18fd41e05c71b4c020545d46b2757064e65825ded0c49bf02c"
+LIVE_PUBKEY   = 0xb1b12b8f4eaa103fa8b05b17bb5fd96362fda6dd43a258c4f656976a5391f388
+LIVE_CREATED  = 1789755986
+LIVE_PRICE    = Decimal("5")
+LIVE_DATA_HASH = "7b2f33f8de550b5639ea9494ba3ee282e6b5ea760bc05b7a0aff2f35bca042eb"
+
+if gs.REAL_EXECUTOR_AVAILABLE:
+    _data = gs.build_sale_contract_data(
+        nft_address=LIVE_NFT, owner_address=LIVE_OWNER, price=LIVE_PRICE,
+        royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
+        public_key=LIVE_PUBKEY)
+    check("хранилище контракта совпадает с задеплоенным побитово",
+          _data.hash.hex() == LIVE_DATA_HASH, _data.hash.hex())
+
+    # Цена обязана влиять на хранилище: одинаковая ячейка при разных ценах
+    # означала бы контракт, продающий не за то, что мы просили.
+    _cheap = gs.build_sale_contract_data(
+        nft_address=LIVE_NFT, owner_address=LIVE_OWNER, price=Decimal("3.33"),
+        royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
+        public_key=LIVE_PUBKEY)
+    check("другая цена даёт другое хранилище",
+          _cheap.hash.hex() != LIVE_DATA_HASH)
+
+    # И адрес продавца тоже: контракт с чужим адресом выручки заплатит не нам.
+    _other_owner = gs.build_sale_contract_data(
+        nft_address=LIVE_NFT, owner_address=LIVE_ROYALTY, price=LIVE_PRICE,
+        royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
+        public_key=LIVE_PUBKEY)
+    check("другой продавец даёт другое хранилище",
+          _other_owner.hash.hex() != LIVE_DATA_HASH)
+else:
+    print("  --   tonutils не установлен: сверка хранилища пропущена")
+    try:
+        gs.build_sale_contract_data(LIVE_NFT, LIVE_OWNER, LIVE_PRICE,
+                                    LIVE_ROYALTY, LIVE_CREATED, LIVE_PUBKEY)
+        _clear39 = False
+    except RuntimeError as e:
+        _clear39 = "tonutils" in str(e) and "pip install" in str(e)
+    except NameError:
+        _clear39 = False
+    check("без библиотеки сборка даёт понятную ошибку, а не NameError", _clear39)
+
+# Адреса Getgems — не настройки. Подставить туда своё значение значит
+# задеплоить контракт, который площадка не узнает или который платит не туда.
+check("адрес деплойера Getgems зафиксирован в коде, а не читается из окружения",
+      "GETGEMS_DEPLOYER" not in open("gift_sniper.py", encoding="utf-8").read()
+      .split("GETGEMS_DEPLOYER =")[1].split("\n")[0] and
+      "getenv" not in open("gift_sniper.py", encoding="utf-8").read()
+      .split("GETGEMS_DEPLOYER =")[1].split("\n")[0])
+
+
+# =============================================================================
+print("\n[40] Уведомления о находках")
+# =============================================================================
+
+# Пока бот в DRY_RUN — а он в нём надолго, живой режим закрыт воротами —
+# покупок не существует. Без уведомления о находке владелец не видит работы
+# бота вообще: смотреть лог на VPS с телефона никто не станет.
+
+_sent40 = []
+_ob40 = (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+         gs.FIND_NOTIFY_MAX_PER_HOUR, gs.DRY_RUN, gs.DB_PATH)
+_db40 = tempfile.mktemp(suffix=".db")
+try:
+    # Находка теперь уходит через _tg_call (нужны кнопки и message_id),
+    # поэтому подменяем транспорт, а не notify().
+    gs.DB_PATH = _db40
+    gs.db_init()
+    gs._tg_call = (lambda method, payload:
+                   (_sent40.append(payload.get("text", "")),
+                    {"ok": True, "result": {"message_id": 1}})[1])
+    gs.TELEGRAM_BOT_TOKEN = "тест"
+    gs.TELEGRAM_CHAT_ID = "42"
+    gs.FIND_NOTIFY_MAX_PER_HOUR = 3
+    gs.DRY_RUN = True
+    gs._find_sent_ts.clear()
+    gs._finds_suppressed = 0
+
+    _item40 = {"address": "0:" + "ab" * 32, "sale_price_ton": Decimal("1.2")}
+    _snap40 = {"floor": Decimal("1.5"), "floor_reliable": True}
+    _ev40 = {"discount_pct": Decimal("20.0"), "buy_price": Decimal("1.2"),
+             "net_profit": Decimal("0.12"), "roi_pct": Decimal("10"),
+             "peer_floor": None, "eff_floor": Decimal("1.5"), "peer_n": 0,
+             "rarity_pct": None, "rarest_trait": None,
+             "sale_price": Decimal("1.455"), "fee_amount": Decimal("0.0291"),
+             "royalty_amount": Decimal("0"), "proceeds": Decimal("1.4259"),
+             "breakeven_buy": Decimal("1.2759"),
+             "max_buy_min_roi": Decimal("1.2152"),
+             "premium_applied": False, "is_pretty": False, "is_rare": False}
+
+    check("находка отправляется", gs.notify_find(_item40, _snap40, _ev40) is True)
+    _txt = _sent40[-1]
+    check("в сообщении есть цена и floor", "1.2" in _txt and "1.5" in _txt, _txt[:60])
+    check("в сообщении есть ссылка на площадку", "getgems.io" in _txt)
+    # Обозреватель и сырой адрес УШЛИ из Telegram в лог (23.09.2026): три
+    # ссылки подряд в телефоне читаются как мусор, а нужна из них одна.
+    # Две ссылки: площадка и обозреватель. Сырой адрес ушёл в лог — он
+    # дублирует обе и в телефоне только мешает.
+    check("в телефон идут ДВЕ ссылки, а не три плюс адрес",
+          _txt.count("http") == 2, _txt)
+    check("обозреватель на месте: он различает «лот ушёл» и «URL разъехался»",
+          "tonviewer.com" in _txt, _txt)
+    # РЕШЕНИЕ ОТМЕНЕНО 23.09.2026 по прямой просьбе владельца: «за каждый
+    # пункт пиши какая наценка идёт и почему, чтобы потом из этих пунктов
+    # получалась цена продажи». Раньше разбор уходил ТОЛЬКО в лог ради
+    # краткости — но владелец покупает руками и проверить три числа без
+    # разложения не может.
+    check("цепочка цены теперь В СООБЩЕНИИ, а не только в логе",
+          "undercut" in _txt and "газ за круг" in _txt, _txt)
+    check("в цепочке названа цена выставления",
+          "ВЫСТАВЛЯЮ" in _txt, _txt)
+    check("в симуляции честно сказано, что покупки не будет",
+          "симуляц" in _txt.lower(), _txt)
+
+    # Потолок частоты. Телефон, звонящий десять раз подряд, выключают — и
+    # тогда пропускают ту находку, ради которой всё затевалось.
+    _sent40.clear()
+    gs._find_sent_ts.clear()
+    gs._finds_suppressed = 0
+    _ok = [gs.notify_find(_item40, _snap40, _ev40) for _ in range(5)]
+    check("сверх лимита за час не шлём", _ok == [True, True, True, False, False],
+          str(_ok))
+    check("подавленные посчитаны", gs._finds_suppressed == 2,
+          str(gs._finds_suppressed))
+
+    # Подавленные обязаны всплыть в сводке: «тихо не отправили» и «находок не
+    # было» — разные вещи, и перепутать их значит решить, что рынок мёртв.
+    _sent40.clear()
+    gs.notify_heartbeat([], force=True)
+    check("сводка называет число подавленных находок",
+          any("подавлен" in t.lower() or "не отправлено" in t.lower() for t in _sent40),
+          str(_sent40))
+    check("счётчик подавленных сбрасывается после сводки",
+          gs._finds_suppressed == 0)
+
+    # Нулевой лимит = механизм выключен целиком.
+    gs.FIND_NOTIFY_MAX_PER_HOUR = 0
+    gs._find_sent_ts.clear()
+    check("нулевой лимит отключает уведомления о находках",
+          gs.notify_find(_item40, _snap40, _ev40) is False)
+
+    # Без токена Telegram — молча ничего, а не падение торгового цикла.
+    gs.FIND_NOTIFY_MAX_PER_HOUR = 10
+    gs.TELEGRAM_BOT_TOKEN = ""
+    check("без токена находка не шлётся и не падает",
+          gs.notify_find(_item40, _snap40, _ev40) is False)
+finally:
+    (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+     gs.FIND_NOTIFY_MAX_PER_HOUR, gs.DRY_RUN, gs.DB_PATH) = _ob40
+    if os.path.exists(_db40):
+        os.unlink(_db40)
+    gs._find_sent_ts.clear()
+    gs._finds_suppressed = 0
+
+# scan_finds() обязана молчать при недостоверном floor: находка, посчитанная
+# от floor по тонкой выборке, — это приглашение купить по завышенной оценке.
+check("при недостоверном floor находок нет",
+      gs.scan_finds({"floor": Decimal("1.5"), "floor_reliable": False,
+                     "candidates": [{"address": "0:" + "cd" * 32,
+                                     "sale_price_ton": Decimal("0.1")}]},
+                    None) == 0)
+
+
+# =============================================================================
+print("\n[41] Telegram: отказ сервера НЕ выглядит успехом")
+# =============================================================================
+
+# requests.post бросает исключение только на СЕТЕВОЙ ошибке. Неверный токен
+# это HTTP 401, неизвестный chat_id — 400, и оба раза ответ обычный. Код без
+# проверки статуса считал их успехом: владелец видел ровный зелёный лог и
+# пустой чат, а причины в логе не было вовсе. Поймано живым прогоном 21.09.2026.
+
+class _Resp41:
+    def __init__(self, ok, code=200, body=None):
+        self.ok, self.status_code, self._body = ok, code, (body or {})
+
+    def json(self):
+        return self._body
+
+
+_ob41 = (gs.requests.post, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID)
+_logged41 = []
+_olog41 = gs.log.warning
+try:
+    gs.TELEGRAM_BOT_TOKEN = "123:FAKE"
+    gs.TELEGRAM_CHAT_ID = "42"
+    gs.log.warning = lambda m, *a, **k: _logged41.append(str(m))
+
+    gs.requests.post = lambda *a, **k: _Resp41(True)
+    check("успешная отправка = True", gs.notify("привет") is True)
+
+    _logged41.clear()
+    gs.requests.post = lambda *a, **k: _Resp41(
+        False, 401, {"description": "Unauthorized"})
+    check("неверный токен = False, а не тихий успех", gs.notify("привет") is False)
+    check("в логе назван токен как причина",
+          any("TELEGRAM_BOT_TOKEN" in m for m in _logged41), str(_logged41))
+
+    _logged41.clear()
+    gs.requests.post = lambda *a, **k: _Resp41(
+        False, 400, {"description": "Bad Request: chat not found"})
+    check("неизвестный chat_id = False", gs.notify("привет") is False)
+    check("в логе совет написать боту /start",
+          any("/start" in m for m in _logged41), str(_logged41))
+
+    # Токен лежит прямо в URL, поэтому в лог он попасть не должен НИКОГДА.
+    check("токен не утёк в лог",
+          not any("FAKE" in m for m in _logged41), str(_logged41))
+
+    # Сетевая ошибка — тоже не успех.
+    _logged41.clear()
+    def _boom(*a, **k):
+        raise ConnectionError("сеть упала")
+    gs.requests.post = _boom
+    check("сетевая ошибка = False", gs.notify("привет") is False)
+
+    # Без токена — тихо и False, торговый цикл не страдает.
+    gs.TELEGRAM_BOT_TOKEN = ""
+    check("без токена = False без падения", gs.notify("привет") is False)
+finally:
+    (gs.requests.post, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID) = _ob41
+    gs.log.warning = _olog41
+
+
+# =============================================================================
+print("\n[42] Бэктест говорит, когда ему НЕЛЬЗЯ верить")
+# =============================================================================
+
+# Живой прогон 21.09.2026 дал «Winrate: 100.0% (1/1)» и «расхождение 0.0000».
+# Обе строки читаются как «модель работает», а означают другое: сделка была
+# ОДНА, и floor за сутки не сдвинулся. Отчёт, из которого можно с уверенным
+# видом сделать неверный вывод, опаснее отсутствующего — именно по такой
+# строке решают включить живую торговлю.
+
+_warn42 = []
+_info42 = []
+_ow42 = (gs.log.warning, gs.log.info)
+try:
+    gs.log.warning = lambda m, *a, **k: _warn42.append(str(m))
+    gs.log.info = lambda m, *a, **k: _info42.append(str(m))
+
+    _one = [{"status": "closed", "buy": Decimal("5"), "expected": Decimal("0.55"),
+             "pnl": Decimal("0.55"), "roi": Decimal("11"),
+             "entry_floor": Decimal("6"), "exit_floor": Decimal("6")}]
+    _res = gs._report_backtest(_one, 24, span_h=96.9, collections=6)
+
+    check("малая выборка названа малой",
+          any("ВЫБОРКА МАЛА" in m for m in _warn42), str(_warn42)[:120])
+    check("сказано, что floor не двигался",
+          any("floor на выходе совпал" in m for m in _warn42), str(_warn42)[:120])
+    check("посчитана частота сделок",
+          any("Частота:" in m for m in _info42), str(_info42)[:120])
+    check("сказано, сколько суток нужно на осмысленную выборку",
+          any("суток записи" in m for m in _info42), str(_info42)[:120])
+    check("все выходы отмечены как плоские", _res["flat_exits"] == 1)
+
+    # Обратная сторона: когда floor ДВИГАЛСЯ, предупреждения про плоский
+    # рынок быть не должно — иначе оно обесценится и его перестанут читать.
+    _warn42.clear()
+    _moved = [{"status": "closed", "buy": Decimal("5"), "expected": Decimal("0.55"),
+               "pnl": Decimal("0.20"), "roi": Decimal("11"),
+               "entry_floor": Decimal("6"), "exit_floor": Decimal("5.5")}]
+    _res2 = gs._report_backtest(_moved, 24, span_h=96.9, collections=6)
+    check("при сдвинувшемся floor про плоский рынок не пишем",
+          not any("floor на выходе совпал" in m for m in _warn42), str(_warn42)[:120])
+    check("плоских выходов ноль", _res2["flat_exits"] == 0)
+
+    # А предупреждение о малой выборке остаётся: оно про число сделок.
+    check("малая выборка названа и здесь",
+          any("ВЫБОРКА МАЛА" in m for m in _warn42))
+finally:
+    (gs.log.warning, gs.log.info) = _ow42
+
+# Порог — проектное решение: winrate на единицах сделок это шум.
+check("порог осмысленной выборки не меньше 20",
+      int(source_default("MIN_BACKTEST_TRADES")) >= 20,
+      source_default("MIN_BACKTEST_TRADES"))
+
+
+# =============================================================================
+print("\n[43] Реальный лимит TonAPI измеряется, а не угадывается")
+# =============================================================================
+
+# TONAPI_DAILY_BUDGET — это догадка. У анонимного доступа лимит один, у
+# бесплатного ключа другой, у платного третий. Занижённая догадка делает
+# наблюдение реже, чем позволено; завышенная сжигает квоту к обеду. Отказ
+# сервера — единственный ИЗМЕРЕННЫЙ факт о лимите, и выбрасывать его глупо.
+
+_ob43 = (gs.DB_PATH, gs.TONAPI_DAILY_BUDGET, gs._tonapi_used_today,
+         gs._tonapi_budget_day)
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "learn.db")
+    gs.db_init()
+    gs.TONAPI_DAILY_BUDGET = 10000
+
+    check("пока в стену не упирались — лимит не выучен",
+          gs.budget_learned_limit() is None)
+    check("бюджет равен настройке", gs.effective_daily_budget() == 10000)
+
+    # Отказ при смешном счётчике — не измерение: счётчик считает только НАШИ
+    # запросы, а квоту могли сжечь до старта или другим процессом. Выученные
+    # «20 запросов в сутки» замедлили бы бота навсегда.
+    gs.budget_learn_limit(20)
+    check("отказ при низком счётчике лимитом не считается",
+          gs.budget_learned_limit() is None)
+
+    # Сервер отказал после 3000 запросов — значит столько он и даёт.
+    gs.budget_learn_limit(3000)
+    check("лимит запомнен", gs.budget_learned_limit() == 3000)
+    check("бюджет считается по измеренному, с запасом",
+          gs.effective_daily_budget() == int(3000 * gs._LEARNED_MARGIN),
+          str(gs.effective_daily_budget()))
+    check("запас оставлен, а не потрачен весь",
+          gs.effective_daily_budget() < 3000)
+
+    # Выученный лимит должен ВЛИЯТЬ на интервал, иначе он бесполезен.
+    _real_mid = gs._next_utc_midnight
+    gs._next_utc_midnight = lambda: time.time() + 12 * 3600
+    try:
+        gs._tonapi_used_today = 0
+        _with = gs.budget_paced_interval(5)
+        with gs.db_connect() as _c:
+            _c.execute("DELETE FROM api_budget WHERE day='_learned_limit'")
+        _without = gs.budget_paced_interval(5)
+        check("меньший измеренный лимит растягивает интервал сильнее",
+              _with > _without, f"{_with:.0f} против {_without:.0f}")
+    finally:
+        gs._next_utc_midnight = _real_mid
+
+    # Оценка не должна ПАДАТЬ: лимит на сервере постоянен, а низкий счётчик
+    # бывает от потерянной истории. Берём максимум из виденного.
+    # (проверка интервала выше стёрла запись — восстанавливаем)
+    gs.budget_learn_limit(3000)
+    gs.budget_learn_limit(900)
+    check("более низкое измерение не понижает оценку",
+          gs.budget_learned_limit() == 3000, str(gs.budget_learned_limit()))
+    gs.budget_learn_limit(6000)
+    check("более высокое измерение поднимает оценку",
+          gs.budget_learned_limit() == 6000, str(gs.budget_learned_limit()))
+
+    # Мусор не запоминаем: ноль запросов лимитом быть не может.
+    with gs.db_connect() as _c:
+        _c.execute("DELETE FROM api_budget WHERE day='_learned_limit'")
+    gs.budget_learn_limit(0)
+    check("нулевой лимит не запоминается", gs.budget_learned_limit() is None)
+
+    # Выученный лимит НЕ должен путаться с расходом за сутки: обе записи
+    # лежат в одной таблице, и перепутать их значит спланировать по чужому
+    # числу.
+    _today = datetime.now(timezone.utc).date()
+    gs._tonapi_budget_day, gs._tonapi_used_today = _today, 777
+    gs.budget_flush()
+    gs.budget_learn_limit(4200)
+    gs._tonapi_used_today, gs._tonapi_budget_day = 0, None
+    gs.budget_restore()
+    check("расход суток не перепутан с выученным лимитом",
+          gs._tonapi_used_today == 777, str(gs._tonapi_used_today))
+    check("выученный лимит не перепутан с расходом",
+          gs.budget_learned_limit() == 4200, str(gs.budget_learned_limit()))
+finally:
+    (gs.DB_PATH, gs.TONAPI_DAILY_BUDGET, gs._tonapi_used_today,
+     gs._tonapi_budget_day) = _ob43
+
+
+# =============================================================================
+print("\n[30] Ставка комиссии площадки")
+# =============================================================================
+
+# Справка Getgems (18.09.2026): 5% с продажи вообще, 1% для Anonymous Telegram
+# Numbers и Usernames, и 2% ДЛЯ TELEGRAM-ПОДАРКОВ. Бот работает именно с
+# подарками, поэтому 2%. Сходится с карточкой лота: 0.09 GRAM на 4.75 = 1.9%.
+#
+# Тест стоит здесь потому, что этот параметр уже дважды ставили неверно, и
+# оба раза правка проходила незаметно: завышенная комиссия просто тихо
+# отклоняет сделки, заниженная — тихо завышает прибыль.
+check("комиссия площадки по умолчанию = 2% (ставка Telegram-подарков)",
+      source_default("MARKETPLACE_FEE_PCT") == "0.02",
+      source_default("MARKETPLACE_FEE_PCT"))
+
+# Порядок величины прибыли при этой ставке. Если кто-то поставит 5%,
+# сделка на floor 1.5 перестанет проходить порог ROI — и это будет выглядеть
+# как "рынок плохой", а не как ошибка в конфиге.
+# Порог ROI тоже приходит из окружения — фиксируем и его, иначе проверка
+# мерит не комиссию, а чужую настройку.
+_of, _or2, _omin = gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT, gs.MIN_ROI_PCT
+try:
+    gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT = Decimal("0.02"), Decimal("0.05")
+    gs.MIN_ROI_PCT = Decimal("5")
+    _p = gs.compute_net_profit(Decimal("1.5"), Decimal("1.12"))
+    check("при 2% сделка на floor 1.5 проходит порог ROI",
+          gs.compute_roi_pct(_p, Decimal("1.12")) >= gs.MIN_ROI_PCT,
+          str(gs.compute_roi_pct(_p, Decimal("1.12"))))
+
+    gs.MARKETPLACE_FEE_PCT = Decimal("0.05")
+    _p5 = gs.compute_net_profit(Decimal("1.5"), Decimal("1.12"))
+    check("при 5% та же сделка порог НЕ проходит",
+          gs.compute_roi_pct(_p5, Decimal("1.12")) < gs.MIN_ROI_PCT,
+          str(gs.compute_roi_pct(_p5, Decimal("1.12"))))
+    check("разница между 2% и 5% — это 3% от цены продажи",
+          abs((_p - _p5) - gs.target_sale_price(Decimal("1.5")) * Decimal("0.03"))
+          < Decimal("0.0001"), str(_p - _p5))
+finally:
+    gs.MARKETPLACE_FEE_PCT, gs.ROYALTY_PCT, gs.MIN_ROI_PCT = _of, _or2, _omin
+
+
+# =============================================================================
+print("\n[31] Исполнитель покупки: True только при реальной отправке")
+# =============================================================================
+
+# Главное правило файла: execute_blockchain_buy() НИКОГДА не возвращает True,
+# не совершив сделку. Иначе в БД появится позиция, которой нет, и учёт PnL
+# станет фикцией. Здесь это проверяется на всех путях отказа.
+
+_odry2 = gs.DRY_RUN
+_oexec2 = gs.REAL_EXECUTOR_AVAILABLE
+_okey = gs.WALLET_KEY_FILE
+_onet = gs.TRADING_NETWORK
+try:
+    gs.DRY_RUN = False
+
+    gs.REAL_EXECUTOR_AVAILABLE = False
+    check("без библиотеки подписи покупка возвращает False",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale") is False)
+
+    gs.REAL_EXECUTOR_AVAILABLE = True
+    gs.WALLET_KEY_FILE = ""
+    check("без файла ключа покупка возвращает False",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale") is False)
+
+    # Адрес продажи проверяется раньше всего: платить некуда.
+    check("без адреса контракта продажи покупка возвращает False",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "") is False)
+
+    # Любое исключение внутри отправки = сделки не было. Возврат True здесь
+    # был бы худшей из возможных ошибок: бот записал бы несуществующую позицию.
+    _osend = gs._send_purchase
+
+    async def _boom(*a, **k):
+        raise RuntimeError("сеть недоступна")
+
+    gs._send_purchase = _boom
+    gs.WALLET_KEY_FILE = key_path
+    check("исключение при отправке НЕ выглядит покупкой",
+          gs.execute_blockchain_buy("0:item", Decimal("1"), "0:sale") is False)
+    gs._send_purchase = _osend
+
+    # Выбор сети проверяется только если библиотека установлена. Без неё
+    # ЭТИ проверки бессмысленны, но обязана быть другая: понятное сообщение
+    # вместо NameError. Тесты должны проходить и на машине без tonutils —
+    # иначе набор ломается там, где ломаться нечему.
+    if gs._NetworkGlobalID is not None:
+        gs.TRADING_NETWORK = "testnet"
+        check("по умолчанию торгуем в testnet",
+              gs._trading_network() == gs._NetworkGlobalID.TESTNET)
+        gs.TRADING_NETWORK = "mainnet"
+        check("mainnet выбирается только явно",
+              gs._trading_network() == gs._NetworkGlobalID.MAINNET)
+        gs.TRADING_NETWORK = "чепуха"
+        check("нераспознанная сеть НЕ уводит в mainnet",
+              gs._trading_network() == gs._NetworkGlobalID.TESTNET)
+    else:
+        print("  --   tonutils не установлен: проверки выбора сети пропущены")
+        try:
+            gs._trading_network()
+            _clear = False
+        except RuntimeError as e:
+            _clear = "tonutils" in str(e) and "pip install" in str(e)
+        except NameError:
+            _clear = False
+        check("без библиотеки сеть даёт понятную ошибку, а не NameError",
+              _clear)
+
+    # Газ поверх цены — отдельная величина от газа в экономике сделки.
+    check("газ на исполнение контракта задан отдельно от экономики",
+          gs.PURCHASE_GAS_TON > 0 and gs.PURCHASE_GAS_TON != gs.GAS_FEE_TON,
+          f"{gs.PURCHASE_GAS_TON} / {gs.GAS_FEE_TON}")
+
+    # 0.3 — столько прикладывает сам интерфейс Getgems (диалог покупки,
+    # 18.09.2026). Недостача газа роняет транзакцию, а излишек возвращается,
+    # поэтому опускать это значение нельзя.
+    check("газ на покупку не ниже того, что прикладывает Getgems",
+          Decimal(source_default("PURCHASE_GAS_TON")) >= Decimal("0.3"),
+          source_default("PURCHASE_GAS_TON"))
+finally:
+    gs.DRY_RUN = _odry2
+    gs.REAL_EXECUTOR_AVAILABLE = _oexec2
+    gs.WALLET_KEY_FILE = _okey
+    gs.TRADING_NETWORK = _onet
+
+
+# =============================================================================
+print("\n[44] Адрес для ссылки: raw -> user-friendly")
+# =============================================================================
+
+# TonAPI отдаёт адреса ТОЛЬКО в raw-форме, витрины понимают user-friendly.
+# Ссылка getgems.io/nft/0:48de... открывается пустой страницей — поймано
+# пользователем 21.09.2026, уведомление о находке вело в никуда.
+_RAW = "0:48de39a63d627d30d2d62e7da41f793da94c5b3f3893864fe93c0617b36b708d"
+_FRIENDLY = "EQBI3jmmPWJ9MNLWLn2kH3k9qUxbPziThk_pPAYXs2twjaTx"
+
+check("raw-адрес превращается в EQ-форму",
+      gs.friendly_ton_address(_RAW) == _FRIENDLY, gs.friendly_ton_address(_RAW))
+
+# Круг обязан сходиться: иначе ссылка ведёт на ЧУЖОЙ предмет, а это хуже
+# пустой страницы — владелец решит, что смотрит на свою находку.
+check("обратное преобразование возвращает исходный адрес",
+      gs.normalize_ton_address(gs.friendly_ton_address(_RAW)) == _RAW)
+
+check("уже user-friendly адрес не портится",
+      gs.friendly_ton_address(_FRIENDLY) == _FRIENDLY)
+
+# Нераспознанный адрес возвращается как есть: в уведомлении лучше нерабочая
+# строка, чем пустая — по ней хотя бы видно, что бот что-то нашёл.
+check("мусор возвращается как есть, а не пустой строкой",
+      gs.friendly_ton_address("не адрес") == "не адрес")
+
+# Ссылка в уведомлении обязана собираться из FRIENDLY-формы. Проверяем через
+# само уведомление, а не через функцию: сломаться может именно подстановка.
+_sent = []
+_onotify = gs._tg_call
+_otok, _ochat = gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID
+try:
+    gs._tg_call = (lambda method, payload:
+                   (_sent.append(payload.get("text", "")),
+                    {"ok": True, "result": {"message_id": 1}})[1])
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "t", "c"
+    gs._find_sent_ts.clear()
+    gs.notify_find(
+        {"address": _RAW, "sale_price_ton": Decimal("4")},
+        {"floor": Decimal("5"), "floor_reliable": True},
+        {"discount_pct": Decimal("20.0"), "buy_price": Decimal("4"),
+         "net_profit": Decimal("0.2"), "roi_pct": Decimal("5"),
+         "peer_floor": None, "eff_floor": Decimal("5"), "peer_n": 0,
+         "rarity_pct": None, "rarest_trait": None,
+         "sale_price": Decimal("4.85"), "fee_amount": Decimal("0.097"),
+         "royalty_amount": Decimal("0"), "proceeds": Decimal("4.753"),
+         "breakeven_buy": Decimal("4.603"),
+         "max_buy_min_roi": Decimal("4.3838"),
+         "premium_applied": False, "is_pretty": False, "is_rare": False})
+    _msg = _sent[0] if _sent else ""
+finally:
+    gs._tg_call = _onotify
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = _otok, _ochat
+
+check("в уведомлении ссылка на площадку с user-friendly адресом",
+      f"getgems.io/nft/{_FRIENDLY}" in _msg, _msg[-200:])
+check("raw-адрес в ссылку не попадает",
+      "/nft/0:" not in _msg and "tonviewer.com/0:" not in _msg)
+
+
+# =============================================================================
+print("\n[45] Проценты в контракте продажи: 34 бита опознаны")
+# =============================================================================
+
+# Раньше это были "_FEES_UNKNOWN_A = 1000" и "_FEES_UNKNOWN_B = 0" — значения,
+# снятые с живого листинга и воспроизводимые дословно, но без смысла.
+# Исходник Getgems (nft-fixprice-sale-v4r1.fc, load_static_data) говорит:
+# два поля uint17, процент умноженный на 100 000.
+#
+# СХОДИМОСТЬ: те же 34 бита, прочитанные по новой раскладке, дают 2.0% и 0% —
+# ровно то, что независимо подтверждено диалогом Getgems (0.1 на цене 5) и
+# тремя лотами с Creator Fee 0. Совпадение трёх независимых источников и есть
+# доказательство; хеш хранилища в секции [39] проверяет это побитово.
+check("2% превращается в поле контракта 2000", gs._percent_to_raw(Decimal("0.02")) == 2000)
+check("0% превращается в 0", gs._percent_to_raw(Decimal("0")) == 0)
+check("100% -- верхняя граница поля", gs._percent_to_raw(Decimal("1")) == 100000)
+
+# Диапазон проверяется, потому что переполнение uint17 не упало бы, а ТИХО
+# записало бы чужой процент: контракт отдал бы выручку не туда.
+_bad = 0
+for _v in ("-0.01", "1.5", "2"):
+    try:
+        gs._percent_to_raw(Decimal(_v))
+    except ValueError:
+        _bad += 1
+check("процент вне диапазона отвергается", _bad == 3, _bad)
+
+# Значение по умолчанию обязано совпадать с проверенной ставкой площадки.
+# Ошибка здесь тихо поменяет экономику задеплоенного лота, и заметить её
+# можно будет только по недополученной выручке.
+check("по умолчанию комиссия в контракте продажи -- 2%",
+      "fee_percent=Decimal(\"0.02\")" in open("gift_sniper.py", encoding="utf-8").read())
+check("по умолчанию роялти в контракте продажи -- 0",
+      "royalty_percent=Decimal(\"0\")" in open("gift_sniper.py", encoding="utf-8").read())
+
+if gs.REAL_EXECUTOR_AVAILABLE:
+    # Проценты обязаны ВЛИЯТЬ на хранилище: если поле пишется мимо, хеш
+    # не изменится, и мы этого не заметим.
+    _a = gs.build_sale_contract_data(
+        nft_address=LIVE_NFT, owner_address=LIVE_OWNER, price=LIVE_PRICE,
+        royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
+        public_key=LIVE_PUBKEY, fee_percent=Decimal("0.05"))
+    check("другая комиссия даёт другое хранилище", _a.hash.hex() != LIVE_DATA_HASH)
+    _b = gs.build_sale_contract_data(
+        nft_address=LIVE_NFT, owner_address=LIVE_OWNER, price=LIVE_PRICE,
+        royalty_address=LIVE_ROYALTY, created_at=LIVE_CREATED,
+        public_key=LIVE_PUBKEY, royalty_percent=Decimal("0.05"))
+    check("другое роялти даёт другое хранилище", _b.hash.hex() != LIVE_DATA_HASH)
+
+
+# =============================================================================
+print("\n[46] Расклад сделки: за сколько покупаю, за сколько выставлять, почему")
+# =============================================================================
+
+# Одного числа «профит» мало: по нему нельзя ни проверить расчёт, ни выставить
+# лот руками. Бот обязан называть ОБЕ цены и показывать, из чего вторая вышла.
+_it46 = {"address": "0:" + "cd" * 32, "sale_price_ton": Decimal("4.10"),
+         "mint_index": 16450, "traits": {}}
+_sn46 = {"floor": Decimal("5.00"), "floor_reliable": True,
+         "trait_index": {}, "trait_total": 0, "peer_prices": {}, "competition": 0}
+_ev46 = gs.evaluate_trade(_it46, _sn46, None)
+_txt46 = "\n".join(gs.explain_trade(_ev46, _sn46))
+
+check("расклад называет цену покупки", "ПОКУПАЮ за 4.1000 TON" in _txt46, _txt46)
+check("расклад называет цену выставления", "ВЫСТАВЛЯЮ за 4.8500 TON" in _txt46, _txt46)
+
+# Главная проверка: арифметика в тексте обязана СХОДИТЬСЯ с решением. Отчёт,
+# который печатает одни числа, а решение принимает по другим, заставил бы
+# владельца выставить лот по цене, при которой одобренная сделка убыточна.
+_sum = (_ev46["sale_price"] - _ev46["fee_amount"] - _ev46["royalty_amount"]
+        - _ev46["buy_price"] - gs.GAS_FEE_TON)
+check("разложение сходится с net_profit до нанотона",
+      abs(_sum - _ev46["net_profit"]) < Decimal("0.000000001"),
+      f"{_sum} vs {_ev46['net_profit']}")
+check("выручка на руки = цена продажи минус комиссии",
+      _ev46["proceeds"] == _ev46["sale_price"] - _ev46["fee_amount"]
+      - _ev46["royalty_amount"])
+
+# Цена выставления обязана быть НИЖЕ floor: продать ровно по floor нельзя.
+check("цена выставления ниже floor", _ev46["sale_price"] < _sn46["floor"])
+check("undercut объяснён словами", "продать РОВНО по floor нельзя" in _txt46)
+
+# Границы: выше них торговаться нельзя. Без них расклад не позволяет решать.
+check("названа граница безубыточности",
+      f"{_ev46['breakeven_buy'].quantize(Decimal('0.0001'))}" in _txt46, _txt46)
+check("названа граница по порогу ROI",
+      f"{_ev46['max_buy_min_roi'].quantize(Decimal('0.0001'))}" in _txt46, _txt46)
+check("граница по ROI строже границы безубыточности",
+      _ev46["max_buy_min_roi"] < _ev46["breakeven_buy"])
+
+# Красивый номер: бот обязан ПРИЗНАТЬСЯ, что заметил его и НЕ учёл. Молчание
+# здесь читается как «номер учтён», и владелец переоценит бота.
+_pretty46 = dict(_it46, mint_index=888)
+_evp = gs.evaluate_trade(_pretty46, _sn46, None)
+_txtp = "\n".join(gs.explain_trade(_evp, _sn46))
+check("красивый номер распознан", _evp["is_pretty"] is True)
+check("но честно сказано, что на цену он НЕ влияет",
+      "НЕ влияют" in _txtp and "PREMIUM_MULT" in _txtp, _txtp)
+check("красивый номер не изменил цену выставления",
+      _evp["sale_price"] == _ev46["sale_price"])
+
+# Оценка по сегменту: если она отличается от floor коллекции, расклад обязан
+# сказать, на что опирается, — иначе цифра выглядит взятой из воздуха.
+_sn_peer = dict(_sn46, peer_prices={"X": [3.0, 3.1, 3.2, 3.3, 3.4, 3.5]})
+_it_peer = dict(_it46, traits={gs.PEER_TRAIT: "X"})
+_evx = gs.evaluate_trade(_it_peer, _sn_peer, None)
+_txtx = "\n".join(gs.explain_trade(_evx, _sn_peer))
+check("оценка по сегменту не выше floor коллекции",
+      _evx["eff_floor"] <= _sn46["floor"], _evx["eff_floor"])
+check("основание оценки названо", "сегмент" in _txtx.lower(), _txtx)
+
+# ПЛОЩАДКИ: где покупать и где выставлять. Без названия площадки владелец не
+# найдёт лот руками; без второй площадки не увидит, что продавать выгоднее в
+# другом месте.
+_sn_mk = dict(_sn46, market_floors={
+    "Getgems Sales": {"floor": Decimal("5.30"), "n": 40},
+    "Marketapp Marketplace": {"floor": Decimal("4.80"), "n": 12}})
+_it_mk = dict(_it46, sale_market="Marketapp Marketplace")
+_ev_mk = gs.evaluate_trade(_it_mk, _sn_mk, None)
+_txt_mk = "\n".join(gs.explain_trade(_ev_mk, _sn_mk, _it_mk))
+
+check("названа площадка покупки",
+      "на «Marketapp Marketplace»" in _txt_mk.split("ВЫСТАВЛЯЮ")[0], _txt_mk)
+check("названа площадка продажи -- самая дорогая",
+      "ВЫСТАВЛЯЮ" in _txt_mk and "на «Getgems Sales»" in _txt_mk, _txt_mk)
+check("_best_sell_market берёт максимум floor",
+      gs._best_sell_market(_sn_mk) == ("Getgems Sales", Decimal("5.30")))
+check("без market_floors функция не падает, а возвращает пусто",
+      gs._best_sell_market({}) == (None, None))
+
+# Разница площадок названа числом, но с оговоркой: комиссии у них разные и
+# проверены только у Getgems. Голая цифра читалась бы как гарантия профита.
+check("разница между площадками посчитана", "разница 10.4%" in _txt_mk, _txt_mk)
+check("оговорка про непроверенные комиссии стоит рядом",
+      "комиссии площадок РАЗНЫЕ" in _txt_mk, _txt_mk)
+
+# И главное: бот обязан сказать, что САМ купить там не может. Иначе владелец
+# ждёт автоматической сделки, которой ворота ALLOWED_MARKETS не допустят.
+check("сказано, что покупка ботом на этой площадке запрещена",
+      "ЗАПРЕЩЕНА" in _txt_mk and "руками" in _txt_mk, _txt_mk)
+
+# На разрешённой площадке этого предупреждения быть не должно -- иначе оно
+# станет фоном и его перестанут читать.
+_it_ok = dict(_it46, sale_market="Getgems Sales")
+_txt_ok = "\n".join(gs.explain_trade(gs.evaluate_trade(_it_ok, _sn_mk, None),
+                                     _sn_mk, _it_ok))
+check("на разрешённой площадке предупреждения нет", "ЗАПРЕЩЕНА" not in _txt_ok)
+
+# И то же самое обязано попасть в уведомление, а не только в лог: владелец
+# смотрит в телефон, а не в консоль на VPS.
+_sent46 = []
+_ob46 = (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.DRY_RUN)
+try:
+    gs._tg_call = (lambda method, payload:
+                   (_sent46.append(payload.get("text", "")),
+                    {"ok": True, "result": {"message_id": 1}})[1])
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "t", "c"
+    gs.DRY_RUN = True
+    gs._find_sent_ts.clear()
+    gs.notify_find(_it46, _sn46, _ev46)
+finally:
+    (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.DRY_RUN) = _ob46
+_msg46 = _sent46[0] if _sent46 else ""
+check("в уведомлении есть обе цены в короткой форме",
+      "Купить" in _msg46 and "продать" in _msg46, _msg46)
+check("в уведомлении есть причина, а не только цифры",
+      "Признаки и их вклад в цену" in _msg46, _msg46)
+# ПЕРВАЯ СТРОКА — сразу вердикт, а не название лота: решение принимают по ней.
+check("первая строка — вердикт с эмодзи",
+      _msg46.splitlines()[0].startswith(("🟢", "🟡")), _msg46.splitlines()[0])
+
+
+# =============================================================================
+print("\n[47] Премия за редкие трейты: цены ПРОДАВЦОВ, а не сделок")
+# =============================================================================
+
+# build_trait_prices() появилась потому, что peer_prices пишет ТОЛЬКО
+# PEER_TRAIT ("model"), а главный тезис владельца — про ФОНЫ. Запись без
+# фонов не даёт проверить его в принципе, и дни наблюдения копили бы данные
+# не про то. Поймано 22.09.2026 при подходе к калибровке PREMIUM_MULT.
+_items47 = ([{"sale_price_ton": Decimal("5.0"),
+              "traits": {"model": "Common", "backdrop": "Sky Blue"}}] * 40
+            + [{"sale_price_ton": Decimal("20.0"),
+                "traits": {"model": "Rare", "backdrop": "Onyx Black"}}] * 6)
+_tp = gs.build_trait_prices(_items47)
+
+check("цены пишутся по КАЖДОМУ трейту, а не только по PEER_TRAIT",
+      set(_tp) == {"model", "backdrop"}, sorted(_tp))
+check("фоны попали в запись", "Onyx Black" in _tp["backdrop"])
+check("цены сегмента отсортированы",
+      _tp["backdrop"]["Onyx Black"] == sorted(_tp["backdrop"]["Onyx Black"]))
+check("лот без трейтов не роняет сборку",
+      gs.build_trait_prices([{"sale_price_ton": Decimal("1"), "traits": {}}]) == {})
+
+# Снапшот обязан нести новое поле: иначе запись снова окажется не про то.
+check("build_trait_prices вызывается при сборке снапшота",
+      '"trait_prices": build_trait_prices(on_sale)' in
+      open("gift_sniper.py", encoding="utf-8").read())
+check("trait_prices сохраняется в запись",
+      '"trait_prices": {name: {val: [str(p) for p in prices]' in
+      open("gift_sniper.py", encoding="utf-8").read())
+
+# --- сам отчёт ---
+def _snap47(tp, idx, total, floor="5.00"):
+    return {"ts": time.time(), "collection": "0:" + "ab" * 32, "floor": floor,
+            "sample_size": total, "competition": 0, "floor_reliable": True,
+            "trait_index": idx, "trait_total": total, "peer_prices": {},
+            "market_floors": {}, "candidates": [],
+            "trait_prices": {n: {v: [str(p) for p in pr] for v, pr in vals.items()}
+                             for n, vals in tp.items()}}
+
+def _run47(row):
+    fh = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False,
+                                     encoding="utf-8")
+    fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    fh.close()
+    try:
+        return gs.trait_premium_report(fh.name)
+    finally:
+        os.unlink(fh.name)
+
+# Редкость 13% ВЫШЕ порога RARE_TRAIT_THRESHOLD_PCT (5%) — в сводку такой
+# сегмент попасть не должен, иначе «редкая» премия считалась бы по обычным.
+_idx47, _tot47 = gs.build_trait_index(_items47)
+check("сегмент выше порога редкости в сводку не идёт",
+      _run47(_snap47(_tp, _idx47, _tot47)) is None)
+
+# А теперь действительно редкий: 3 из 100 = 3%.
+_rare = ([{"sale_price_ton": Decimal("5.0"),
+           "traits": {"backdrop": "Sky Blue"}}] * 97
+         + [{"sale_price_ton": Decimal("20.0"),
+             "traits": {"backdrop": "Onyx Black"}}] * 4)
+_tpr = gs.build_trait_prices(_rare)
+_idxr, _totr = gs.build_trait_index(_rare)
+_res = _run47(_snap47(_tpr, _idxr, _totr))
+check("редкий сегмент измерен", _res is not None and len(_res) == 1, _res)
+check("премия посчитана как отношение к floor",
+      _res is not None and Decimal("3.9") < _res[0] < Decimal("4.1"), _res)
+
+# Сегмент с выборкой меньше MIN_PEER_SAMPLE не измеряется: отношение по
+# одному лоту -- это не премия, а цена одного продавца.
+_thin = ([{"sale_price_ton": Decimal("5.0"),
+           "traits": {"backdrop": "Sky Blue"}}] * 99
+         + [{"sale_price_ton": Decimal("99.0"),
+             "traits": {"backdrop": "Unique"}}])
+check("сегмент из одного лота премией не считается",
+      _run47(_snap47(gs.build_trait_prices(_thin),
+                     *gs.build_trait_index(_thin))) is None)
+
+# Старая запись (без trait_prices) обязана дать ВНЯТНЫЙ отказ, а не пустой
+# отчёт: пустой читается как «премии нет» и закрыл бы вопрос неверно.
+_old47 = _snap47({}, {}, 10)
+del _old47["trait_prices"]
+check("запись без trait_prices даёт отказ, а не пустой отчёт",
+      _run47(_old47) is None)
+
+# И главное: отчёт обязан НАЗВАТЬ это ценами продавцов. Без оговорки число
+# 4.05x прочитается как «можно смело ставить PREMIUM_MULT=4».
+_src47 = open("gift_sniper.py", encoding="utf-8").read()
+check("отчёт называет, что это цены продавцов, а не сделок",
+      "ЦЕНЫ ПРОДАВЦОВ, А НЕ ЦЕНЫ СДЕЛОК" in _src47)
+check("сказано, что вписывать напрямую в PREMIUM_MULT нельзя",
+      "PREMIUM_MULT напрямую" in _src47)
+
+
+# =============================================================================
+print("\n[48] Объединение записей: склейка врёт про оборот, --merge нет")
+# =============================================================================
+
+# Две машины (ПК и ноутбук) дают две записи. Просто склеить их нельзя:
+# оборот в --rank считается как разница множеств самых дешёвых лотов между
+# СОСЕДНИМИ снапшотами, а снапшоты двух машин в одно время встанут
+# вперемешку. Выборки у них чуть разные, и эта разница засчитается как
+# продажи, которых не было. Именно по обороту отбирались живые коллекции.
+
+_C48 = "0:" + "ab" * 32
+
+def _row48(ts, cands):
+    return json.dumps({"ts": ts, "collection": _C48, "floor": "5.00",
+                       "sample_size": 50, "competition": 0,
+                       "floor_reliable": True, "trait_index": {},
+                       "trait_total": 0, "peer_prices": {}, "market_floors": {},
+                       "trait_prices": {},
+                       "candidates": [{"address": a} for a in cands]},
+                      ensure_ascii=False)
+
+_d48 = tempfile.mkdtemp()
+_A48 = os.path.join(_d48, "a.jsonl")
+_B48 = os.path.join(_d48, "b.jsonl")
+
+# Обе машины видят ОДНУ И ТУ ЖЕ неподвижную витрину, только B выхватывает
+# чуть другой пятый лот. Настоящий оборот здесь НУЛЕВОЙ.
+with open(_A48, "w", encoding="utf-8") as _f:
+    _f.write("\n".join(_row48(t, ["x1", "x2", "x3"])
+                       for t in (0, 1200, 2400, 3600)) + "\n")
+with open(_B48, "w", encoding="utf-8") as _f:
+    _f.write("\n".join(_row48(t + 60, ["x1", "x2", "y9"])
+                       for t in (0, 1200, 2400, 3600)) + "\n")
+
+# --- наивная склейка ---
+_naive = os.path.join(_d48, "naive.jsonl")
+with open(_naive, "w", encoding="utf-8") as _f:
+    _f.write(open(_A48, encoding="utf-8").read())
+    _f.write(open(_B48, encoding="utf-8").read())
+_st_naive = gs._collection_stats(_C48, gs._load_recording(_naive))
+
+# --- честное объединение ---
+_merged = gs.merge_recordings(_B48, base_path=_A48,
+                              out_path=os.path.join(_d48, "m.jsonl"))
+_st_merged = gs._collection_stats(_C48, gs._load_recording(_merged))
+
+check("склейка ВЫДУМЫВАЕТ оборот на неподвижной витрине",
+      _st_naive["turnover_per_hour"] > 0, _st_naive["turnover_per_hour"])
+check("после --merge оборот честно нулевой",
+      _st_merged["turnover_per_hour"] == 0, _st_merged["turnover_per_hour"])
+
+# Строки обязаны переписываться ДОСЛОВНО: пересборка через json.dumps
+# прогнала бы цены через float, а они лежат строками именно поэтому.
+_orig = set(open(_A48, encoding="utf-8").read().splitlines())
+_out = set(open(_merged, encoding="utf-8").read().splitlines())
+check("строки переписаны дословно, без пересборки JSON",
+      _out.issubset(_orig | set(open(_B48, encoding="utf-8").read().splitlines())))
+
+# Непересекающиеся записи объединяются ЦЕЛИКОМ: выбрасывать там нечего.
+_A2 = os.path.join(_d48, "a2.jsonl")
+_B2 = os.path.join(_d48, "b2.jsonl")
+with open(_A2, "w", encoding="utf-8") as _f:
+    _f.write("\n".join(_row48(t, ["x1"]) for t in (0, 1200)) + "\n")
+with open(_B2, "w", encoding="utf-8") as _f:
+    _f.write("\n".join(_row48(t, ["x1"]) for t in (9000, 10200)) + "\n")
+_m2 = gs.merge_recordings(_B2, base_path=_A2, out_path=os.path.join(_d48, "m2.jsonl"))
+check("непересекающиеся записи сохраняются целиком",
+      sum(1 for _ in open(_m2, encoding="utf-8")) == 4)
+
+# Ничего не перезаписываем: запись рынка невосстановима.
+check("существующий файл результата НЕ перезаписывается",
+      gs.merge_recordings(_B2, base_path=_A2, out_path=_m2) is None)
+check("отсутствующий исходник даёт отказ, а не пустой результат",
+      gs.merge_recordings(os.path.join(_d48, "нет.jsonl"), base_path=_A2,
+                          out_path=os.path.join(_d48, "m3.jsonl")) is None)
+
+# Дыра между записями объединением НЕ лечится, и это надо сказать вслух:
+# иначе бэктест молча недосчитает половину сделок.
+_src48 = open("gift_sniper.py", encoding="utf-8").read()
+check("про разрывы в объединённой записи предупреждается",
+      "Объединение их НЕ" in _src48 and "лечит" in _src48)
+
+
+# =============================================================================
+print("\n[49] Кнопки «Купил / Продал» в Telegram")
+# =============================================================================
+
+# Режим сейчас РУЧНОЙ: бот находит, покупает и выставляет владелец. Без
+# отметки «купил» позиция не попадает в БД, и ни PnL, ни риск-лимиты про неё
+# не знают — учёт становится фикцией.
+
+_db49 = tempfile.mktemp(suffix=".db")
+_ob49 = (gs.DB_PATH, gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.DRY_RUN)
+_sent49 = []
+
+def _fake_tg(method, payload):
+    _sent49.append((method, payload))
+    return {"ok": True,
+            "result": ({"message_id": 777} if method == "sendMessage"
+                       else _fake_tg.updates)}
+_fake_tg.updates = []
+
+def _press(data, who="4242"):
+    _fake_tg.updates = [{"update_id": _press.n, "callback_query": {
+        "id": "q", "data": data, "from": {"id": who},
+        "message": {"message_id": 777, "chat": {"id": 4242}}}}]
+    _press.n += 1
+    return gs.poll_telegram_callbacks()
+_press.n = 1
+
+try:
+    gs.DB_PATH = _db49
+    gs.db_init()
+    gs._tg_call = _fake_tg
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "tok", "4242"
+    gs.DRY_RUN = True
+    gs._find_sent_ts.clear()
+
+    _it49 = {"address": "0:" + "ab" * 32, "sale_price_ton": Decimal("4.0"),
+             "collection_address": "0:cc"}
+    _sn49 = {"floor": Decimal("5"), "floor_reliable": True, "trait_index": {},
+             "trait_total": 0, "peer_prices": {}, "competition": 0,
+             "market_floors": {}}
+    _ev49 = gs.evaluate_trade(_it49, _sn49, None)
+    check("находка с кнопками отправлена", gs.notify_find(_it49, _sn49, _ev49) is True)
+
+    _kb = _sent49[0][1]["reply_markup"]["inline_keyboard"][0]
+    check("две кнопки", [b["text"] for b in _kb] == ["Купил", "Продал"], _kb)
+
+    # 64 байта — жёсткий предел Telegram, а сырой адрес TON это 66 символов.
+    # Положить туда адрес значит получить молча неработающую кнопку.
+    check("callback_data влезает в лимит Telegram",
+          all(len(b["callback_data"].encode()) <= 64 for b in _kb))
+    check("в callback_data НЕ адрес, а короткий id",
+          all(len(b["callback_data"]) < 20 for b in _kb), _kb)
+
+    # Посторонний не должен вести учёт владельца.
+    check("нажатие от чужого id игнорируется", _press("b:1", who="9999") == 0)
+
+    check("«Купил» открывает позицию", _press("b:1") == 1)
+    with gs.db_connect() as _c:
+        _pos = _c.execute("SELECT * FROM positions").fetchall()
+    check("позиция ровно одна", len(_pos) == 1, len(_pos))
+    check("позиция открыта по цене покупки",
+          Decimal(_pos[0]["buy_price_ton"]) == _ev49["buy_price"])
+
+    # Повторное нажатие НЕ открывает вторую позицию: в учёте появился бы лот,
+    # которого нет. Тот же принцип, что и у execute_blockchain_buy().
+    check("повторное «Купил» вторую позицию НЕ открывает", _press("b:1") == 0)
+    with gs.db_connect() as _c:
+        check("позиций по-прежнему одна",
+              _c.execute("SELECT COUNT(*) n FROM positions").fetchone()["n"] == 1)
+
+    check("«Продал» закрывает позицию", _press("s:1") == 1)
+    with gs.db_connect() as _c:
+        _row = _c.execute("SELECT * FROM positions").fetchone()
+    check("позиция закрыта", _row["status"] == "closed", _row["status"])
+    check("PnL посчитан по той же экономике, что и прогноз",
+          abs(Decimal(_row["pnl_ton"]) - _ev49["net_profit"]) < Decimal("0.000000001"),
+          f"{_row['pnl_ton']} vs {_ev49['net_profit']}")
+
+    # Галочки: одно и то же уведомление владелец видит и до, и после
+    # действия, и без отметки не вспомнить, нажимал ли он уже.
+    _kbs = [p["reply_markup"]["inline_keyboard"][0]
+            for m, p in _sent49 if m == "editMessageReplyMarkup"]
+    check("после «Купил» галочка у первой кнопки",
+          [b["text"] for b in _kbs[0]] == ["✅ Куплено", "Продал"], _kbs[0])
+    check("после «Продал» галочки у обеих",
+          [b["text"] for b in _kbs[1]] == ["✅ Куплено", "✅ Продано"], _kbs[1])
+
+    # Цена продажи у бота только ПЛАНОВАЯ. Подставить её молча значило бы
+    # выдумать сделку, поэтому это названо прямо и дан способ поправить.
+    _confirm = [p["text"] for m, p in _sent49 if m == "sendMessage"][-1]
+    check("сказано, что цена ПЛАНОВАЯ", "ПЛАНОВОЙ" in _confirm, _confirm)
+    check("назван способ поправить фактическую цену",
+          "--close" in _confirm, _confirm)
+
+    # --close правит цену на фактическую.
+    _pnl = gs.close_position(int(_row["id"]), Decimal("6.0"))
+    with gs.db_connect() as _c:
+        _row2 = _c.execute("SELECT * FROM positions").fetchone()
+    check("--close переписывает цену продажи",
+          Decimal(_row2["sell_price_ton"]) == Decimal("6.0"))
+
+    # Смещение getUpdates обязано пережить перезапуск: иначе бот проглотит
+    # старое нажатие заново и откроет позицию повторно.
+    check("смещение getUpdates сохранено в БД",
+          gs.meta_get("tg_offset") is not None, gs.meta_get("tg_offset"))
+
+    # Нажатие на несуществующий лот не роняет цикл и ничего не открывает.
+    check("нажатие по неизвестному id безопасно", _press("b:999") == 0)
+    check("мусор в callback_data безопасен", _press("мусор") == 0)
+finally:
+    (gs.DB_PATH, gs._tg_call, gs.TELEGRAM_BOT_TOKEN,
+     gs.TELEGRAM_CHAT_ID, gs.DRY_RUN) = _ob49
+    if os.path.exists(_db49):
+        os.unlink(_db49)
+
+
+# =============================================================================
+print("\n[50] Позиции видно, и их происхождение названо честно")
+# =============================================================================
+
+# Кнопка «Купил» создаёт позицию, а --close требует её НОМЕР. Узнать номер
+# было неоткуда: инструмент, номер для которого негде взять, не инструмент.
+_db50 = tempfile.mktemp(suffix=".db")
+_odb50 = gs.DB_PATH
+try:
+    gs.DB_PATH = _db50
+    gs.db_init()
+    gs.record_purchase({"address": "0:" + "ab" * 32, "collection_address": "0:c"},
+                       Decimal("4.1"), Decimal("5"))
+    _pid50 = gs.record_purchase({"address": "0:" + "cd" * 32,
+                                 "collection_address": "0:c"},
+                                Decimal("3.2"), Decimal("4"))
+    gs.close_position(_pid50, Decimal("4.0"))
+
+    check("показаны только открытые позиции", gs.show_positions() == 1)
+    check("пустая база не роняет отчёт",
+          gs.show_positions.__doc__ is not None)
+
+    _src50 = open("gift_sniper.py", encoding="utf-8").read()
+    # Отметка «Купил» — утверждение владельца, а не факт блокчейна. Без этой
+    # оговорки список читается как выписка по кошельку.
+    check("сказано, что это учёт по отметкам, а не состояние кошелька",
+          "отметкам в Telegram" in _src50 and "бот не совершал" in _src50)
+    check("назван способ закрыть позицию", "--close НОМЕР ЦЕНА" in _src50)
+    # Адрес показывается в user-friendly форме: raw в поиск площадки не
+    # вставишь, а искать позицию владелец будет руками.
+    check("адрес в списке -- user-friendly",
+          "friendly_ton_address(r[\"address\"])" in _src50
+          or "friendly_ton_address(r['address'])" in _src50)
+finally:
+    gs.DB_PATH = _odb50
+    if os.path.exists(_db50):
+        os.unlink(_db50)
+
+
+# =============================================================================
+print("\n[51] Покрытие коллекции: floor по куску — не floor")
+# =============================================================================
+
+# Поймано владельцем 23.09.2026: бот сообщил floor 11 TON по коллекции
+# Spring Baskets, где витрина Getgems показывала 5.65, а MRKT — 5.5.
+# Причина не в парсинге цен, а в ВЫБОРКЕ: 15 страниц по 100 — это 1500
+# предметов из 13 000, то есть 12% коллекции. Пятый перцентиль такого куска
+# соответствует примерно 91-му самому дешёвому лоту из 1820 выставленных,
+# а не первому. Ошибка шла в сторону ЗАВЫШЕНИЯ ВЫРУЧКИ — то есть бот
+# придумывал скидки, которых нет.
+
+# 1000 — максимум, разрешённый TonAPI (openapi.yml: limitQuery maximum 1000).
+# Стояло 100. Число запросов при этом НЕ меняется: та же страница, вдесятеро
+# больше предметов.
+check("размер страницы = максимум TonAPI",
+      source_default("FLOOR_PAGE_SIZE") == "1000",
+      source_default("FLOOR_PAGE_SIZE"))
+
+_db51 = tempfile.mktemp(suffix=".db")
+_ob51 = (gs._collect_sample, gs.DB_PATH)
+try:
+    gs.DB_PATH = _db51
+    gs.db_init()
+
+    def _mk_items(n, coll="0:c"):
+        return [{"address": f"0:{i:064x}", "sale_price_ton": Decimal(10 + i),
+                 "is_on_sale": True, "traits": {"model": "M"}, "mint_index": i,
+                 "collection_address": coll, "sale_address": "0:s",
+                 "sale_market": "Getgems Sales", "explicit_rarity_pct": None,
+                 "collection_name": "C"} for i in range(n)]
+
+    # --- покрытие 1.5%: выборка ОГРОМНАЯ по числу, но floor недостоверен ---
+    gs._collection_size_cache.clear()
+    gs._collection_size_cache["0:c"] = 13000
+    gs._floor_cache.clear()
+    gs._collect_sample = lambda c: (_mk_items(200), "TonAPI", False)
+    _s51 = gs.get_market_snapshot("0:c")
+
+    check("покрытие посчитано", _s51["coverage_pct"] == Decimal("1.5"),
+          _s51["coverage_pct"])
+    check("выборка по ЧИСЛУ проходит старый порог",
+          _s51["sample_size"] >= gs.MIN_FLOOR_SAMPLE, _s51["sample_size"])
+    # Вот ради чего всё: раньше этого хватало, и бот торговал по floor,
+    # посчитанному по 1.5% коллекции.
+    check("но floor всё равно НЕДОСТОВЕРЕН из-за покрытия",
+          _s51["floor_reliable"] is False)
+
+    # --- покрытие 100%: тот же код должен РАЗРЕШИТЬ торговлю ---
+    # Иначе тест доказывал бы лишь то, что проверка всегда против.
+    gs._collection_size_cache.clear()
+    gs._collection_size_cache["0:full"] = 200
+    gs._floor_cache.clear()
+    gs._collect_sample = lambda c: (_mk_items(200, "0:full"), "TonAPI", False)
+    _s51b = gs.get_market_snapshot("0:full")
+    check("при полном покрытии floor снова достоверен",
+          _s51b["floor_reliable"] is True and _s51b["coverage_pct"] == Decimal("100.0"),
+          (_s51b["floor_reliable"], _s51b["coverage_pct"]))
+
+    # --- размер коллекции неизвестен: не выдумываем покрытие ---
+    # Недоступный размер — это «не знаю», а не «всё в порядке». Но и не
+    # повод глушить торговлю: до 23.09.2026 бот работал вообще без этого
+    # числа, и такое поведение остаётся запасным.
+    gs._collection_size_cache.clear()
+    gs._collection_size_cache["0:nosize"] = None
+    gs._floor_cache.clear()
+    gs._collect_sample = lambda c: (_mk_items(200, "0:nosize"), "TonAPI", False)
+    _s51c = gs.get_market_snapshot("0:nosize")
+    check("без размера коллекции покрытие = None, а не 100",
+          _s51c["coverage_pct"] is None)
+    check("пустой снапшот тоже несёт поля покрытия",
+          "coverage_pct" in gs._empty_snapshot() and
+          "collection_size" in gs._empty_snapshot())
+
+    # ГЛАВНОЕ, что показал живой прогон 23.09.2026: у ВСЕХ коллекций
+    # владельца next_item_index = -1, то есть покрытие всегда было «не знаю»
+    # и защита не работала ни разу. Дошедший до конца обход — это измерение,
+    # и оно обязано перебивать отсутствующее поле API.
+    gs._collection_size_cache.clear()
+    gs._collection_size_cache["0:ex"] = None          # API размера НЕ ДАЁТ
+    gs._floor_cache.clear()
+    gs._collect_sample = lambda c: (_mk_items(200, "0:ex"), "TonAPI", True)
+    _s51d = gs.get_market_snapshot("0:ex")
+    check("обход дошёл до конца -> покрытие 100 ИЗМЕРЕНО, а не None",
+          _s51d["coverage_pct"] == Decimal("100.0"), _s51d["coverage_pct"])
+    check("размер коллекции взят из самого обхода",
+          _s51d["collection_size"] == 200, _s51d["collection_size"])
+    check("и floor снова достоверен", _s51d["floor_reliable"] is True)
+finally:
+    (gs._collect_sample, gs.DB_PATH) = _ob51
+    gs._collection_size_cache.clear()
+    gs._floor_cache.clear()
+    if os.path.exists(_db51):
+        os.unlink(_db51)
+
+# Покрытие обязано попасть и в запись, и в уведомление: floor по 12%
+# коллекции и floor по всей коллекции — разные числа, и различать их должен
+# не только код, но и владелец.
+_src51 = open("gift_sniper.py", encoding="utf-8").read()
+check("покрытие сохраняется в запись рынка",
+      '"coverage_pct": (str(snap["coverage_pct"])' in _src51)
+check("покрытие названо в уведомлении о находке",
+      "видно {cov}% коллекции" in _src51)
+check("неизвестное покрытие названо прямо, а не опущено",
+      "покрытие коллекции неизвестно" in _src51)
+
+
+# =============================================================================
+print("\n[52] Арбитраж площадок: считается той же экономикой")
+# =============================================================================
+
+# Владельцу подходит и арбитраж, а общий floor разницу между площадками
+# УСРЕДНЯЕТ — то есть в обычных числах бота её не видно вовсе.
+
+_snap52 = {"market_floors": {
+    "Getgems Sales":        {"floor": Decimal("5.65"), "n": 40},
+    "Marketapp Marketplace": {"floor": Decimal("4.20"), "n": 9},
+    # Самый дешёвый floor в таблице — и он же самый ненадёжный: два лота.
+    # Если бы выборка не проверялась, арбитраж всегда находился бы здесь.
+    "Thin Market":          {"floor": Decimal("1.00"), "n": 2},
+}}
+_arb52 = gs.market_arbitrage(_snap52)
+
+check("арбитраж найден", _arb52 is not None)
+check("покупка на дешёвой площадке",
+      _arb52["buy_market"] == "Marketapp Marketplace", _arb52["buy_market"])
+check("продажа на дорогой площадке",
+      _arb52["sell_market"] == "Getgems Sales", _arb52["sell_market"])
+# ГЛАВНОЕ в этой секции: арбитраж НЕ заводит вторую модель прибыли рядом
+# с первой. Разойдясь, они дали бы два разных ответа на один вопрос.
+check("прибыль посчитана compute_net_profit, а не своей формулой",
+      _arb52["net_profit"] == gs.compute_net_profit(Decimal("5.65"), Decimal("4.20")),
+      _arb52["net_profit"])
+check("площадка с выборкой меньше MIN_MARKET_SAMPLE не участвует",
+      "Thin Market" not in (_arb52["buy_market"], _arb52["sell_market"]))
+# Покупать вне ALLOWED_MARKETS бот не умеет: протоколы контрактов продажи
+# различаются, и платить туда по нашей схеме значит отправить деньги вслепую.
+check("покупка вне ALLOWED_MARKETS помечена как недоступная боту",
+      _arb52["buyable"] is False)
+
+# Обратный случай: бот обязан признавать и ДОСТУПНУЮ покупку, иначе тест
+# доказывал бы лишь то, что buyable всегда False.
+_arb52b = gs.market_arbitrage({"market_floors": {
+    "Getgems Sales": {"floor": Decimal("4.00"), "n": 30},
+    "Marketapp Marketplace": {"floor": Decimal("6.00"), "n": 30},
+}})
+check("покупка на разрешённой площадке доступна",
+      _arb52b["buy_market"] == "Getgems Sales" and _arb52b["buyable"] is True)
+
+check("одна площадка — арбитража нет",
+      gs.market_arbitrage({"market_floors": {
+          "Getgems Sales": {"floor": Decimal("5.65"), "n": 40}}}) is None)
+check("нет market_floors — арбитража нет",
+      gs.market_arbitrage({}) is None)
+# Равные floor: разница нулевая, а комиссия и газ — нет. Сделка убыточна,
+# и показывать её как возможность значит звать владельца терять деньги.
+check("равные floor — арбитража нет (комиссия и газ не покрыты)",
+      gs.market_arbitrage({"market_floors": {
+          "A": {"floor": Decimal("5.00"), "n": 30},
+          "B": {"floor": Decimal("5.00"), "n": 30}}}) is None)
+
+# Оговорки обязаны идти РЯДОМ С ЧИСЛОМ: голая цифра «+1.02 TON» читается
+# как гарантия профита, а она ею не является.
+# Старый арбитраж по TonAPI с 07.10.2026 в телефон не идёт (SEETG_ONLY=1),
+# поэтому его оговорки проверяются в его же режиме.
+_oonly52 = gs.SEETG_ONLY
+gs.SEETG_ONLY = False
+_l52 = gs._arbitrage_lines([{"collection": "0:c", **_snap52}])
+check("в сводке сказано, что бот сам там купить не может",
+      any("НЕ может" in x for x in _l52), _l52)
+check("в сводке сказано, что комиссии проверены только у Getgems",
+      any("только у Getgems" in x for x in _l52), _l52)
+check("без арбитража строк нет вовсе",
+      gs._arbitrage_lines([{"collection": "0:c", "market_floors": {}}]) == [])
+gs.SEETG_ONLY = _oonly52
+
+
+
+# =============================================================================
+print("\n[53] «Что видел, но не прошло»")
+# =============================================================================
+
+# После исправления floor находка требует лот примерно на 12% ниже
+# НАСТОЯЩЕГО пола, и тишина стала нормой. Молчащий бот неотличим от бота,
+# смотрящего в пустой рынок, — а решения у этих состояний разные.
+
+def _nm_item(price, mint=None, name="Spring Baskets"):
+    return {"address": "0:aa", "sale_price_ton": Decimal(str(price)),
+            "mint_index": mint, "collection_name": name,
+            "collection_address": "0:c", "sale_market": "Getgems Sales"}
+
+def _nm_ev(roi, disc, reason="ROI ниже порога"):
+    return {"roi_pct": Decimal(str(roi)), "discount_pct": Decimal(str(disc)),
+            "reason": reason}
+
+gs._near_misses.clear()
+# floor недостоверен — прибыль посчитана от выдуманного пола. Показать её
+# владельцу значит предложить сделку по несуществующей цене.
+gs.note_near_miss(_nm_item("5.0"), {"floor_reliable": False}, _nm_ev(4, 10))
+check("при недостоверном floor промах НЕ запоминается", gs._near_misses == [])
+
+_rel53 = {"floor_reliable": True}
+for _roi in (1, 9, 3, 7, 5):
+    gs.note_near_miss(_nm_item("5.0", mint=_roi), _rel53, _nm_ev(_roi, 10))
+check("держим только NEAR_MISS_TOP лучших",
+      len(gs._near_misses) == gs.NEAR_MISS_TOP, len(gs._near_misses))
+# Ранжирование по ROI, а не по скидке: скидка не учитывает ни комиссию,
+# ни газ, и «дешевле на 20%» может быть убыточнее «дешевле на 12%».
+check("лучшие — по ROI",
+      [n["roi_pct"] for n in gs._near_misses] ==
+      [Decimal("9"), Decimal("7"), Decimal("5")],
+      [n["roi_pct"] for n in gs._near_misses])
+
+_line53 = gs._near_miss_line({
+    "collection": "Spring Baskets", "mint": 1234,
+    "buy_price": Decimal("4.90"), "market": "Getgems Sales",
+    "roi_pct": Decimal("3"), "discount_pct": Decimal("13.0"),
+    "reason": "ROI 3% ниже порога 5%"})
+check("в строке есть цена, отклонение от floor и причина",
+      "4.90" in _line53 and "дешевле floor на 13%" in _line53
+      and "ниже порога" in _line53, _line53)
+# Лот ДОРОЖЕ floor обязан называться дорогим. «Дешевле на −5%» — строка,
+# которую перечитывают, а решение о деньгах перечитывания не терпит.
+check("лот дороже floor назван дорогим",
+      "дороже floor на 5%" in gs._near_miss_line({
+          "collection": "C", "mint": None, "buy_price": Decimal("6.0"),
+          "market": "G", "roi_pct": Decimal("-9"),
+          "discount_pct": Decimal("-5.0"), "reason": "убыточно"}))
+
+# Промахи обязаны попадать в оба пути отказа, иначе в режиме записи (где
+# process_item не вызывается вовсе) владелец не увидит ничего.
+_src53 = open("gift_sniper.py", encoding="utf-8").read()
+check("scan_finds запоминает промахи",
+      _src53.count("note_near_miss(item, snap, ev)") == 1)
+check("process_item запоминает промахи",
+      _src53.count("note_near_miss(item, snapshot, ev)") == 1)
+
+# --- сводка: арбитраж и промахи реально доходят до Telegram ---
+_ob53 = (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+         gs._last_heartbeat)
+_sent53 = []
+_oonly53 = gs.SEETG_ONLY
+try:
+    # Эти проверки — про СТАРЫЙ арбитраж по TonAPI, а он с 07.10.2026 в
+    # телефон не идёт (SEETG_ONLY=1): в сводку попадает арбитраж по see.tg,
+    # где floor считается по всем пяти маркетам. Механизм не удалён, поэтому
+    # проверяем его в его же режиме.
+    gs.SEETG_ONLY = False
+    gs._tg_call = (lambda method, payload:
+                   (_sent53.append(payload.get("text", "")),
+                    {"ok": True, "result": {"message_id": 1}})[1])
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "t", "1"
+    gs._last_heartbeat = 0.0
+    gs.notify_heartbeat([{"collection": "0:c", "sample_size": 100,
+                          "floor": Decimal("5.65"), "floor_reliable": True,
+                          **_snap52}], force=True)
+    _txt53 = _sent53[0] if _sent53 else ""
+    check("в сводке есть арбитраж", "Арбитраж площадок" in _txt53, _txt53)
+    check("в сводке есть промахи", "Ближе всего к сделке" in _txt53, _txt53)
+    check("промахи очищены после отправки", gs._near_misses == [])
+
+    # Пустой список — ДРУГОЙ факт, и он тоже обязан быть назван: молчание
+    # здесь прочиталось бы как «рынок рядом, просто не дотянул».
+    _sent53.clear()
+    gs._last_heartbeat = 0.0
+    gs.notify_heartbeat([{"collection": "0:c", "sample_size": 100,
+                          "floor": Decimal("5.65"), "floor_reliable": True}],
+                        force=True)
+    check("пустой список промахов назван прямо",
+          "Оценивать было нечего" in _sent53[0], _sent53[0])
+finally:
+    gs.SEETG_ONLY = _oonly53
+    (gs._tg_call, gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+     gs._last_heartbeat) = _ob53
+    gs._near_misses.clear()
+
+
+# =============================================================================
+print("\n[54] Модель автора видео: скоринг номера и монохрома")
+# =============================================================================
+
+# Это ЧУЖАЯ модель, и проверяется она на ЕГО ЖЕ примерах: если наш код даёт
+# другие баллы, значит мы реализовали не то, что он описал.
+
+for _num, _want in [(19913, 35), (22969, 35), (226256, 22),
+                    (155745, 10), (97518, 0)]:
+    check(f"номер {_num} -> {_want}", gs.flip_number_score(_num) == _want,
+          gs.flip_number_score(_num))
+
+# Бонусы: мало разных цифр плюс структура. 1919 — повтор блока, 777 — три
+# подряд и <= 999; потолок 40 не пробивается.
+check("повтор блока 1919 -> 40", gs.flip_number_score(1919) == 40)
+check("777 -> 40 (потолок не пробит)", gs.flip_number_score(777) == 40)
+check("нет номера -> 0", gs.flip_number_score(None) == 0)
+
+# ПРОТИВОРЕЧИЕ В САМОМ ПРОМПТЕ, зафиксировано намеренно: правило считает
+# РАЗНЫЕ цифры, и у 16630 их четыре -> 10 + 5 за круглый хвост = 15. А
+# таблица примеров в том же промпте ставит 16630 оценку 35+5. Мы реализуем
+# ПРАВИЛО, потому что оно машинное; расхождение названо владельцу, чтобы
+# решение принимал он, а не молчаливая правка кода.
+check("16630 по ПРАВИЛУ (а не по таблице примеров) = 15",
+      gs.flip_number_score(16630) == 15, gs.flip_number_score(16630))
+
+# «Неровная» цена: преимущество в сортировке по цене.
+check("6.00 -> 5.87", gs.flip_uneven_price(Decimal("6.00")) == Decimal("5.87"))
+check("9.00 -> 8.87", gs.flip_uneven_price(Decimal("9.00")) == Decimal("8.87"))
+check("11.00 -> 10.9", gs.flip_uneven_price(Decimal("11.00")) == Decimal("10.9"))
+
+# --- цветовой словарь: «не знаю» НЕ равно «цвет другой» ---
+check("оникс — это чёрный", gs.color_of("Onyx Black") == "black")
+check("какао — это коричневый", gs.color_of("Cocoa Bear") == "brown")
+check("в названии без цвета цвета НЕТ (None, а не 'чёрный')",
+      gs.color_of("Plush Pepe") is None)
+
+# --- монохром: «не знаю» НЕ равно «монохрома нет» ---
+_it54 = {"address": "0:aa", "sale_price_ton": Decimal("3.9"), "mint_index": 22969,
+         "traits": {"model": "Plush Pepe", "backdrop": "Onyx Black"},
+         "sale_market": "Getgems Sales", "explicit_rarity_pct": None}
+_m54, _known54 = gs.flip_mono_score(_it54, None)
+check("цвет модели неизвестен -> монохром НЕ посчитан",
+      _m54 == 0 and _known54 is False)
+_m54b, _known54b = gs.flip_mono_score(_it54, {"plush pepe": "black"})
+check("таблица дала цвет, он совпал с фоном -> монохром есть",
+      _m54b == 40 and _known54b is True, (_m54b, _known54b))
+_m54c, _ = gs.flip_mono_score(_it54, {"plush pepe": "green"})
+check("зелёная модель на чёрном фоне -> 0", _m54c == 0)
+
+# Без таблицы, но цвет назван в САМОМ имени модели — считается. Ради этого
+# словарь и заведён: иначе ручная таблица требовалась бы на каждую модель.
+_named = {"traits": {"model": "Cocoa Bear", "backdrop": "Chocolate Brown"}}
+check("цвет из имени модели: коричневое на коричневом -> 40",
+      gs.flip_mono_score(_named, None) == (40, True),
+      gs.flip_mono_score(_named, None))
+check("цвет из имени модели: коричневое на синем -> 0, но ПОСЧИТАНО",
+      gs.flip_mono_score(
+          {"traits": {"model": "Cocoa Bear", "backdrop": "Sky Blue"}},
+          None) == (0, True))
+# Таблица СИЛЬНЕЕ словаря: она заполняется по картинке, словарь угадывает.
+check("таблица перебивает цвет из имени",
+      gs.flip_mono_score(_named, {"cocoa bear": "blue"}) == (0, True))
+
+# --- score_flip целиком ---
+_snap54 = {"floor": Decimal("3.6"), "peer_prices": {}, "trait_index": {},
+           "trait_total": 0, "collection": "0:c"}
+_r54 = gs.score_flip(_it54, _snap54, {"plush pepe": "black"})
+check("монохром + номер + Onyx Black -> BUY",
+      _r54["decision"] == "BUY", (_r54["decision"], _r54["total"]))
+check("цель — неровная цена от x1.5",
+      _r54["target_ton"] == gs.flip_uneven_price(Decimal("3.9") * Decimal("1.5")),
+      _r54["target_ton"])
+
+# Жёсткие фильтры автора. Переплата больше 20% над floor -> SKIP «зависнет»:
+# это ЕГО правило, и оно прямо противоположно нашему (мы покупаем только
+# НИЖЕ floor), поэтому проверяется отдельно.
+_over = dict(_it54, sale_price_ton=Decimal("8.0"))
+check("переплата над floor -> SKIP",
+      gs.score_flip(_over, _snap54, {"plush pepe": "black"})["decision"] == "SKIP")
+_rich = dict(_it54, sale_price_ton=Decimal("9.0"))
+check("дороже бюджета -> SKIP",
+      "бюджета" in gs.score_flip(_rich, _snap54, None)["reason"])
+
+# Чего в данных нет — обязано быть НАЗВАНО, а не подставлено нулём.
+_r54b = gs.score_flip(_it54, _snap54, None)
+check("отсутствие цвета модели названо в missing",
+      any("цвет модели" in m for m in _r54b["missing"]), _r54b["missing"])
+check("без монохрома доверие понижено", _r54b["confidence"] == "low")
+check("сторона bid названа отсутствующей",
+      any("bid" in m for m in _r54b["missing"]))
+
+# ЦЕЛЬ ПРОДАЖИ ОТНОСИТЕЛЬНО FLOOR. Правило «x1.5» автор применяет к лоту,
+# купленному НА floor. Купив НИЖЕ floor, тот же множитель ставит цену ВЫШЕ
+# floor — конкурировать придётся с такими же лотами дешевле, и шанс продажи
+# уже не тот, из которого считался порог «каждый четвёртый».
+# Живой прогон 23.09.2026 дал такую строку сразу: 6.99 при floor 9.39.
+_under = {"address": "0:b", "sale_price_ton": Decimal("6.99"), "mint_index": 46400,
+          "traits": {"model": "X", "backdrop": "Sapphire"},
+          "sale_market": "Getgems Sales", "explicit_rarity_pct": None}
+_r_under = gs.score_flip(_under, {"floor": Decimal("9.39"), "peer_prices": {},
+                                  "trait_index": {}, "trait_total": 0}, None)
+check("цель x1.5 от цены НИЖЕ floor оказывается ВЫШЕ floor — и это названо",
+      _r_under["target_over_floor_pct"] > 0, _r_under["target_over_floor_pct"])
+# Обратный случай: купили на floor — цель тоже выше, это нормально для его
+# модели. Проверка нужна, чтобы поле считалось всегда, а не только в беде.
+_at = dict(_under, sale_price_ton=Decimal("4.00"))
+check("поле считается и при покупке ровно на floor",
+      gs.score_flip(_at, {"floor": Decimal("4.00"), "peer_prices": {},
+                          "trait_index": {}, "trait_total": 0},
+                    None)["target_over_floor_pct"] > 0)
+
+# РАСХОЖДЕНИЕ ДВУХ МОДЕЛЕЙ — не мнение, а арифметика min(). Лот, дешёвый
+# в СВОЁМ сегменте, наша модель видит как обычный, если floor коллекции ниже.
+# Это и есть ответ на «почему --flip его нашёл, а торговля нет».
+_seg = {"floor": Decimal("5.00"),                       # floor КОЛЛЕКЦИИ ниже
+        "peer_prices": {"Sapphire": [Decimal("9.39")] * 6},
+        "trait_index": {}, "trait_total": 0, "floor_reliable": True,
+        "competition": 0}
+_lot = {"address": "0:s", "sale_price_ton": Decimal("6.99"), "mint_index": 46400,
+        "traits": {"model": "Sapphire", "backdrop": "Sapphire"},
+        "sale_market": "Getgems Sales", "explicit_rarity_pct": None}
+_ev_seg = gs.evaluate_trade(_lot, _seg, None)
+check("floor коллекции ниже -> оцениваем по нему, лот отклонён",
+      _ev_seg["eff_floor"] == Decimal("5.00") and _ev_seg["allowed"] is False,
+      (_ev_seg["eff_floor"], _ev_seg["reason"]))
+
+# Тот же лот, но floor коллекции ВЫШЕ сегментного: минимум берёт сегмент,
+# и сделка проходит. Без этой половины тест доказывал бы лишь, что мы всегда
+# против.
+_seg2 = dict(_seg, floor=Decimal("12.00"))
+_ev2 = gs.evaluate_trade(_lot, _seg2, None)
+check("floor коллекции выше -> оцениваем по сегменту, лот проходит",
+      _ev2["eff_floor"] == Decimal("9.39") and _ev2["allowed"] is True,
+      (_ev2["eff_floor"], _ev2["reason"]))
+
+# Отчёт обязан вызывать ЕЁ ЖЕ, а не копию логики: иначе он объяснял бы
+# поведение кода, которого нет.
+_src_flip = open("gift_sniper.py", encoding="utf-8").read()
+_fr = _src_flip[_src_flip.index("def flip_report("):]
+_fr = _fr[:_fr.index("\ndef ")]
+check("отчёт прогоняет саму evaluate_trade(), а не пересказ",
+      "evaluate_trade(item, snap, None)" in _fr)
+check("отчёт печатает ОБА floor",
+      "floor коллекции" in _fr and "floor сегмента" in _fr)
+
+# ПОЛЯ ПРОДАЖИ ПРОВЕРЯЮТСЯ ТОЛЬКО ПО ВЫСТАВЛЕННЫМ ЛОТАМ. Живой прогон
+# 23.09.2026 дал «цена продажи 0/5 НЕ РАЗОБРАНО» на коллекции, где сам же
+# probe десятью строками ниже насчитал 123 выставленных лота из 1000:
+# выставлено ~12%, и в пятёрке их не бывает примерно в половине случаев.
+# Вердикт «парсер сломан» был статистикой, а не фактом.
+_src_probe = open("gift_sniper.py", encoding="utf-8").read()
+_pb = _src_probe[_src_probe.index("def probe("):]
+_pb = _pb[:_pb.index("\ndef ")]
+check("probe берёт большую выборку, а не 5 предметов",
+      "fetch_items_tonapi(address, limit=FLOOR_PAGE_SIZE)" in _pb
+      and "limit=5)" not in _pb)
+check("цена продажи считается по выставленным, а не по всем",
+      "if on_sale:" in _pb and "for i in on_sale" in _pb)
+check("отсутствие выставленных названо НЕ поломкой",
+      "не поломка" in _pb)
+# И второй запрос за тем же списком не делается: перепись площадок считается
+# по той же выборке.
+check("перепись площадок не тратит второй запрос",
+      "census, listed = parsed, on_sale" in _pb)
+
+# --- шаблон таблицы цветов ---
+# Собрать список моделей бот может сам, а цвета — нет. Значит заполненное
+# руками обязано пережить повторный запуск: затереть его автоподстановкой
+# значило бы выбросить единственные настоящие данные в файле.
+_src_colors = open("gift_sniper.py", encoding="utf-8").read()
+_bct = _src_colors[_src_colors.index("def build_colors_template("):]
+_bct = _bct[:_bct.index("\ndef ")]
+check("шаблон не перезаписывает заполненное владельцем",
+      "if prev:" in _bct and "table[name] = prev" in _bct)
+check("незаполненное — пустая строка, а не выдуманный цвет",
+      'table[name] = ""' in _bct)
+
+# ГЛАВНОЕ: чужая модель НЕ управляет торговлей. evaluate_trade() про неё не
+# знает, иначе бот начал бы покупать ВЫШЕ floor на непроверенном основании.
+_src54 = open("gift_sniper.py", encoding="utf-8").read()
+_ev54 = _src54[_src54.index("def evaluate_trade("):]
+_ev54 = _ev54[:_ev54.index("\ndef ")]
+check("evaluate_trade не вызывает скоринг чужой модели",
+      "score_flip" not in _ev54 and "flip_" not in _ev54)
+
+
+# =============================================================================
+print("\n[55] «Дешевле своих»: показываем, но НЕ покупаем")
+# =============================================================================
+
+# Решение владельца 23.09.2026. Лоты, дешёвые относительно floor СВОЕЙ модели,
+# торговля отклоняет из-за min(floor коллекции, floor сегмента). Менять min()
+# значило бы увеличить расчётную прибыль без данных, поэтому здесь ровно
+# наблюдение: находим и показываем, покупок нет.
+
+def _si(addr, price, model, mint=1234):
+    return {"address": addr, "sale_price_ton": Decimal(str(price)),
+            "mint_index": mint, "traits": {"model": model},
+            "collection_address": "0:c", "sale_market": "Getgems Sales",
+            "is_on_sale": True, "explicit_rarity_pct": None,
+            "collection_name": "C"}
+
+# floor коллекции 5.00 (ниже сегментного) — именно тот случай, где торговля
+# отказывает, а наблюдение обязано лот показать.
+# exhausted=True — обход дошёл до конца коллекции. Без этого наблюдение по
+# сегменту не работает вовсе: см. проверку ниже.
+_snap55 = {
+    "floor": Decimal("5.00"), "floor_reliable": True, "exhausted": True,
+    "on_sale": [_si("0:x1", "6.99", "Sapphire"), _si("0:x2", "9.50", "Sapphire")],
+    "peer_prices": {"Sapphire": [Decimal("9.39")] * 6},
+    "trait_index": {}, "trait_total": 0, "competition": 0,
+}
+_b55 = gs.find_segment_bargains(_snap55)
+check("лот дешевле floor своего сегмента найден", len(_b55) == 1, len(_b55))
+check("это тот самый лот", _b55[0]["item"]["address"] == "0:x1")
+check("прибыль считается compute_net_profit, а не своей формулой",
+      _b55[0]["profit"] == gs.compute_net_profit(Decimal("9.39"), Decimal("6.99")),
+      _b55[0]["profit"])
+check("скидка от СЕГМЕНТНОГО пола, а не от коллекции",
+      _b55[0]["discount_pct"] == Decimal("25.6"), _b55[0]["discount_pct"])
+
+# А торговля тот же лот по-прежнему отклоняет — механизм не тронут.
+_ev55 = gs.evaluate_trade(_si("0:x1", "6.99", "Sapphire"), _snap55, None)
+check("торговля этот лот ВСЁ РАВНО отклоняет (min() не менялся)",
+      _ev55["allowed"] is False and _ev55["eff_floor"] == Decimal("5.00"),
+      (_ev55["allowed"], _ev55["eff_floor"]))
+
+# Недостоверный floor — не наблюдаем вовсе: прибыль от выдуманного пола.
+check("при недостоверном floor не ищем ничего",
+      gs.find_segment_bargains(dict(_snap55, floor_reliable=False)) == [])
+# Нет данных о похожих — не догадываемся.
+check("без выборки по сегменту лот не берётся",
+      gs.find_segment_bargains(dict(_snap55, peer_prices={})) == [])
+
+# ДЕДУПЛИКАЦИЯ ОТДЕЛЬНАЯ ОТ ТОРГОВОЙ. Общий кеш был бы тихой поломкой:
+# наблюдение пометило бы лот виденным, и торговый путь пропустил бы его молча.
+gs._segment_seen.clear()
+gs._seen_cache.clear()
+_it55 = _si("0:x1", "6.99", "Sapphire")
+check("первый раз лот не считается виденным",
+      gs._segment_already_seen(_it55, Decimal("9.39")) is False)
+check("повторно — уже виденным",
+      gs._segment_already_seen(_it55, Decimal("9.39")) is True)
+check("торговый кеш при этом НЕ ТРОНУТ",
+      gs.already_analyzed(_it55, Decimal("5.00")) is False)
+gs._segment_seen.clear()
+gs._seen_cache.clear()
+
+# НЕПОЛНЫЙ ОБХОД — НЕТ УТВЕРЖДЕНИЙ О КОНКУРЕНТАХ. Живой прогон 23.09.2026,
+# Pool Floats #141416: бот объявил «следующий Leonardo стоит 14.00», а на
+# витрине их четыре по 5.00 и ещё десяток по 6-8. Функция считала верно —
+# неверна была ВЫБОРКА: обход оборвался на лимите TonAPI, и дешёвые Leonardo
+# в наши 12 лотов не попали. Ошибка шла в сторону завышения прибыли.
+check("при оборванном обходе наблюдение по сегменту молчит",
+      gs.find_segment_bargains(dict(_snap55, exhausted=False)) == [],
+      "выборка — первые N страниц по индексу, а не случайный срез")
+check("и при отсутствии флага вовсе — тоже молчит",
+      gs.find_segment_bargains(
+          {k: v for k, v in _snap55.items() if k != "exhausted"}) == [])
+# Молчание, причина которого не названа, неотличимо от поломки. Пропуск
+# считается и попадает в часовую сводку.
+check("пропуск из-за оборванного обхода СЧИТАЕТСЯ, а не теряется",
+      gs._segment_truncated >= 2, gs._segment_truncated)
+_src_tr = open("gift_sniper.py", encoding="utf-8").read()
+check("счётчик пропусков печатается в сводке",
+      "коллекций без сравнения с конкурентами" in _src_tr)
+gs._segment_truncated = 0
+
+# ПЕРЦЕНТИЛЬ ПО СЕГМЕНТУ ВЫДАВАЛ ТОЧКУ В ПУСТОТЕ. Живой прогон 23.09.2026,
+# Candy Canes #105655: у модели Toxicane 19 выставленных лотов, самый дешёвый
+# 4.47 (наш), следующий 11. P5 при N=19 садится на индекс 0.90 — то есть на
+# 90% пути от первого ко второму — и интерполяция дала 10.35. Витрина при этом
+# писала «Toxicane 4.47 GRAM floor», и владелец справедливо спросил, почему
+# floor неправильный.
+_toxi = [Decimal("4.47")] + [Decimal(str(11 + i * Decimal("0.5"))) for i in range(18)]
+check("перцентиль при N=19 уходит в разрыв между двумя ценами",
+      Decimal("10.3") < gs._percentile(sorted(_toxi), Decimal("5")) < Decimal("10.4"),
+      gs._percentile(sorted(_toxi), Decimal("5")))
+
+_own = _si("0:own", "4.47", "Toxicane")
+_rival, _total = gs.cheapest_rival(_own, {"Toxicane": _toxi})
+check("вместо этого берём САМОГО ДЕШЁВОГО КОНКУРЕНТА — наблюдённую цену",
+      _rival == Decimal("11"), _rival)
+check("всего лотов в сегменте посчитано верно", _total == 19, _total)
+
+# СВОЙ ЛОТ ИСКЛЮЧАЕТСЯ. Сравнивать лот со статистикой, в которую он сам
+# входит, — круг: наш лот тянул «floor сегмента» вниз, а потом объявлялся
+# дешевле него на 56.8%.
+check("свой лот не участвует в оценке конкурентов",
+      gs.cheapest_rival(_si("0:own", "4.47", "Toxicane"),
+                        {"Toxicane": [Decimal("4.47")] * gs.MIN_PEER_SAMPLE})[0] is None,
+      "после вычёркивания своей цены конкурентов стало меньше MIN_PEER_SAMPLE")
+# Но вычёркивается ТОЛЬКО ОДНО вхождение: несколько лотов по одной цене —
+# это конкуренты, а не копии нашего.
+check("вычёркивается одно вхождение, а не все одинаковые",
+      gs.cheapest_rival(
+          _si("0:own", "4.47", "Toxicane"),
+          {"Toxicane": [Decimal("4.47")] * (gs.MIN_PEER_SAMPLE + 1)}
+      )[0] == Decimal("4.47"))
+
+# ТОРГОВЛЯ НЕ ЗАТРОНУТА: evaluate_trade() по-прежнему зовёт peer_floor().
+_src_cr = open("gift_sniper.py", encoding="utf-8").read()
+_ev_src = _src_cr[_src_cr.index("def evaluate_trade("):]
+_ev_src = _ev_src[:_ev_src.index("\ndef ")]
+check("evaluate_trade по-прежнему на peer_floor(), а не на конкуренте",
+      "peer_floor(item" in _ev_src and "cheapest_rival" not in _ev_src)
+
+# ПОЧЕМУ ПРИХОДИЛ ТОЛЬКО SURGE BOARDS. Две причины, обе в этом файле.
+#
+# 1) Выдержка повтора была SEEN_TTL_SEC = 300с при цикле 6.5 мин: один и тот
+#    же лот считался новым КАЖДЫЙ ЦИКЛ и слал уведомление снова, забивая
+#    часовой лимит. Теперь своя выдержка, шесть часов.
+check("выдержка повтора у наблюдения СВОЯ и длинная",
+      gs.SEGMENT_SEEN_TTL_SEC > gs.SEEN_TTL_SEC * 10,
+      (gs.SEGMENT_SEEN_TTL_SEC, gs.SEEN_TTL_SEC))
+# Смена цены обязана пробивать выдержку: подешевевший лот — это новость,
+# а не повтор.
+gs._segment_seen.clear()
+_i55 = _si("0:x1", "6.99", "Sapphire")
+gs._segment_already_seen(_i55, Decimal("9.39"))
+check("тот же лот по ДРУГОЙ цене не считается виденным",
+      gs._segment_already_seen(_si("0:x1", "5.50", "Sapphire"),
+                               Decimal("9.39")) is False)
+gs._segment_seen.clear()
+
+# 2) Коллекции обходятся по очереди, и первая выедала весь лимит. Теперь в
+#    телефон идёт не больше SEGMENT_MAX_PER_COLLECTION лучших по ROI, а в лог
+#    по-прежнему все.
+_src55b = open("gift_sniper.py", encoding="utf-8").read()
+_sc = _src55b[_src55b.index("def scan_segment_bargains("):]
+_sc = _sc[:_sc.index("\ndef ")]
+check("на коллекцию шлётся ограниченное число, а логируются все",
+      "notified < SEGMENT_MAX_PER_COLLECTION" in _sc and "found += 1" in _sc)
+
+# Сообщение ОБЯЗАНО говорить, что покупки не будет: похожее на находку
+# заставило бы ждать автоматической сделки, которой не случится.
+_src55 = open("gift_sniper.py", encoding="utf-8").read()
+_ns = _src55[_src55.index("def notify_segment_bargain("):]
+_ns = _ns[:_ns.index("\ndef ")]
+check("в сообщении сказано, что бот это НЕ купит", "НЕ КУПИТ" in _ns)
+check("названы и сегмент, и коллекция",
+      "Сверка с витриной" in _ns and "коллекция: самый дешёвый" in _ns)
+# СВЕРКА С ВИТРИНОЙ. Getgems пишет «Floor price» и показывает САМЫЙ ДЕШЁВЫЙ
+# лот, мы считаем 5-й перцентиль. Владелец увидел 8.83 у нас и 6.79 на экране
+# и решил, что бот врёт. Числа расходятся законно, и сообщение обязано это
+# называть — иначе каждая проверка глазами выглядит как пойманный баг.
+check("сверка с витриной: и её floor, и следующий конкурент",
+      "это и есть наш лот" in _ns and "его и режем" in _ns, _ns[:200])
+check("цена конкурента названа ПРОСЬБОЙ, а не сделкой",
+      "ЦЕНА ПРОСЬБЫ" in _ns, _ns[:200])
+check("сказано, где купить и где выставить",
+      "Купить" in _ns and "выставить" in _ns)
+
+# БЕЗЫМЯННАЯ ПЛОЩАДКА В СОВЕТ НЕ ГОДИТСЯ. Живой прогон 23.09.2026 выдал
+# владельцу «выставить на «(площадка неизвестна)»»: у части лотов TonAPI не
+# отдаёт sale.market.name, они попадают в общую корзину, и та оказалась с
+# самым высоким floor. Совет выставить лот там, где мы не знаем названия,
+# выполнить нельзя.
+_mf_unknown = {
+    gs._UNKNOWN_MARKET: {"floor": Decimal("99.0"), "n": 40},
+    "Getgems Sales":    {"floor": Decimal("5.0"), "n": 40},
+}
+check("безымянная корзина не выбирается площадкой продажи",
+      gs._best_sell_market({"market_floors": _mf_unknown})[0] == "Getgems Sales",
+      gs._best_sell_market({"market_floors": _mf_unknown}))
+
+# Тонкая выборка — тоже не совет: floor по четырём лотам это не floor.
+_mf_thin = {
+    "Thin Market":   {"floor": Decimal("99.0"), "n": 2},
+    "Getgems Sales": {"floor": Decimal("5.0"), "n": 40},
+}
+check("площадка с выборкой меньше MIN_MARKET_SAMPLE не выбирается",
+      gs._best_sell_market({"market_floors": _mf_thin})[0] == "Getgems Sales",
+      gs._best_sell_market({"market_floors": _mf_thin}))
+
+# Если названной площадки не нашлось — честное None, а не выдуманное имя.
+check("не из чего выбрать -> None, а не подстановка",
+      gs._best_sell_market({"market_floors": {
+          gs._UNKNOWN_MARKET: {"floor": Decimal("9.0"), "n": 40}}}) == (None, None))
+
+# И ровно один способ называть эту корзину на весь файл: раньше их было три,
+# и сравнить их между собой было нельзя.
+_src_um = open("gift_sniper.py", encoding="utf-8").read()
+check("корзина без имени названа одной константой",
+      _src_um.count('"(площадка неизвестна)"') == 1
+      and "(без имени)" not in _src_um, _src_um.count('"(площадка неизвестна)"'))
+check("номер оценён обеими мерками и обе дают ноль",
+      "по правилу видео" in _ns and "+0%" in _ns)
+
+# И покупок тут нет ни одной — ни прямо, ни через торговый путь.
+_ss = _src55[_src55.index("def scan_segment_bargains("):]
+_ss = _ss[:_ss.index("\ndef ")]
+check("наблюдение не вызывает покупку",
+      "execute_blockchain_buy" not in _ss and "record_purchase" not in _ss
+      and "process_item" not in _ss)
+
+
+# =============================================================================
+print("\n[56] Цепочка цены: пункты обязаны складываться в прибыль")
+# =============================================================================
+
+# Владелец просил разложение, «чтобы из пунктов получалась цена продажи».
+# Значит цепочка — не украшение: если она разойдётся с решением хоть на
+# нанотон, владелец выставит лот по цене, при которой одобренная сделка
+# убыточна. Ровно эта ошибка уже ловилась тестом explain_trade().
+_floor56, _buy56 = Decimal("9.39"), Decimal("6.99")
+_chain56 = gs.price_chain_lines(_buy56, _floor56, "модели")
+_txt56 = "\n".join(_chain56)
+
+_sale56 = gs.target_sale_price(_floor56)
+_net56 = gs.compute_net_profit(_floor56, _buy56)
+_q = lambda x: x.quantize(Decimal("0.01"))
+
+check("в цепочке стоит цена выставления из target_sale_price()",
+      str(_q(_sale56)) in _txt56, _txt56)
+check("последняя строка равна compute_net_profit()",
+      f"{_q(_net56):+}" in _txt56, _txt56)
+
+# Сложение вручную по тем же слагаемым: цепочка не должна расходиться с
+# формулой ни на нанотон.
+_undercut56 = _floor56 - _sale56
+_fee56 = _sale56 * gs.MARKETPLACE_FEE_PCT
+_roy56 = _sale56 * gs.ROYALTY_PCT
+_manual = (_floor56 - _undercut56) - _fee56 - _roy56 - gs.GAS_FEE_TON - _buy56
+check("слагаемые цепочки в сумме дают ровно прибыль",
+      _manual == _net56, (_manual, _net56))
+
+# ЧЕСТНЫЕ НУЛИ. PREMIUM_MULT = 1.0, значит редкость и красивый номер на цену
+# НЕ влияют. Написать «+15% за редкость» значило бы выдумать число и завысить
+# цену, по которой владелец выставит лот.
+_prem56 = "\n".join(gs.premium_lines(Decimal("1.2"), "backdrop", 777, True,
+                                     Decimal("25.6"), "похожих"))
+check("редкость показана с нулевым вкладом",
+      "редкий «backdrop»" in _prem56 and "+0%" in _prem56, _prem56)
+check("красивый номер показан с нулевым вкладом",
+      "#777" in _prem56 and _prem56.count("+0%") == 2, _prem56)
+check("скидка названа единственным источником прибыли",
+      "ЭТО И ЕСТЬ вся прибыль" in _prem56, _prem56)
+
+# ДЕШЁВЫЕ ЛОТЫ. Газ — величина в ТОНАХ, и порог безубытка растёт при падении
+# цены. «Ищи подешевле» без этой цифры звучит как бесплатный совет.
+_d5 = gs.required_discount_pct(Decimal("5.00"))
+_d1 = gs.required_discount_pct(Decimal("1.00"))
+check("чем дешевле лот, тем БОЛЬШАЯ скидка нужна для безубытка",
+      _d1 > _d5, (_d1, _d5))
+# Не «около N%» с потолка, а сама формула: порог = насколько ниже floor
+# лежит граница безубыточности. Диапазон, подобранный руками, сломался бы
+# при первой же смене комиссии и ничего бы при этом не доказывал.
+for _f in (Decimal("5.00"), Decimal("1.00")):
+    _expect = ((Decimal("1") - gs.max_profitable_buy(_f) / _f)
+               * Decimal("100")).quantize(Decimal("0.1"))
+    check(f"порог при floor {_f} сходится с границей безубыточности",
+          gs.required_discount_pct(_f) == _expect,
+          (gs.required_discount_pct(_f), _expect))
+# И величина порога ЗАМЕТНАЯ: на дешёвом лоте газ решает, а не комиссия.
+check("на floor 1 TON нужна скидка вдвое больше, чем на floor 5",
+      _d1 > _d5 * Decimal("1.5"), (_d1, _d5))
+check("нулевой floor не роняет расчёт",
+      gs.required_discount_pct(Decimal("0")) == Decimal("0"))
+
+
+# =============================================================================
+print("\n[57] Счётчики за цикл: решение о тарифе по измерению")
+# =============================================================================
+
+# Владелец спросил, сколько стоит платный тариф TonAPI. Прежде чем платить,
+# надо знать, В ЧЁМ упираемся. Пауза 1.1с это 0.91 запроса в секунду — если
+# потолок тарифа около 1 rps, мы идём впритык, и лечится это паузой, а не
+# деньгами. Увидеть можно только по доле отказов за цикл.
+_src57 = open("gift_sniper.py", encoding="utf-8").read()
+check("счётчик запросов за цикл существует", "_cycle_requests" in _src57)
+check("счётчик отказов 429 за цикл существует", "_cycle_429" in _src57)
+check("оба печатаются в строке итога цикла",
+      "отказов 429" in _src57 and "запросов" in _src57)
+check("совет про паузу даётся ДО совета платить",
+      "Прежде чем платить за тариф" in _src57)
+# Счётчики обнуляются в конце цикла: иначе они складывались бы за сутки и
+# доля отказов размывалась бы историей.
+check("счётчики обнуляются в конце цикла",
+      "_cycle_requests, _cycle_429 = 0, 0" in _src57)
+
+# Наша фактическая частота — не догадка, а частное от паузы.
+check("пауза 1.1с даёт меньше одного запроса в секунду",
+      Decimal("1") / gs.TONAPI_MIN_INTERVAL < Decimal("1"),
+      Decimal("1") / gs.TONAPI_MIN_INTERVAL)
+
+
+
+# =============================================================================
+# [58] ДОКАЗАТЕЛЬСТВО КОНЦА ОБХОДА: пустая страница ничего не доказывает
+# =============================================================================
+# Liberty Figure #80594, 23.09.2026. Бот написал «следующий Astronaut стоит
+# 10.00», на витрине стояли 6.94, 7, 7, 8, 8, 8, 8, 9 и только потом 10.
+# Ворота exhausted СТОЯЛИ и лот пропустили: прежнее правило считало концом
+# коллекции ПУСТУЮ страницу, а так же выглядит потолок смещения TonAPI
+# (в том же прогоне — 500 Server Error на offset=20000).
+print("\n[58] Конец обхода доказывается НЕПОЛНОЙ страницей, а не пустой")
+
+_ofetch58 = gs.fetch_items_tonapi
+_opages58 = gs.FLOOR_SAMPLE_PAGES
+gs.FLOOR_SAMPLE_PAGES = 40
+
+
+def _page(n, tag="x"):
+    return [{"n": f"{tag}{i}"} for i in range(n)]
+
+
+try:
+    # --- Случай 1: полные страницы, затем ПУСТАЯ -------------------------
+    # Так выглядит и конец коллекции, и потолок смещения. Различить нельзя,
+    # значит покрытие НЕ подтверждается.
+    _seen58 = []
+
+    def _f1(collection, limit, offset=0):
+        _seen58.append(offset)
+        return _page(limit) if offset < 3 * limit else []
+
+    gs.fetch_items_tonapi = _f1
+    _it, _src58, _exh = gs._collect_sample("0:test58a")
+    check("пустая страница НЕ засчитывается как полный обход", _exh is False)
+    check("собранное при этом не теряется", len(_it) == 3 * gs.FLOOR_PAGE_SIZE,
+          len(_it))
+    check("после пустой страницы обход прекращается",
+          len(_seen58) == 4, _seen58)
+
+    # --- Случай 2: НЕПОЛНАЯ страница, за ней пусто -----------------------
+    # Вот это доказательство: сервер отдал меньше, чем просили, и за
+    # остатком тоже ничего нет. Совпасть случайно не может — конец должен
+    # был бы прийтись ровно на границу страницы.
+    _part = max(1, gs.FLOOR_PAGE_SIZE // 4)
+
+    def _f2(collection, limit, offset=0):
+        if offset == 0:
+            return _page(limit)
+        if offset == limit:
+            return _page(_part)
+        return []
+
+    gs.fetch_items_tonapi = _f2
+    _it, _src58, _exh = gs._collect_sample("0:test58b")
+    check("неполная страница + пусто за ней = полный обход", _exh is True)
+    check("предметы с неполной страницы собраны",
+          len(_it) == gs.FLOOR_PAGE_SIZE + _part, len(_it))
+
+    # --- Случай 3: неполная страница ОКАЗАЛАСЬ ОБРЕЗКОЙ ------------------
+    # Под нагрузкой сервер может отдать укороченный ответ. Проверочный
+    # запрос за ним возвращает предметы — значит это не конец, и покрытие
+    # подтверждать нельзя.
+    def _f3(collection, limit, offset=0):
+        if offset == 0:
+            return _page(_part)        # выглядит концом
+        if offset == _part:
+            return _page(limit)        # а за ним ещё есть
+        return []
+
+    gs.fetch_items_tonapi = _f3
+    _it, _src58, _exh = gs._collect_sample("0:test58c")
+    check("обрезанный ответ НЕ объявляется концом коллекции", _exh is False,
+          f"exhausted={_exh}")
+    check("предметы из-за обрезки не потеряны",
+          len(_it) == _part + gs.FLOOR_PAGE_SIZE, len(_it))
+finally:
+    gs.fetch_items_tonapi = _ofetch58
+    gs.FLOOR_SAMPLE_PAGES = _opages58
+
+# Ворота наблюдения опираются именно на этот флаг — проверяем связку целиком,
+# иначе тест доказывал бы только арифметику страниц.
+check("без доказанного обхода наблюдение по сегменту молчит",
+      gs.find_segment_bargains(dict(_snap55, exhausted=False)) == [])
+
+
+# =============================================================================
+# [59] ЧТО ПОКАЗЫВАТЬ В ТЕЛЕФОНЕ: порог ROI, потолок правдоподобия, конкуренты
+# =============================================================================
+# Timeless Books #72993, 23.09.2026. Бот увидел 5 лотов «Big Brother», взял
+# следующего за 32.80 и написал ROI 248.65%. На витрине под тем же фильтром:
+# 5.66, 5.66, 8, [наш 8.9], 9, 10, 12, 12, 13... — три лота ДЕШЕВЛЕ нашего,
+# и настоящая сделка была УБЫТОЧНОЙ.
+print("\n[59] Пороги показа: ROI от 10% и потолок правдоподобия")
+
+check("порог показа выше торгового порога ROI",
+      gs.SEGMENT_MIN_ROI_PCT > gs.MIN_ROI_PCT,
+      (gs.SEGMENT_MIN_ROI_PCT, gs.MIN_ROI_PCT))
+# Порога по ЧИСЛУ конкурентов нет намеренно: 23.09.2026 два живых случая
+# одного вечера дали сегменты 5 (вывод неверен) и 6 лотов (вывод верен).
+# Любой порог между ними выдуман, а порог выше убивает верную находку —
+# у модели Celestial на витрине всего 11 выставленных.
+check("порога по числу конкурентов НЕТ — его не с чем откалибровать",
+      not hasattr(gs, "MIN_SEGMENT_RIVALS"))
+check("причина записана рядом с кодом",
+      "Surge Boards  #20176" in open("gift_sniper.py", encoding="utf-8").read())
+
+
+def _lot59(addr, price, model="M"):
+    return {"address": addr, "collection_address": _snap55["on_sale"][0]["collection_address"],
+            "sale_price_ton": Decimal(price), "traits": {"model": model},
+            "is_on_sale": True, "mint_index": 500,
+            "sale_market": "Getgems Sales", "name": f"Lot {addr}"}
+
+
+# Сегмент из 20 конкурентов, наш лот заметно дешевле -> проходит.
+_rivals59 = [Decimal("9.00")] * 20
+_own59 = _lot59("0:cheap", "5.00")
+_base59 = dict(_snap55, on_sale=[_own59],
+               peer_prices={"M": sorted(_rivals59 + [Decimal("5.00")])})
+_got59 = gs.find_segment_bargains(_base59)
+check("нормальный лот с ROI выше порога проходит", len(_got59) == 1, _got59)
+
+# Тонкий сегмент показывается — и это осознанно: отличить верный вывод от
+# неверного по размеру сегмента нельзя (5 против 6 лотов в живых случаях).
+# Полноту витрины стерегут ворота `exhausted`, а не число здесь.
+_thin59 = dict(_base59, peer_prices={"M": [Decimal("5.00")] + [Decimal("9.00")] * 5})
+check("тонкий сегмент при ПОЛНОМ обходе проходит",
+      len(gs.find_segment_bargains(_thin59)) == 1)
+check("он же при НЕПОЛНОМ обходе молчит",
+      gs.find_segment_bargains(dict(_thin59, exhausted=False)) == [])
+
+# ROI между торговым порогом (5%) и порогом показа (10%) — в телефон не идёт.
+_small59 = dict(_base59, on_sale=[_lot59("0:small", "8.50")],
+                peer_prices={"M": sorted(_rivals59 + [Decimal("8.50")])})
+_roi_small = gs.compute_roi_pct(
+    gs.compute_net_profit(Decimal("9.00"), Decimal("8.50")), Decimal("8.50"))
+check("проверяемый лот действительно ниже порога показа",
+      _roi_small < gs.SEGMENT_MIN_ROI_PCT, _roi_small)
+check("мелкий ROI в телефон не идёт", gs.find_segment_bargains(_small59) == [])
+
+# ROI выше потолка правдоподобия — тоже не идёт, и это СЧИТАЕТСЯ.
+gs._segment_implausible = 0
+_huge59 = dict(_base59, on_sale=[_lot59("0:huge", "8.90")],
+               peer_prices={"M": sorted([Decimal("32.80")] * 20 + [Decimal("8.90")])})
+_roi_huge = gs.compute_roi_pct(
+    gs.compute_net_profit(Decimal("32.80"), Decimal("8.90")), Decimal("8.90"))
+check("проверяемый лот действительно выше потолка",
+      _roi_huge > gs.SEGMENT_MAX_ROI_PCT, _roi_huge)
+check("невероятный ROI в телефон не идёт", gs.find_segment_bargains(_huge59) == [])
+# Молчание обязано быть объяснимым: подавленное попадает в сводку.
+check("подавленное потолком посчитано", gs._segment_implausible == 1,
+      gs._segment_implausible)
+gs._segment_implausible = 0
+
+_src59 = open("gift_sniper.py", encoding="utf-8").read()
+check("счётчик подавленных печатается в сводке",
+      "потолку правдоподобия" in _src59)
+
+# ГЛАВНОЕ: пороги показа не трогают торговлю. Решение владельца «показывать,
+# но не покупать» в силе, и обратное тоже — торговый порог остаётся своим.
+check("торговый порог ROI не изменился", source_default("MIN_ROI_PCT") == "5",
+      source_default("MIN_ROI_PCT"))
+
+
+# =============================================================================
+# [60] ПРЕМИЯ ЗА НОМЕР: «+0%» должно стать ИЗМЕРИМЫМ, а не вечным
+# =============================================================================
+# Вопрос владельца 23.09.2026: «номер #5020: по правилу видео 40/40 -> +0%,
+# почему 0 если 40 из 40». Ноль стоит потому, что PREMIUM_MULT = 1.0 и премия
+# за номер НИКОГДА не измерялась — а измерить её было нечем: запись хранила
+# цены по трейтам, но не по номерам.
+print("\n[60] Цены по оценке номера пишутся в запись")
+
+check("#5020 по правилу видео даёт максимум", gs.flip_number_score(5020) == 40,
+      gs.flip_number_score(5020))
+check("по нашему правилу он обычный", gs.is_pretty_mint(5020) is False)
+# Вот он, источник нуля — и он ОДИН, а не два разных механизма.
+check("премия по умолчанию выключена", gs.PREMIUM_MULT == Decimal("1.0"),
+      gs.PREMIUM_MULT)
+
+
+def _ni(addr, price, mint):
+    return {"address": addr, "sale_price_ton": Decimal(price), "mint_index": mint}
+
+
+_np = gs.build_number_prices([_ni("0:a", "5", 5020), _ni("0:b", "7", 97518),
+                              _ni("0:c", "9", 77), _ni("0:d", "6", 97516)])
+# Ключ несёт ОБЕ мерки сразу: хранить два разбиения значит записать весь
+# список цен дважды, а запись рынка невосстановима и растёт каждый цикл.
+check("ключ несёт балл видео и наше правило", "40:0" in _np, sorted(_np))
+check("красивый по-нашему помечен единицей",
+      any(k.endswith(":1") for k in _np), sorted(_np))
+check("лоты с одинаковым ключом складываются вместе",
+      len(_np.get("0:0", [])) == 2, _np.get("0:0"))
+# Лот без номера не превращается в «номер 0»: это разные вещи, и нулевой
+# балл — утверждение, которого мы не делали.
+check("лот без номера в разбиение не попадает",
+      gs.build_number_prices([{"address": "0:x", "sale_price_ton": Decimal("5"),
+                               "mint_index": None}]) == {})
+
+_src60 = open("gift_sniper.py", encoding="utf-8").read()
+check("поле попадает в запись рынка", '"number_prices"' in _src60)
+check("отчёт существует", hasattr(gs, "number_premium_report"))
+# Старая запись поля не содержит. Пустой отчёт прочитался бы как «премии
+# нет» и закрыл бы вопрос неверно — тот же довод, что у trait_prices.
+check("старая запись названа прямо, а не выдаёт пустоту",
+      "собрана до 23.09.2026" in _src60)
+# Цены продавцов и цены сделок — разные вещи, и это обязано стоять В ОТЧЁТЕ,
+# а не в документации: по нему будут ставить PREMIUM_MULT.
+check("оговорка про цены продавцов стоит в самом отчёте",
+      "ЦЕНЫ ПРОДАВЦОВ, А НЕ ЦЕНЫ СДЕЛОК" in _src60)
+
+
+# =============================================================================
+# [61] РУЧНАЯ ПОКУПКА ПОПАДАЕТ В УЧЁТ (--bought)
+# =============================================================================
+# 23.09.2026: владелец купил лот из уведомления «ДЕШЕВЛЕ СВОИХ». У таких
+# уведомлений кнопок «Купил / Продал» НЕТ — они только у находок, — и позиция
+# не попадала в БД вообще. Без неё не работает ни PnL, ни риск-лимиты, ни
+# измерение того, чем такие лоты кончаются, а ради него наблюдение и заводилось.
+print("\n[61] Лот, купленный руками, заносится в учёт")
+
+_ob61 = gs.DB_PATH
+gs.DB_PATH = os.path.join(_tmpdir, "manual_buy.db")
+try:
+    gs.db_init()
+    _addr61 = "EQDmZLZ5vxQF1-smvcJoHSDhMI6NTRjz31OWIFUw94denDcK"
+    _pos = gs.record_manual_purchase(_addr61, "5.42", "6.94")
+    check("позиция открыта", isinstance(_pos, int) and _pos > 0, _pos)
+    check("она видна как открытая", gs.open_positions_count() == 1,
+          gs.open_positions_count())
+
+    # То же правило, что у кнопки «Купил» и execute_blockchain_buy(): в учёте
+    # не должно появиться позиции, которой нет. Ошибиться командой легко.
+    check("повтор того же адреса вторую позицию НЕ открывает",
+          gs.record_manual_purchase(_addr61, "5.42") is None)
+    check("после отказа позиция по-прежнему одна",
+          gs.open_positions_count() == 1, gs.open_positions_count())
+
+    # Адрес нормализуется: EQ-форма с витрины и raw из API — один лот.
+    check("EQ и raw считаются одним лотом",
+          gs.record_manual_purchase(gs.normalize_ton_address(_addr61), "5.42") is None)
+
+    # Мусор на входе не должен молча открывать позицию по нулевой цене.
+    check("нечисловая цена отклоняется",
+          gs.record_manual_purchase("EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "дёшево") is None)
+    check("неразобранный адрес отклоняется",
+          gs.record_manual_purchase("не-адрес", "5.42") is None)
+    check("нулевая цена отклоняется",
+          gs.record_manual_purchase("EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "0") is None)
+    check("после всех отказов позиция по-прежнему одна",
+          gs.open_positions_count() == 1, gs.open_positions_count())
+
+    # Закрытие идёт той же функцией, что и у находок: второй бухгалтерии нет.
+    _pnl = gs.close_position(_pos, Decimal("6.73"))
+    check("позиция закрывается штатно", _pnl is not None)
+    check("после закрытия открытых нет", gs.open_positions_count() == 0)
+finally:
+    gs.DB_PATH = _ob61
+
+
+# =============================================================================
+# [62] ОБХОД, СТАВШИЙ КОРОЧЕ, — ЭТО ОБРЕЗКА; АРБИТРАЖ БЕЗ БЕЗЫМЯННОЙ ПЛОЩАДКИ
+# =============================================================================
+# Живой лог 23.09.2026, 22:03. Два наблюдения в одном экране:
+#   1) «АРБИТРАЖ ... продать на «(площадка неизвестна)» 8.2000 (лотов 5)» —
+#      совет, который невозможно выполнить. `_best_sell_market()` чинили
+#      23.09, но корзина попадает в ДВА места, а поправили одно.
+#   2) exhausted=True при 12 лотах Leonardo, хотя на витрине их около 38.
+#      Отказов 429 при этом НОЛЬ, то есть обход рвётся не лимитом.
+print("\n[62] Короткий обход = обрезка; безымянная площадка вне арбитража")
+
+_mf62 = {
+    "Getgems Sales": {"n": 766, "floor": Decimal("4.99")},
+    gs._UNKNOWN_MARKET: {"n": 5, "floor": Decimal("8.20")},
+}
+_arb62 = gs.market_arbitrage({"market_floors": _mf62})
+# Двух НАЗВАННЫХ площадок нет, значит сравнивать не с чем — и выдумывать
+# направление нельзя.
+check("безымянная площадка не даёт пары для арбитража", _arb62 is None, _arb62)
+
+# Разрыв берём заведомо прибыльный: на узком газ 0.15 съедает всё, и тест
+# доказывал бы не то (пары нет из-за экономики, а не из-за безымянной).
+_mf62b = dict(_mf62, **{"Marketapp Marketplace": {"n": 45, "floor": Decimal("6.95")}})
+_arb62b = gs.market_arbitrage({"market_floors": _mf62b})
+check("пара из двух названных площадок считается", _arb62b is not None)
+if _arb62b:
+    check("безымянная не стала «где продать»",
+          _arb62b["sell_market"] != gs._UNKNOWN_MARKET, _arb62b["sell_market"])
+    check("безымянная не стала «где купить»",
+          _arb62b["buy_market"] != gs._UNKNOWN_MARKET, _arb62b["buy_market"])
+
+# --- обход, который вдруг стал короче --------------------------------
+_ofetch62 = gs.fetch_items_tonapi
+_opages62 = gs.FLOOR_SAMPLE_PAGES
+_obest62 = dict(gs._walk_best)
+gs.FLOOR_SAMPLE_PAGES = 40
+gs._walk_best.clear()
+try:
+    _part62 = max(1, gs.FLOOR_PAGE_SIZE // 4)
+    _full62 = {"n": 3}
+
+    def _long(collection, limit, offset=0):
+        if offset < 3 * limit:
+            return [{"i": offset}] * limit
+        return [{"i": offset}] * _part62 if offset == 3 * limit else []
+
+    gs.fetch_items_tonapi = _long
+    _it, _s, _exh = gs._collect_sample("0:test62")
+    check("длинный обход с неполной страницей засчитан", _exh is True)
+    _long_len = len(_it)
+
+    # Тот же адрес, но ответ обрезан вчетверо. Коллекция столько предметов
+    # между циклами не теряет — значит обрезали ответ, и «конец» не доказан.
+    def _short(collection, limit, offset=0):
+        return [{"i": offset}] * _part62 if offset == 0 else []
+
+    gs.fetch_items_tonapi = _short
+    _it2, _s2, _exh2 = gs._collect_sample("0:test62")
+    check("внезапно короткий обход НЕ считается полным", _exh2 is False,
+          f"собрано {len(_it2)} против {_long_len}")
+    check("собранное при этом не выбрасывается", len(_it2) == _part62, len(_it2))
+
+    # А для НОВОЙ коллекции сравнивать не с чем — первый обход принимается
+    # как есть, иначе наблюдение не заработало бы никогда.
+    gs.fetch_items_tonapi = _short
+    _it3, _s3, _exh3 = gs._collect_sample("0:test62_new")
+    check("первый обход новой коллекции принимается", _exh3 is True)
+finally:
+    gs.fetch_items_tonapi = _ofetch62
+    gs.FLOOR_SAMPLE_PAGES = _opages62
+    gs._walk_best.clear()
+    gs._walk_best.update(_obest62)
+
+_src62 = open("gift_sniper.py", encoding="utf-8").read()
+check("в лог печатается, ЧЕМ кончился обход", "конец:" in _src62)
+
+
+# =============================================================================
+# [63] ИСТОЧНИК see.tg: токен не течёт, суточная квота отличается от частотной
+# =============================================================================
+# Чужой API принимается только после схождения с нашим измерением — поэтому
+# первым написан не источник floor, а режим сверки. Здесь проверяется ровно
+# то, на чём проект уже обжигался: утечка секрета в лог и путаница между
+# «слишком часто» (секунды) и «кончилась суточная квота» (часы).
+print("\n[63] see.tg: токен, суточная квота, порядок принятия источника")
+
+_src63 = open("gift_sniper.py", encoding="utf-8").read()
+
+# Токен уходит ЗАГОЛОВКОМ. В URL он попал бы в трейсбеки и логи - ровно та
+# причина, по которой у Telegram мы логируем только description.
+check("токен передаётся заголовком Authorization",
+      'f"Bearer {SEETG_TOKEN}"' in _src63)
+check("токен не подставляется в строку запроса",
+      "token=" not in _src63.split("def seetg_get")[1].split("def ")[0])
+
+
+class _Resp63:
+    def __init__(self, code, payload=None, headers=None):
+        self.status_code = code
+        self._payload = payload or {}
+        self.headers = headers or {}
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _Req63:
+    def __init__(self, resp):
+        self.resp = resp
+        self.seen = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.seen.append((url, params or {}, headers or {}))
+        return self.resp
+
+
+_oreq63, _otok63, _oint63 = gs.requests, gs.SEETG_TOKEN, gs.SEETG_MIN_INTERVAL
+gs.SEETG_TOKEN = "12:SeCrEtToKeN"
+gs.SEETG_MIN_INTERVAL = Decimal("0")
+try:
+    _ok = _Req63(_Resp63(200, {"ok": True, "result": {"id": 12}}))
+    gs.requests = _ok
+    check("разобран успешный ответ", gs.seetg_get("/ping") == {"id": 12})
+    _url, _params, _headers = _ok.seen[0]
+    check("секрет ушёл в заголовок", gs.SEETG_TOKEN in str(_headers))
+    check("секрета НЕТ в url и параметрах",
+          gs.SEETG_TOKEN not in _url and gs.SEETG_TOKEN not in str(_params),
+          (_url, _params))
+
+    # Два разных 429. Путать их нельзя: суточную ждут часами, обычную секунды.
+    gs.requests = _Req63(_Resp63(429, {"ok": False, "window": "day"}))
+    try:
+        gs.seetg_get("/floors")
+        check("суточная квота распознана", False)
+    except gs.RateLimited as e:
+        check("суточная квота распознана по телу", "уточная" in str(e), str(e))
+
+    gs.requests = _Req63(_Resp63(429, {"ok": False}, {"Retry-After": "7"}))
+    try:
+        gs.seetg_get("/floors")
+        check("обычный лимит распознан", False)
+    except gs.RateLimited as e:
+        check("обычный лимит назван отдельно и со сроком",
+              "уточная" not in str(e) and "7" in str(e), str(e))
+
+    # ok:false это ОТКАЗ, а не пустой результат: молча вернуть None значило бы
+    # выдать «данных нет» там, где API сказал «ошибка».
+    gs.requests = _Req63(_Resp63(200, {"ok": False, "description": "Gift not found"}))
+    try:
+        gs.seetg_get("/resolve")
+        check("ok:false не проходит молча", False)
+    except RuntimeError as e:
+        check("ok:false поднимает ошибку с описанием", "not found" in str(e))
+
+    # Без токена — понятная ошибка с тем, где его взять, а не NameError.
+    gs.SEETG_TOKEN = ""
+    try:
+        gs.seetg_get("/ping")
+        check("без токена запрос не уходит", False)
+    except RuntimeError as e:
+        check("без токена сказано, где его взять", "see.tg" in str(e))
+finally:
+    gs.requests, gs.SEETG_TOKEN, gs.SEETG_MIN_INTERVAL = _oreq63, _otok63, _oint63
+
+# --- 404 и формы адреса -------------------------------------------------
+# Первый живой прогон 06.10.2026 получил "404 Client Error" и больше ничего.
+# По такой строке нельзя отличить «у них нет этого объекта» от «мы спросили
+# не тем параметром» — а лечатся эти случаи по-разному. Тело ответа обязано
+# попадать в сообщение.
+
+
+class _Resp63b(_Resp63):
+    text = ""
+
+
+_RAW63 = "0:" + "ab" * 32
+
+_oreq63b, _otok63b, _oint63b = gs.requests, gs.SEETG_TOKEN, gs.SEETG_MIN_INTERVAL
+gs.SEETG_TOKEN = "12:SeCrEtToKeN"
+gs.SEETG_MIN_INTERVAL = Decimal("0")
+try:
+    gs.requests = _Req63(_Resp63b(404, {"ok": False, "description": "gift not found"}))
+    try:
+        gs.seetg_get("/resolve", {"q": "EQ..."})
+        check("404 не проходит молча", False)
+    except RuntimeError as e:
+        check("404 несёт описание от сервера, а не голый код",
+              "not found" in str(e) and "404" in str(e), str(e))
+
+    # Адрес у каждого слоя пишется по-своему: EQ (bounceable), UQ и raw.
+    # Спросить одной формой и объявить «у них этого нет» — это вывод о целом
+    # по наблюдению за частью, тот самый класс ошибки проекта.
+    class _ReqForms63:
+        def __init__(self, accept):
+            self.accept = accept
+            self.asked = []
+
+        def get(self, url, params=None, headers=None, timeout=None):
+            q = (params or {}).get("q", "")
+            self.asked.append(q)
+            if self.accept(q):
+                return _Resp63b(200, {"ok": True, "result": {
+                    "type": "gift", "gift": {"slug": "SpringBaskets", "num": 7}}})
+            return _Resp63b(404, {"ok": False, "description": "not found"})
+
+    _items63 = [{"address": _RAW63, "sale_price_ton": Decimal("5")}]
+
+    _r = _ReqForms63(lambda q: q.startswith("0:"))
+    gs.requests = _r
+    _card, _by, _tries = gs.seetg_resolve_gift(_items63)
+    check("перебор форм доходит до raw",
+          _card is not None and (_card.get("gift") or {}).get("slug") == "SpringBaskets",
+          _card)
+    check("спрошены все три формы, raw последней",
+          len(_r.asked) == 3 and _r.asked[0].startswith("EQ")
+          and _r.asked[1].startswith("UQ") and _r.asked[2] == _RAW63, _r.asked)
+    check("неудачные формы названы поимённо", len(_tries) == 2, _tries)
+    check("сказано, какой формой нашли", "raw" in (_by or ""), _by)
+
+    # Если подходит первая форма, лишних запросов НЕ делается: правила see.tg
+    # запрещают лишний трафик, и перебор не должен стать обходом.
+    _r2 = _ReqForms63(lambda q: True)
+    gs.requests = _r2
+    _card2, _by2, _tries2 = gs.seetg_resolve_gift(_items63)
+    check("на первой подошедшей форме перебор прекращается",
+          len(_r2.asked) == 1 and not _tries2, _r2.asked)
+
+    # Ни одна форма не подошла — честный None, а не выдуманный слаг.
+    _r3 = _ReqForms63(lambda q: False)
+    gs.requests = _r3
+    _card3, _by3, _tries3 = gs.seetg_resolve_gift(_items63, tries=1)
+    check("при полном отказе слаг не выдумывается", _card3 is None and _by3 is None)
+    check("отказ по каждой форме записан", len(_tries3) == 3, _tries3)
+finally:
+    gs.requests, gs.SEETG_TOKEN, gs.SEETG_MIN_INTERVAL = _oreq63b, _otok63b, _oint63b
+
+# Круговая проверка: адрес берётся ИЗ ИХ ЖЕ ответа. Если он не распознаётся,
+# значит resolve не принимает адреса предметов — это измерение, а не чтение
+# документации.
+check("адрес находится в их карточке на любой глубине",
+      gs._seetg_find_address({"gift": {"owner": {"address": _RAW63}}}) == _RAW63)
+check("не-адрес за адрес не выдаётся",
+      gs._seetg_find_address({"gift": {"slug": "PlushPepe"}}) is None)
+check("контрольный образец взят из их документации",
+      "t.me/nft/PlushPepe-1" in _src63)
+check("контрольная проверка идёт ДО сравнения floor",
+      _src63.index("seetg_probe_resolve()")
+      < _src63.index("for coll in TARGET_COLLECTIONS[:limit_collections]"))
+
+# --- запасной путь к слагу: имя сужает, адреса доказывают ---------------
+# Совпадение названий — ДОГАДКА, и решать по ней запрещено правилом проекта.
+# Поэтому слаг принимается только после сверки адресов: пересеклись с нашей
+# выборкой — это та же коллекция (факт о блокчейне), нет — отказ.
+_OUR63 = {"0:" + "cd" * 32, "0:" + "ef" * 32}
+
+
+def _census_stub(gift_addrs):
+    def _get(path, params=None):
+        if path == "/floors" and (params or {}).get("by") == "collection":
+            return {"items": [{"slug": "SpringBaskets", "title": "Spring Baskets"},
+                              {"slug": "PlushPepe", "title": "Plush Pepe"}]}
+        if path == "/gifts":
+            return {"items": [{"address": a} for a in gift_addrs]}
+        return {}
+    return _get
+
+
+_oget63 = gs.seetg_get
+try:
+    gs._seetg_board_cache = None
+    gs.seetg_get = _census_stub(["0:" + "cd" * 32])
+    _slug, _why = gs.seetg_slug_by_census("Spring Baskets", _OUR63)
+    check("слаг принят, когда адреса пересеклись с нашей выборкой",
+          _slug == "SpringBaskets", (_slug, _why))
+    check("в пояснении сказано, что подтверждено адресами", "адрес" in _why, _why)
+
+    # Имя совпало, адреса — нет. Это и есть случай, ради которого проверка:
+    # принять такой слаг значило бы сравнить свой floor с ЧУЖОЙ коллекцией.
+    gs._seetg_board_cache = None
+    gs.seetg_get = _census_stub(["0:" + "11" * 32, "0:" + "22" * 32])
+    _slug2, _why2 = gs.seetg_slug_by_census("Spring Baskets", _OUR63)
+    check("совпадения имени МАЛО: без пересечения адресов слаг отвергнут",
+          _slug2 is None, (_slug2, _why2))
+    check("отказ назван причиной, а не молчанием", "подтвержд" in _why2, _why2)
+
+    # Имени нет в борде — честный отказ, а не ближайшее похожее.
+    gs._seetg_board_cache = None
+    gs.seetg_get = _census_stub(["0:" + "cd" * 32])
+    _slug3, _why3 = gs.seetg_slug_by_census("Nesuschestvuyushchaya", _OUR63)
+    check("неизвестное имя не подменяется похожим", _slug3 is None, (_slug3, _why3))
+finally:
+    gs.seetg_get = _oget63
+    gs._seetg_board_cache = None
+
+# СЫРАЯ БОРДА 06.10.2026 показала: у see.tg слаги в ЕДИНСТВЕННОМ числе
+# (TimelessBook, PoolFloat, CandyCane), у TonAPI имена во МНОЖЕСТВЕННОМ.
+# Точное сравнение не опознало ни одной коллекции из 121.
+check("множественное число нашего имени ловит их единственное",
+      gs._name_match("Surge Boards", "SurgeBoard") is not None
+      and gs._name_match("Timeless Books", "TimelessBook") is not None
+      and gs._name_match("Candy Canes", "CandyCane") is not None)
+check("точное совпадение ближе приставочного",
+      gs._name_match("PoolFloat", "PoolFloat") == 0
+      and gs._name_match("Pool Floats", "PoolFloat") > 0)
+# Допуск не должен превращаться в «похоже — значит оно»: решает всё равно
+# пересечение адресов, но лишние кандидаты стоят запросов к see.tg.
+check("разные коллекции не склеиваются",
+      gs._name_match("Pool Floats", "PoolParty") is None
+      and gs._name_match("Pool Floats", "SnakeBox") is None)
+check("короткие строки в допуск не идут",
+      gs._name_match("Bow", "BowTie") is None)
+
+# В карточке лота есть И адрес предмета, И кошелёк владельца. Берём ВСЕ:
+# первая попавшаяся могла бы оказаться кошельком, и верный кандидат получил
+# бы «не подтверждено».
+_a1, _a2 = "0:" + "ab" * 32, "0:" + "cd" * 32
+check("из ответа берутся все адреса, а не первый",
+      gs._seetg_all_addresses({"owner": {"address": _a1},
+                               "nft": {"address": _a2}}) == {_a1, _a2})
+
+# ТОЧНОЕ доказательство слага: наш номер минта -> их карточка -> их адрес.
+# Пересечение случайных выборок не годится: наша выборка это ВЫСТАВЛЕННЫЕ
+# лоты (12% коллекции), их 20 подарков берутся из всей — ноль пересечений
+# при верном слаге, что и случилось 06.10.2026 на всех трёх коллекциях.
+_PROVE_ADDR = "0:" + "7f" * 32
+_prove_items = [{"address": _PROVE_ADDR, "mint_index": 20176,
+                 "sale_price_ton": Decimal("7.86")}]
+_oget63c = gs.seetg_get
+try:
+    _asked = []
+
+    def _gift_ok(path, params=None):
+        _asked.append(path)
+        return {"giftAddress": gs.friendly_ton_address(_PROVE_ADDR)}
+
+    gs.seetg_get = _gift_ok
+    _ok63, _why63 = gs.seetg_prove_slug("SurgeBoard", _prove_items)
+    check("совпадение giftAddress доказывает слаг", _ok63, _why63)
+    check("спрошена карточка по НАШЕМУ номеру минта",
+          _asked == ["/gift/SurgeBoard-20176"], _asked)
+
+    # Чужая коллекция с тем же номером — адрес другой, слаг не принимается.
+    gs.seetg_get = lambda path, params=None: {"giftAddress": "0:" + "11" * 32}
+    _bad63, _whybad = gs.seetg_prove_slug("PoolFloat", _prove_items)
+    check("несовпадение адреса слаг отвергает", not _bad63, _whybad)
+    check("в причине названы оба адреса", "!=" in _whybad, _whybad)
+finally:
+    gs.seetg_get = _oget63c
+
+# Числовые строки — это giftId, а не слаг: прогон тратил на них запросы.
+check("числовой id в кандидаты слага не идёт",
+      "5936013938331222567" not in gs._slug_candidates(
+          {"slug": "PlushPepe", "giftId": "5936013938331222567"}))
+# Цена лежит в saleInfo, и прогон обрезался ровно на нём.
+check("вложенные узлы ответа печатаются отдельно от обрезанного сырья",
+      '"saleInfo"' in _src63)
+
+check("имя и слаг сводятся к одному ключу",
+      gs._slug_key("Spring Baskets") == gs._slug_key("SpringBaskets")
+      == gs._slug_key("spring-baskets"))
+
+# --- поиск через see.tg -------------------------------------------------
+# ГЛАВНОЕ: цена берётся ТОЛЬКО из saleInfo. Рядом лежит estimate.ton — ИХ
+# ОЦЕНКА (5279 при floor 5497), и схватить её вместо цены значит посчитать
+# прибыль от суммы, которую никто не просит.
+# ФОРМА СНЯТА С ЖИВОГО ОТВЕТА: saleInfo это СПИСОК предложений по маркетам,
+# amount в нанотонах. Первая версия ждала словарь и возвращала None на каждом
+# лоте — поиск отказывался работать на всех 12 коллекциях.
+_gift63 = {"saleInfo": [{"amount": "6381750000", "currency": "gram",
+                         "market": "tonnel", "link": "https://t.me/x"}],
+           "estimate": {"ton": 5279.05, "low": 3959.29},
+           "resellAmountTon": "0"}
+check("цена берётся из saleInfo-списка в нанотонах",
+      gs._seetg_price_ton(_gift63) == Decimal("6.381750000"),
+      gs._seetg_price_ton(_gift63))
+check("маркет и ссылка берутся оттуда же",
+      gs._seetg_best_offer(_gift63)["market"] == "tonnel"
+      and gs._seetg_best_offer(_gift63)["link"] == "https://t.me/x")
+# Звёзды и USDT — не TON. Пересчитать их нечем: курса у нас нет, и выдумать
+# его значит придумать прибыль.
+check("цена в звёздах за TON НЕ выдаётся",
+      gs._seetg_price_ton({"saleInfo": [{"amount": "10000", "currency": "xtr"}]})
+      is None)
+check("из нескольких предложений берётся самое дешёвое",
+      gs._seetg_price_ton({"saleInfo": [
+          {"amount": "9000000000", "currency": "gram"},
+          {"amount": "6000000000", "currency": "gram"}]}) == Decimal("6"))
+# «Pretty Posies» против их «PrettyPosy»: y -> ies меняет основу, приставки
+# мало. Прогон 06.10.2026 на этой коллекции промахнулся.
+check("множественное с заменой основы тоже ловится",
+      gs._name_match("Pretty Posies", "PrettyPosy") is not None)
+check("оценка за цену НЕ выдаётся",
+      gs._seetg_price_ton({"estimate": {"ton": 5279.05}}) is None)
+check("пустой saleInfo даёт None, а не ноль",
+      gs._seetg_price_ton({"saleInfo": None}) is None)
+# Обход TonAPI нужен ТОЛЬКО чтобы доказать слаг. Прогон потратил на него
+# восемь минут при том, что ответ берётся у see.tg.
+check("при доказанном слаге обход TonAPI пропускается",
+      "if not meta_get(key):" in _src63)
+
+# Разбор цены ПРОВЕРЯЕТСЯ сходимостью: первый лот из sort=price обязан
+# совпасть с floorTon коллекции — это одно утверждение, посчитанное двумя
+# их же методами. Не сошлось — читаем не то поле, считать нельзя.
+_ok63f, _why63f = gs.seetg_price_trusted([_gift63], Decimal("6.38"))
+check("совпадение с floor подтверждает разбор цены", _ok63f, _why63f)
+_bad63f, _whybad63f = gs.seetg_price_trusted([_gift63], Decimal("3.00"))
+check("цена ВЫШЕ floor разбор отвергает: sort=price обязан дать дешёвый первым",
+      not _bad63f, _whybad63f)
+# Борда by=model пересобирается раз в несколько минут, а sort=price живой:
+# лот ЗАКОННО бывает дешевле борда-floor. Прогон 06.10.2026 терял коллекцию
+# на расхождении 1.6% при пороге 1%.
+_stale, _whystale = gs.seetg_price_trusted([_gift63], Decimal("6.50"))
+check("лот дешевле борда-floor — это отставание борды, а не поломка",
+      _stale and "борда отстаёт" in _whystale, _whystale)
+# Но запас вниз ОГРАНИЧЕН: заниженная цена покупки ЗАВЫШАЕТ прибыль.
+_deep, _whydeep = gs.seetg_price_trusted([_gift63], Decimal("20"))
+check("цена втрое ниже floor отвергается, а не принимается как «свежий лот»",
+      not _deep, _whydeep)
+check("в причине названы оба числа",
+      "6.38" in _whybad63f and "3.00" in _whybad63f, _whybad63f)
+_none63f, _whynone = gs.seetg_price_trusted([{"saleInfo": {}}], Decimal("5"))
+check("неразобранная цена печатает сырьё, а не молчит",
+      not _none63f and "saleInfo" in _whynone, _whynone)
+
+# Суточный бюджет see.tg: у бесплатного тарифа потолок 1000, счётчик живёт
+# в БД — перезапущенный в обед бот иначе считал бы квоту нетронутой.
+check("бюджет по умолчанию ниже их потолка в 1000",
+      int(source_default("SEETG_DAILY_BUDGET")) < 1000,
+      source_default("SEETG_DAILY_BUDGET"))
+check("расход see.tg сохраняется в БД", "seetg_spent:" in _src63)
+check("исчерпанный бюджет поднимает RateLimited, а не шлёт запрос",
+      "Суточный бюджет see.tg исчерпан" in _src63)
+
+# Поиск не должен превратиться в выкачивание базы: запросов на коллекцию
+# ровно 2 + SEETG_PROBE_TOP, курсора нет.
+check("в поиске нет постраничного обхода курсором",
+      "cursor" not in _src63.split("def seetg_scan_collection")[1]
+      .split("\ndef ")[0])
+check("прибыль в поиске считает compute_net_profit",
+      "compute_net_profit" in _src63.split("def seetg_scan_collection")[1]
+      .split("\ndef ")[0])
+
+# Вердикт сверки печатался БЕЗУСЛОВНО и соврал при 3:0.
+check("вердикт сверки зависит от чисел",
+      "if disagree == 0 and agree > 0:" in _src63)
+
+# --- сверка конкурента по ВСЕМ маркетам перед отправкой ------------------
+# Конкурент в «дешевле своих» считается по TonAPI, а он видит только Getgems
+# и Marketapp: MRKT/Portals/Tonnel там нет ВООБЩЕ. Значит «следующий стоит
+# 30» — утверждение о двух площадках из пяти, и сверка 06.10.2026 показала
+# направление ошибки: чужие маркеты дешевле на всех трёх коллекциях.
+check("сверка конкурента вызывается ДО отправки сообщения",
+      _src63.index("seetg_rival_check(") < _src63.index("БОТ ЭТО НЕ КУПИТ"))
+check("при их floor НИЖЕ нашего прибыль ПЕРЕСЧИТЫВАЕТСЯ, а не остаётся",
+      'b["profit"] = compute_net_profit(seetg["floor"], b["buy"])' in _src63)
+# Поправка идёт ТОЛЬКО вниз: поднять оценку по чужому API значило бы
+# увеличить расчётную прибыль без данных о комиссиях того маркета.
+check("их floor ВЫШЕ нашего оценку не поднимает",
+      'if seetg and seetg["floor"] < b["seg_floor"]:' in _src63)
+check("лот не дешевле конкурента по всем маркетам — уведомление отменяется",
+      'if seetg["floor"] <= b["buy"]:' in _src63)
+check("отменённое уведомление не тратит часовой лимит",
+      "_segment_sent_ts.pop()" in _src63)
+check("вторая ссылка берётся ОТ них, а не собирается нами",
+      'seetg[\'link\']' in _src63 or 'seetg["link"]' in _src63)
+check("рядом с чужими маркетами стоит оговорка про комиссии",
+      "комиссии там не" in _src63)
+# Квота: борда по моделям кешируется, иначе каждое уведомление стоило бы
+# запроса, а их до 12 в час.
+check("борда моделей кешируется по времени",
+      "_SEETG_MODEL_TTL" in _src63)
+
+# Форма ответов see.tg измеряется тремя запросами по ИХ ЖЕ примеру — наш слаг
+# для этого не нужен. Имена полей, угаданные по памяти, уже один раз выдали
+# «коллекции нет» вместо «не знаю имя поля».
+check("форма ответов снимается с их документированного примера",
+      "/gift/PlushPepe-1" in _src63)
+check("сырьё печатается, а не только разбор",
+      "сырьё" in _src63 and "ключи" in _src63)
+check("замеряются ровно те методы, на которых будет стоять поиск",
+      '"by": "model"' in _src63 and '"sort": "price"' in _src63)
+
+# Нанотоны -> TON ТОЙ ЖЕ функцией, что и у TonAPI. Второй конвертер рядом с
+# первым молча перекрыл его и вернул None там, где парсер ждал Decimal —
+# поймано секцией [20] в первом же прогоне. Поэтому конвертер один.
+check("цена из наименьшей единицы", gs._nano_to_ton("3500000000") == Decimal("3.5"))
+check("конвертер нанотонов в файле ОДИН",
+      _src63.count("def _nano_to_ton") == 1, _src63.count("def _nano_to_ton"))
+
+# Правила API запрещают массовый парсинг: их данные — ответ на живой вопрос
+# решения, а не материал для нашего архива. Запись рынка остаётся на TonAPI.
+check("правило «не выкачивайте базу» записано рядом с клиентом",
+      "Не выкачивайте базу" in _src63)
+check("разделение источников названо явно",
+      "ЗАПИСЬ РЫНКА" in _src63 and "ЖИВОЙ ОТВЕТ" in _src63)
+# Запись снапшотов не должна начать ходить в see.tg: это и есть «копия базы».
+check("record_snapshot не трогает see.tg",
+      "seetg" not in _src63.split("def record_snapshot")[1].split("\ndef ")[0])
+
+# ГЛАВНОЕ: источник ещё НЕ подключён к оценке. Решение владельца «показывать,
+# но не покупать» и правило «чужой API — утверждение» требуют сначала сверки.
+check("evaluate_trade про see.tg не знает",
+      "seetg" not in _src63.split("def evaluate_trade")[1].split("\ndef ")[0])
+check("источник floor пока TonAPI", "seetg" not in
+      _src63.split("def get_market_snapshot")[1].split("\ndef ")[0])
+
+# Комиссия 2% применяется ко ВСЕМ площадкам - прямое решение владельца
+# 06.10.2026. Проверяем, что формула одна и площадку не различает.
+check("в формуле прибыли одна ставка комиссии на все площадки",
+      "sale * (Decimal(\"1\") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)" in _src63)
+check("ставка по умолчанию 2%", source_default("MARKETPLACE_FEE_PCT") == "0.02")
+
+# =============================================================================
+# [64] ЧУЖИЕ ЦЕНЫ ТОЛЬКО ПО see.tg: АРБИТРАЖ МАРКЕТОВ И РИТМ ПО КВОТЕ
+# =============================================================================
+# Прямая команда владельца 07.10.2026: «самое главное смотреть только по see
+# tg», «надо чтобы за сутки хватало лимита», «хотелось бы покупать и с
+# маркета». Основание не вкусовое: сверка по всем маркетам в первом же
+# прогоне отменила ВСЕ 11 находок сегментного поиска по TonAPI — у Love Shard
+# наш конкурент 30.00 против 8.80 у portals, у Privateer 33.33 против 6.29 у
+# tonnel. Источник, который ошибается в каждом случае, не дополняет, а мешает.
+print("\n[64] Чужие цены только по see.tg: арбитраж маркетов и ритм по квоте")
+
+_src64 = open("gift_sniper.py", encoding="utf-8").read()
+
+check("по умолчанию смотрим ТОЛЬКО see.tg",
+      source_default("SEETG_ONLY") == "1", source_default("SEETG_ONLY"))
+# Старый путь НЕ УДАЛЁН: когда квота see.tg исчерпана, других данных нет
+# вовсе, и выбор источника обязан оставаться у оператора.
+check("путь по TonAPI сохранён и включается SEETG_ONLY=0",
+      "def scan_segment_bargains(" in _src64
+      and "return scan_segment_bargains(snap)" in _src64)
+
+# --- ПАРА МАРКЕТОВ ПО ОДНОЙ МОДЕЛИ --------------------------------------
+# Борда `/v1/floors?by=model` даёт floor КАЖДОЙ модели на КАЖДОМ маркете и
+# число листингов — один запрос на коллекцию, и это ИЗМЕРЕНИЕ, а не догадка.
+_row64 = {"key": "Love Shard", "floorTon": 8.8, "floorMarket": "portals",
+          "markets": [
+              {"market": "portals", "floorTon": 8.8, "listings": 40},
+              {"market": "telegram", "floorTon": 12.4, "listings": 900}]}
+_pair64 = gs._seetg_market_pair(_row64)
+_pair64["model"] = "Love Shard"        # модель подставляет seetg_cross_market
+check("купить — там, где дешевле всего",
+      _pair64["buy_market"] == "portals" and _pair64["buy_floor"] == Decimal("8.8"),
+      _pair64)
+check("продавать — ПРОТИВ БЛИЖАЙШЕГО конкурента, а не дорогого маркета",
+      _pair64["sell_market"] == "telegram" and _pair64["sell_floor"] == Decimal("12.4"),
+      _pair64)
+
+# ЖИВОЙ СЛУЧАЙ, РАДИ КОТОРОГО ПРАВИЛО И ПОМЕНЯЛОСЬ (07.10.2026, Candy Canes
+# «New Layer», уведомление у владельца на экране). Бот предлагал купить на
+# mrkt 3.50 и продать на getgems 7.08 = +3.29 TON. Но рядом стоит portals
+# 3.66, и покупателю незачем платить вдвое: честное число −0.17 TON.
+_cc64 = {"key": "New Layer", "markets": [
+    {"market": "mrkt", "floorTon": 3.50, "listings": 36},
+    {"market": "portals", "floorTon": 3.66, "listings": 59},
+    {"market": "tonnel", "floorTon": 5.43, "listings": 25},
+    {"market": "telegram", "floorTon": 6.24, "listings": 267},
+    {"market": "getgems", "floorTon": 7.30, "listings": 16}]}
+_ccp64 = gs._seetg_market_pair(_cc64)
+check("конкурент — portals 3.66, а не getgems 7.30",
+      _ccp64["sell_market"] == "portals", _ccp64["sell_market"])
+check("на том лоте связки НЕТ: честная прибыль отрицательная",
+      _ccp64["profit"] < 0, _ccp64["profit"])
+check("дорогой маркет остаётся, но только как ПОТОЛОК",
+      _ccp64["top_market"] == "getgems" and _ccp64["top_profit"] > 0,
+      _ccp64.get("top_market"))
+check("потолок не подменяет решение: решает осторожное число",
+      _ccp64["profit"] < _ccp64["top_profit"])
+# Прибыль считает ТА ЖЕ функция, что принимает торговое решение. Вторая
+# формула прибыли разошлась бы с первой в первый же день.
+check("прибыль считает compute_net_profit, а не своя формула",
+      _pair64["profit"] == gs.compute_net_profit(Decimal("12.4"), Decimal("8.8")),
+      _pair64["profit"])
+check("ROI считает compute_roi_pct",
+      _pair64["roi"] == gs.compute_roi_pct(_pair64["profit"], Decimal("8.8")))
+
+# СТОРОНЫ НЕСИММЕТРИЧНЫ. Покупаем КОНКРЕТНЫЙ лот — одного листинга хватает.
+# Продаём ПРОТИВ ВИТРИНЫ, и высокий floor при двух лотах — это цена желания
+# одного продавца. Без этого порога «арбитраж» находился бы всегда на самом
+# тонком маркете; отчёт --markets чинили ровно так.
+_thin = dict(_row64, markets=_row64["markets"] + [
+    {"market": "mrkt", "floorTon": 99.0, "listings": 2}])
+check("тонкий маркет не становится ПОТОЛКОМ: floor по двум лотам не рынок",
+      gs._seetg_market_pair(_thin).get("top_market") == "telegram",
+      gs._seetg_market_pair(_thin).get("top_market"))
+# А вот КОНКУРЕНТОМ один дешёвый лот становится: он уводит покупателя, и
+# отбрасывать его значило бы завышать нашу цену продажи.
+_cheap_rival = dict(_row64, markets=_row64["markets"] + [
+    {"market": "mrkt", "floorTon": 9.0, "listings": 1}])
+check("один дешёвый лот рядом — это конкурент, порога листингов тут нет",
+      gs._seetg_market_pair(_cheap_rival)["sell_market"] == "mrkt",
+      gs._seetg_market_pair(_cheap_rival)["sell_market"])
+_cheap1 = dict(_row64, markets=_row64["markets"] + [
+    {"market": "mrkt", "floorTon": 4.0, "listings": 1}])
+check("один листинг годится как сторона ПОКУПКИ: это наблюдённая цена лота",
+      gs._seetg_market_pair(_cheap1)["buy_market"] == "mrkt")
+
+# Безымянный маркет исключается с ОБЕИХ сторон: ни купить, ни выставить там
+# нельзя — адреса мы не знаем. Урок из _best_sell_market(): исправление в
+# одной точке не закрывает класс ошибки, если у значения несколько
+# потребителей, и арбитраж по площадкам этой же ошибкой уже болел.
+_anon = dict(_row64, markets=_row64["markets"] + [
+    {"market": "", "floorTon": 1.0, "listings": 50},
+    {"market": gs._UNKNOWN_MARKET, "floorTon": 50.0, "listings": 50}])
+_panon = gs._seetg_market_pair(_anon)
+check("безымянный маркет не сторона покупки", _panon["buy_market"] == "portals")
+check("безымянный маркет не сторона продажи", _panon["sell_market"] == "telegram")
+check("безымянный маркет не становится и потолком",
+      _panon.get("top_market") in (None, "telegram"), _panon.get("top_market"))
+
+check("одного маркета для арбитража не хватает",
+      gs._seetg_market_pair({"markets": [
+          {"market": "getgems", "floorTon": 5.0, "listings": 40}]}) is None)
+check("продавать дешевле, чем покупать, — не арбитраж",
+      gs._seetg_market_pair({"markets": [
+          {"market": "getgems", "floorTon": 9.0, "listings": 40},
+          {"market": "mrkt", "floorTon": 10.0, "listings": 40}]})["sell_market"]
+      == "mrkt")
+check("мусор в floorTon не роняет разбор",
+      gs._seetg_market_pair({"markets": [
+          {"market": "getgems", "floorTon": None, "listings": 40},
+          {"market": "mrkt", "floorTon": "нет", "listings": 40}]}) is None)
+
+# --- ОДИН ЗАПРОС НА КОЛЛЕКЦИЮ, БЕЗ ПОСТРАНИЧНОГО ОБХОДА -------------------
+# Их правила прямо запрещают выкачивать базу, и блокируется АККАУНТ целиком,
+# а не токен. Поэтому курсора здесь нет и быть не должно.
+_arb_src = _src64.split("def seetg_cross_market")[1].split("\ndef ")[0]
+check("в арбитраже нет постраничного обхода курсором", "cursor" not in _arb_src)
+_scan_src = _src64.split("def scan_seetg_arbitrage")[1].split("\ndef ")[0]
+check("наблюдение по see.tg не пишет в запись рынка",
+      "record_snapshot" not in _scan_src)
+
+_calls64 = []
+_oget64 = gs.seetg_get
+gs._seetg_model_floors.clear()
+try:
+    def _fake_get(path, params=None):
+        _calls64.append((path, params or {}))
+        if path == "/floors":
+            return {"items": [_row64,
+                              {"key": "Dust", "floorTon": 1.0, "markets": [
+                                  {"market": "getgems", "floorTon": 1.0,
+                                   "listings": 40},
+                                  {"market": "mrkt", "floorTon": 1.01,
+                                   "listings": 40}]}]}
+        raise AssertionError(f"лишний запрос: {path}")
+
+    gs.seetg_get = _fake_get
+    _pairs64 = gs.seetg_cross_market("LoveSlug")
+    check("на коллекцию уходит РОВНО один запрос", len(_calls64) == 1, _calls64)
+    check("пара с нулевой прибылью в список не идёт",
+          [p["model"] for p in _pairs64] == ["Love Shard"],
+          [p["model"] for p in _pairs64])
+    # Борда кешируется: иначе каждое уведомление стоило бы запроса, а их до
+    # 12 в час при квоте 900 в сутки.
+    gs.seetg_cross_market("LoveSlug")
+    check("повторный вызов берёт борду из кеша", len(_calls64) == 1, _calls64)
+finally:
+    gs.seetg_get = _oget64
+    gs._seetg_model_floors.clear()
+
+# --- РИТМ ЗАДАЁТ КВОТА, А НЕ ЦИКЛ НАБЛЮДЕНИЯ ------------------------------
+# Прямой ответ на «надо чтобы за сутки хватало лимита»: интервал СЧИТАЕТСЯ из
+# остатка бюджета и времени до полуночи UTC — ровно как budget_paced_interval()
+# для TonAPI. Цифра, подобранная руками под 12 коллекций, станет неверной на
+# тринадцатой.
+_oload64, _ocost64 = gs.seetg_budget_load, gs._seetg_cost_seen
+_ocolls64 = gs.TARGET_COLLECTIONS
+try:
+    gs.TARGET_COLLECTIONS = ["0:" + "aa" * 32] * 12
+    gs._seetg_cost_seen = 0
+    gs.seetg_budget_load = lambda: 0
+    _secs64 = gs._next_utc_midnight() - time.time()
+    _gap64 = gs.seetg_scan_gap_sec()
+    _rounds64 = _secs64 / _gap64
+    check("прогонов за остаток суток не больше, чем позволяет квота",
+          _rounds64 * 12 * gs._seetg_cost_per_collection()
+          <= gs.SEETG_DAILY_BUDGET + 1,
+          (_rounds64, _gap64 / 60))
+    gs.seetg_budget_load = lambda: gs.SEETG_DAILY_BUDGET - 24
+    check("чем меньше остаток, тем реже прогон",
+          gs.seetg_scan_gap_sec() > _gap64, (gs.seetg_scan_gap_sec(), _gap64))
+    # Исчерпанная квота — не «ходим редко», а НЕ ХОДИМ: жечь исчерпанный
+    # лимит незачем, и за это блокируют аккаунт.
+    gs.seetg_budget_load = lambda: gs.SEETG_DAILY_BUDGET
+    check("при исчерпанной квоте прогонов до полуночи нет",
+          gs.seetg_scan_gap_sec() >= _secs64 - 5, gs.seetg_scan_gap_sec())
+    # Расход ИЗМЕРЯЕТСЯ и берётся МАКСИМУМОМ из виденного — тот же принцип,
+    # что у budget_learn_limit(): занижённая оценка сожжёт квоту к обеду.
+    gs._seetg_cost_seen = 7
+    check("расход на коллекцию берётся максимумом из виденного",
+          gs._seetg_cost_per_collection() == 7)
+    gs._seetg_cost_seen = 0
+    check("до первого замера работает догадка, а не ноль",
+          gs._seetg_cost_per_collection() >= 1)
+finally:
+    gs.seetg_budget_load, gs._seetg_cost_seen = _oload64, _ocost64
+    gs.TARGET_COLLECTIONS = _ocolls64
+
+# --- ЛОТ ПО НАЗВАННОЙ ЦЕНЕ ОБЯЗАН СУЩЕСТВОВАТЬ ----------------------------
+# Борда by=model пересобирается у них раз в минуты, то есть её floor — это
+# утверждение о недавнем прошлом. Отправить цену, по которой лота уже нет,
+# значит послать владельца за сделкой, которой не существует.
+_gift64 = {"num": 14570, "giftAddress": "EQD4cq", "saleInfo": [
+    {"amount": "8800000000", "currency": "gram", "market": "portals",
+     "link": "https://t.me/portals/x"},
+    {"amount": "9000000000", "currency": "gram", "market": "tonnel",
+     "link": "https://t.me/tonnel/x"}]}
+check("предложение берётся НА ЗАПРОШЕННОМ маркете, а не самое дешёвое",
+      gs._seetg_offer_on(_gift64, "tonnel")["price"] == Decimal("9"))
+check("маркета нет в saleInfo — None, а не подмена другим",
+      gs._seetg_offer_on(_gift64, "mrkt") is None)
+check("звёзды не считаются TON и здесь",
+      gs._seetg_offer_on({"saleInfo": [
+          {"amount": "10000", "currency": "xtr", "market": "mrkt"}]},
+          "mrkt") is None)
+
+# Лот на маркете ПРОДАЖИ — вторая ссылка, по прямой просьбе владельца:
+# «где продать кидай ссылку сайта, где будет такая же модель и коллекция».
+_sellgift64 = {"num": 777, "giftAddress": "EQSell", "saleInfo": [
+    {"amount": "12400000000", "currency": "gram", "market": "telegram",
+     "link": "https://t.me/nft/x"}]}
+
+_oget64b = gs.seetg_get
+try:
+    # Маркет решает НЕ параметр запроса, а ответ: их API может его
+    # игнорировать, и тогда «лот с нужного маркета» определяется только по
+    # saleInfo. Поэтому в выдаче намеренно лежат лоты разных маркетов.
+    gs.seetg_get = lambda path, params=None: {"items": [_gift64, _sellgift64]}
+    _buy64, _whybuy64 = gs.seetg_cheapest_on("S", "Love Shard", "portals")
+    check("берётся лот ИМЕННО с запрошенного маркета, а не первый в выдаче",
+          _buy64 and _buy64["price"] == Decimal("8.8")
+          and _buy64["link"] == "https://t.me/portals/x", _whybuy64)
+    _sell64, _whysell64 = gs.seetg_cheapest_on("S", "Love Shard", "telegram")
+    check("для маркета ПРОДАЖИ находится свой лот и своя ссылка",
+          _sell64 and _sell64["link"] == "https://t.me/nft/x", _whysell64)
+    check("в причине названо, сколько лотов этого маркета в выборке",
+          "из 2" in _whysell64, _whysell64)
+    _no_m64, _whynom64 = gs.seetg_cheapest_on("S", "Love Shard", "mrkt")
+    check("маркета в выдаче нет — None и сырьё, а не подмена другим маркетом",
+          _no_m64 is None and "saleInfo" in _whynom64, _whynom64)
+
+    # Сторона ПОКУПКИ: выше борды — отказ, ниже — считаем по борде.
+    _conf64, _why64 = gs.seetg_confirm_pair("S", "Love Shard", _pair64)
+    check("пара подтверждена живыми лотами с обеих сторон",
+          _conf64 and _conf64["buy"]["link"] and _conf64["sell"]["link"],
+          _why64)
+    check("прибыль не изменилась: живой конкурент совпал с бордой",
+          _conf64["profit"] == _pair64["profit"], _conf64["profit"])
+    _no64, _whyno64 = gs.seetg_confirm_pair(
+        "S", "Love Shard", dict(_pair64, buy_floor=Decimal("7.0")))
+    check("лот дороже борды — отказ, а не отправка выдуманной цены",
+          _no64 is None and "купить нечего" in _whyno64, _whyno64)
+    _low64, _whylow64 = gs.seetg_confirm_pair(
+        "S", "Love Shard", dict(_pair64, buy_floor=Decimal("9.5")))
+    check("лот дешевле борды — считаем по борде, но говорим вслух",
+          _low64 and "дешевле борды" in _low64["note"], _low64["note"])
+
+    # СТОРОНА ПРОДАЖИ — ровно наоборот, и это закрывает единственное место,
+    # где ошибка шла в ОПАСНУЮ сторону. Борда обещала 20, живой конкурент
+    # стоит 12.4 — значит продавать придётся против него.
+    _down64, _ = gs.seetg_confirm_pair(
+        "S", "Love Shard", dict(_pair64, sell_floor=Decimal("20")))
+    check("живой конкурент дешевле борды — прибыль пересчитана ВНИЗ",
+          _down64["sell_floor"] == Decimal("12.4")
+          and _down64["profit"] == gs.compute_net_profit(Decimal("12.4"),
+                                                         Decimal("8.8")),
+          (_down64["sell_floor"], _down64["profit"]))
+    # А ВЫШЕ борды оценка не поднимается никогда: это увеличило бы расчётную
+    # прибыль по чужому API, у которого мы даже комиссий маркетов не знаем.
+    _up64, _ = gs.seetg_confirm_pair(
+        "S", "Love Shard", dict(_pair64, sell_floor=Decimal("10")))
+    check("живой конкурент дороже борды — оценка НЕ растёт",
+          _up64["sell_floor"] == Decimal("10")
+          and _up64["profit"] == gs.compute_net_profit(Decimal("10"),
+                                                       Decimal("8.8")),
+          _up64["sell_floor"])
+
+    gs.seetg_get = lambda path, params=None: {"items": []}
+    _none64, _whynone64 = gs.seetg_confirm_pair("S", "M", _pair64)
+    check("лотов не отдали — не подтверждено, а не «подтверждено пустотой»",
+          _none64 is None, _whynone64)
+finally:
+    gs.seetg_get = _oget64b
+
+# --- ВЫДЕРЖКА ПОВТОРА: СВОЙ ЖУРНАЛ, И ЦЕНА В КЛЮЧЕ ------------------------
+gs._seetg_arb_seen.clear()
+check("пара видна впервые", gs._seetg_arb_already_seen("S", _pair64) is False)
+check("та же пара повторно не шлётся",
+      gs._seetg_arb_already_seen("S", _pair64) is True)
+check("подешевевшая пара — новость, а не повтор",
+      gs._seetg_arb_already_seen("S", dict(_pair64, buy_floor=Decimal("7.0")))
+      is False)
+# Журнал СВОЙ: общий с сегментным наблюдением означал бы, что одно тихо
+# помечает лот виденным для другого.
+check("журнал арбитража отдельный от сегментного",
+      "_seetg_arb_seen" in _src64 and "_segment_seen" in _src64
+      and "_seetg_arb_seen = _segment_seen" not in _src64)
+gs._seetg_arb_seen.clear()
+
+# --- БЕЗ ТОКЕНА НЕ ПОДМЕНЯЕМ ИСТОЧНИК МОЛЧА -------------------------------
+# Тихий откат на путь по TonAPI — это и есть «горит зелёным, пока ошибка
+# растёт»: владелец получал бы те же выдуманные числа, думая, что смотрит
+# все маркеты.
+_oseg64 = gs.scan_segment_bargains
+_oarb64 = gs.scan_seetg_arbitrage
+_otok64 = gs.SEETG_TOKEN
+try:
+    _hits = []
+    gs.scan_segment_bargains = lambda snap: _hits.append("tonapi")
+    gs.scan_seetg_arbitrage = lambda snap: _hits.append("seetg")
+    gs.SEETG_TOKEN = ""
+    gs._seetg_only_warned = False
+    gs._scan_bargains({"collection": "0:x"})
+    check("SEETG_ONLY без токена НЕ откатывается на TonAPI молча", _hits == [],
+          _hits)
+    gs.SEETG_TOKEN = "12:tok"
+    gs._scan_bargains({"collection": "0:x"})
+    check("с токеном смотрим see.tg", _hits == ["seetg"], _hits)
+    gs.SEETG_ONLY = False
+    gs._scan_bargains({"collection": "0:x"})
+    check("SEETG_ONLY=0 возвращает старый путь", _hits[-1] == "tonapi", _hits)
+finally:
+    gs.scan_segment_bargains, gs.scan_seetg_arbitrage = _oseg64, _oarb64
+    gs.SEETG_TOKEN, gs.SEETG_ONLY = _otok64, True
+
+# --- СООБЩЕНИЕ: ТРИ ЧИСЛА, ССЫЛКА ОТ НИХ, ОГОВОРКИ ------------------------
+_sent64 = []
+_otg64, _otok64b = gs._tg_call, gs.SEETG_TOKEN
+_ochat64, _obot64 = gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN
+_oget64c = gs.seetg_get
+try:
+    gs._tg_call = lambda method, payload: (_sent64.append(payload) or {"ok": True})
+    gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN = "1", "t"
+    gs.SEETG_TOKEN = "12:tok"
+    gs.seetg_get = lambda path, params=None: {"items": [_gift64, _sellgift64]}
+    gs._seetg_arb_sent_ts.clear()
+    check("уведомление отправлено",
+          gs.notify_seetg_arb("Surge Boards", "SurgeBoard", _pair64) is True)
+    _txt64 = _sent64[-1]["text"]
+    check("названы ОБА маркета: где купить и где выставить",
+          "portals" in _txt64 and "telegram" in _txt64, _txt64)
+    check("три числа на месте: купить, продать, чистыми",
+          "8.80" in _txt64 and "+" in _txt64
+          and str(_pair64["roi"]) in _txt64, _txt64)
+    check("цепочка цены печатается целиком",
+          "Откуда берётся цена продажи" in _txt64)
+    check("рядом стоит, сколько лотов на маркете",
+          "лотов" in _txt64 and "900" in _txt64, _txt64)
+    # БОТ ЭТОГО НЕ КУПИТ: вне Getgems у него нет ни протокола, ни адреса
+    # контракта продажи. Сообщение, похожее на находку, заставило бы владельца
+    # ждать автоматической сделки.
+    check("сказано прямо, что бот это не купит", "НЕ КУПИТ" in _txt64)
+    check("оговорка про комиссии вне Getgems стоит рядом с числом",
+          "Getgems" in _txt64 and "роялти" in _txt64, _txt64)
+    check("сказано, что внутри модели лоты разные",
+          "состав" in _txt64 or "фон и узор" in _txt64, _txt64)
+    # ДВЕ ССЫЛКИ, прямая просьба владельца: откуда купить и где продавать.
+    # Обе приходят ОТ see.tg: формы URL с фильтром «коллекция + модель» у
+    # маркетов мы не знаем, а выдуманная ссылка в этом проекте уже один раз
+    # открывалась пустой страницей.
+    check("ссылка КУПИТЬ взята ОТ них", "t.me/portals/x" in _txt64, _txt64)
+    check("ссылка на КОНКУРЕНТА — того, под кого вставать ценой",
+          "КОНКУРЕНТ" in _txt64 and "t.me/nft/x" in _txt64, _txt64)
+    # Главная оговорка: всё это ЦЕНЫ ПРОСЬБЫ. Владелец сверил сообщение с
+    # историей продаж Getgems (средняя 4-5 GRAM) и справедливо усомнился.
+    check("сказано, что цены лестницы — просьбы, а не сделки",
+          "ЦЕНЫ ЛЕСТНИЦЫ" in _txt64 and "ПРОСЬБЫ" in _txt64, _txt64)
+    # Сделки ПО ЭТОМУ ПРЕДМЕТУ теперь есть (07.10.2026), и блок про них
+    # обязателен: это единственное место, где видно, сколько платят.
+    check("блок «за сколько реально уходил» в сообщении есть",
+          "РЕАЛЬНО уходил" in _txt64 or "Продаж этого предмета" in _txt64,
+          _txt64)
+    check("лестница цен напечатана: видно, кто стоит рядом",
+          "Лестница цен" in _txt64, _txt64)
+    check("у ссылки продажи названа цена конкурента",
+          "12.40" in _txt64, _txt64)
+
+    # Живой конкурент дешевле борды -> пара пересчитана вниз, и если после
+    # этого она не проходит порог показа, в телефон НЕ идёт: иначе уйдёт
+    # число, которое мы сами уже не считаем.
+    gs._seetg_arb_sent_ts.clear()
+    # Борда обещала 20, живой конкурент на telegram стоит 12.4.
+    _thin64 = dict(_pair64, sell_market="telegram",
+                   sell_floor=Decimal("20"), buy_floor=Decimal("12.0"),
+                   profit=gs.compute_net_profit(Decimal("20"), Decimal("12.0")),
+                   roi=Decimal("50"))
+    check("после сверки с живым конкурентом слабая пара не уходит",
+          gs.notify_seetg_arb("X", "S", _thin64) is False)
+    check("и она не тратит часовой лимит", gs._seetg_arb_sent_ts == [],
+          gs._seetg_arb_sent_ts)
+
+    # Часовой потолок: телефон, который звонит двадцать раз, выключают.
+    gs._seetg_arb_sent_ts[:] = [time.time()] * gs.SEETG_ARB_NOTIFY_MAX_PER_HOUR
+    gs._seetg_arb_suppressed = 0
+    check("сверх часового лимита не шлём",
+          gs.notify_seetg_arb("X", "S", _pair64) is False)
+    check("подавленное считается, а не теряется",
+          gs._seetg_arb_suppressed == 1, gs._seetg_arb_suppressed)
+    gs._seetg_arb_sent_ts.clear()
+
+    # НЕПОДТВЕРЖДЁННЫЙ ЛОТ: в телефон не идёт, лимит часа не тратит, и
+    # попадает в сводку — подавленное молча неотличимо от несуществующего.
+    gs.seetg_get = lambda path, params=None: {"items": []}
+    gs._seetg_arb_unconfirmed = 0
+    check("без живого лота уведомление не уходит",
+          gs.notify_seetg_arb("X", "S", _pair64) is False)
+    check("отказ не тратит часовой лимит", gs._seetg_arb_sent_ts == [],
+          gs._seetg_arb_sent_ts)
+    check("неподтверждённое считается для сводки",
+          gs._seetg_arb_unconfirmed == 1, gs._seetg_arb_unconfirmed)
+finally:
+    gs._tg_call, gs.SEETG_TOKEN = _otg64, _otok64b
+    gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN = _ochat64, _obot64
+    gs.seetg_get = _oget64c
+    gs._seetg_arb_sent_ts.clear()
+    gs._seetg_arb_suppressed = gs._seetg_arb_unconfirmed = 0
+
+# --- ПОРОГИ ПОКАЗА И ПОТОЛОК ПРАВДОПОДОБИЯ --------------------------------
+# Те же пороги, что у сегментного наблюдения: ROI от 10% (вопрос не экономики
+# сделки, а того, что стоит читать с телефона) и потолок 100% — все
+# разобранные случаи такого размера оказывались ошибкой ДАННЫХ.
+_oslug64, _oboard64, _onotify64 = (gs.seetg_slug_for, gs.seetg_model_board,
+                                   gs.notify_seetg_arb)
+_otok64c, _oload64b = gs.SEETG_TOKEN, gs.seetg_budget_load
+try:
+    gs.SEETG_TOKEN = "12:tok"
+    gs.seetg_budget_load = lambda: 0
+    gs.seetg_slug_for = lambda *a, **k: ("SurgeBoard", "из БД")
+    _notified64 = []
+    gs.notify_seetg_arb = lambda name, slug, pair: (
+        _notified64.append(pair["model"]) or True)
+
+    _huge = {"key": "Wild", "markets": [
+        {"market": "mrkt", "floorTon": 1.0, "listings": 40},
+        {"market": "telegram", "floorTon": 50.0, "listings": 900}]}
+    # Прибыль ПОЛОЖИТЕЛЬНАЯ, но ROI меньше порога показа: проверяем именно
+    # порог, а не то, что убыточная пара отсеялась раньше.
+    _small = {"key": "Tiny", "markets": [
+        {"market": "mrkt", "floorTon": 10.0, "listings": 40},
+        {"market": "telegram", "floorTon": 11.8, "listings": 900}]}
+    _small_pair = gs._seetg_market_pair(_small)
+    check("пара ниже порога показа всё же считается положительной",
+          _small_pair["profit"] > 0
+          and _small_pair["roi"] < gs.SEGMENT_MIN_ROI_PCT,
+          (_small_pair["profit"], _small_pair["roi"]))
+    gs.seetg_model_board = lambda slug: {"Wild": _huge, "Tiny": _small}
+    gs._seetg_arb_seen.clear()
+    gs._seetg_scan_at.clear()
+    gs._seetg_arb_implausible = 0
+    _scanned64 = gs.scan_seetg_arbitrage(
+        {"collection": "0:" + "aa" * 32, "on_sale": []})
+    check("ROI выше потолка правдоподобия в телефон не идёт",
+          "Wild" not in _notified64, _notified64)
+    check("отсеянное потолком считается для сводки",
+          gs._seetg_arb_implausible == 1, gs._seetg_arb_implausible)
+    check("ROI ниже порога показа тоже не идёт",
+          "Tiny" not in _notified64, _notified64)
+    check("обе пары при этом в логе, а не выброшены",
+          _scanned64 == 2, _scanned64)
+
+    # РИТМ: повторный прогон по той же коллекции в тот же миг пропускается,
+    # и пропуск СЧИТАЕТСЯ — молчание без причины неотличимо от поломки.
+    gs._seetg_paced_skips = 0
+    gs.scan_seetg_arbitrage({"collection": "0:" + "aa" * 32, "on_sale": []})
+    check("второй прогон подряд пропущен по бюджету",
+          gs._seetg_paced_skips == 1, gs._seetg_paced_skips)
+    check("пропуск по бюджету печатается в логе",
+          "прогон пропущен по бюджету" in _src64)
+finally:
+    (gs.seetg_slug_for, gs.seetg_model_board,
+     gs.notify_seetg_arb) = _oslug64, _oboard64, _onotify64
+    gs.SEETG_TOKEN, gs.seetg_budget_load = _otok64c, _oload64b
+    gs._seetg_scan_at.clear()
+    gs._seetg_arb_seen.clear()
+    gs._seetg_arb_implausible = gs._seetg_paced_skips = 0
+
+# --- НАХОДКА ТОЖЕ СВЕРЯЕТСЯ ПО ВСЕМ МАРКЕТАМ ------------------------------
+# «Продам по floor» в уведомлении о находке — утверждение о двух площадках из
+# пяти, и сверка показала направление ошибки: чужие маркеты дешевле.
+check("находка сверяется с see.tg до отправки",
+      "seetg_rival_check(item.get(\"collection_address\", \"\"), model_name,"
+      in _src64)
+check("находка отменяется, если по всем маркетам не дороже нашей цены",
+      'if seetg["floor"] <= ev["buy_price"]:' in _src64)
+check("отменённая находка не тратит часовой лимит",
+      "_find_sent_ts.pop()" in _src64)
+check("при их floor ниже нашего в сообщении об этом сказано",
+      "TonAPI видит 2 маркета из 5" in _src64)
+
+# Стартовое сообщение обязано называть источник: подмена источника меняет ВСЕ
+# числа, которые придут в телефон, а тихий старт с не теми настройками уже
+# портил запись рынка.
+check("стартовое сообщение называет источник чужих цен",
+      "Чужие цены: see.tg" in _src64)
+check("при SEETG_ONLY=0 стартовое сообщение предупреждает",
+      "2 маркета" in _src64 or "2 маркетам" in _src64)
+
+
+# --- АРБИТРАЖ ПО TonAPI В ТЕЛЕФОН НЕ ИДЁТ -------------------------------
+# Живой лог 07.10.2026 печатал ЗЕЛЁНУЮ строку, и она же уходила в часовую
+# сводку:
+#   купить на «Getgems Sales» 5.0000 (лотов 426)
+#   -> продать на «Marketapp Marketplace» 45.8250 (лотов 7) -> ROI 768.22%
+# Floor по семи лотам против floor по четырёмстам — это разный состав лотов,
+# а не выгода. Тот же класс ошибки, из-за которого в тот же день отключили
+# сегментное наблюдение: источник видит 2 маркета из 5.
+_snap65 = {"collection": "0:" + "cd" * 32, "market_floors": {
+    "Getgems Sales": {"floor": Decimal("5.00"), "n": 426},
+    "Marketapp Marketplace": {"floor": Decimal("45.825"), "n": 7}}}
+_arb65 = gs.market_arbitrage(_snap65)
+_oonly65 = gs.SEETG_ONLY
+try:
+    gs.SEETG_ONLY = True
+    check("при SEETG_ONLY арбитраж по TonAPI в сводку НЕ попадает",
+          gs._arbitrage_lines([_snap65]) == [], gs._arbitrage_lines([_snap65]))
+    # И даже со старым источником потолок правдоподобия теперь стоит: он тут
+    # не стоял вовсе, хотя выборка здесь тоньше всего.
+    gs.SEETG_ONLY = False
+    if _arb65 is not None and _arb65["roi_pct"] > gs.SEGMENT_MAX_ROI_PCT:
+        check("ROI выше потолка правдоподобия не идёт в сводку и со старым "
+              "источником", gs._arbitrage_lines([_snap65]) == [],
+              _arb65["roi_pct"])
+    # Правдоподобная пара при SEETG_ONLY=0 по-прежнему печатается: механизм
+    # не удалён, он подчинён выбору источника.
+    _ok65 = {"collection": "0:" + "ef" * 32, "market_floors": {
+        "Getgems Sales": {"floor": Decimal("5.00"), "n": 426},
+        "Marketapp Marketplace": {"floor": Decimal("6.00"), "n": 40}}}
+    check("правдоподобная пара при SEETG_ONLY=0 остаётся в сводке",
+          any("Арбитраж площадок" in ln for ln in gs._arbitrage_lines([_ok65])),
+          gs._arbitrage_lines([_ok65]))
+finally:
+    gs.SEETG_ONLY = _oonly65
+
+_src65 = open("gift_sniper.py", encoding="utf-8").read()
+# Цвет — не оформление: зелёная строка в логе читается как сигнал.
+check("в логе арбитраж TonAPI при SEETG_ONLY не зелёный и назван по имени",
+      "арбитраж TonAPI (2 маркета из 5)" in _src65)
+
+
+# --- СВЯЗКА НА ОДНОМ МАРКЕТЕ И ЦЕНЫ ПРОСЬБЫ -----------------------------
+# «купить на mrkt и продать на нём же» — прямая просьба владельца. Отдельного
+# кода это не требует: конкурент берётся из ЛЕСТНИЦЫ цен по всем маркетам, и
+# если вторая ступень стоит на том же маркете, связка внутри маркета
+# получается сама. Это самый сравнимый случай: обе цены на одной витрине.
+_lad66 = [
+    {"price": Decimal("3.50"), "market": "mrkt", "link": "https://t.me/mrkt/1",
+     "num": 1, "giftAddress": ""},
+    {"price": Decimal("4.60"), "market": "mrkt", "link": "https://t.me/mrkt/2",
+     "num": 2, "giftAddress": ""}]
+_oget66 = gs.seetg_get
+try:
+    gs.seetg_get = lambda path, params=None: {"items": [
+        {"num": 1, "giftAddress": "EQa", "saleInfo": [
+            {"amount": "3500000000", "currency": "gram", "market": "mrkt",
+             "link": "https://t.me/mrkt/1"}]},
+        {"num": 2, "giftAddress": "EQb", "saleInfo": [
+            {"amount": "4600000000", "currency": "gram", "market": "mrkt",
+             "link": "https://t.me/mrkt/2"}]}]}
+    _same66 = {"model": "New Layer", "buy_market": "mrkt",
+               "buy_floor": Decimal("3.50"), "buy_n": 36,
+               "sell_market": "portals", "sell_floor": Decimal("6.00"),
+               "sell_n": 59, "markets": [], "profit": Decimal("0"),
+               "roi": Decimal("0")}
+    _conf66, _why66 = gs.seetg_confirm_pair("S", "New Layer", _same66)
+    check("вторая ступень лестницы — конкурент, даже на СВОЁМ маркете",
+          _conf66 and _conf66["same_market"] is True, _why66)
+    check("прибыль считается по НЕМУ, а не по чужому маркету",
+          _conf66["sell_floor"] == Decimal("4.60")
+          and _conf66["profit"] == gs.compute_net_profit(Decimal("4.60"),
+                                                         Decimal("3.50")),
+          _conf66["sell_floor"])
+    # Лестница из одинаковых цен — вставать не под кого, и это отказ, а не
+    # «продам по своей же цене».
+    gs.seetg_get = lambda path, params=None: {"items": [
+        {"num": 1, "saleInfo": [{"amount": "3500000000", "currency": "gram",
+                                 "market": "mrkt"}]},
+        {"num": 2, "saleInfo": [{"amount": "3500000000", "currency": "gram",
+                                 "market": "mrkt"}]}]}
+    _none66, _whynone66 = gs.seetg_confirm_pair("S", "New Layer", _same66)
+    check("все лоты по одной цене — связки нет, а не нулевая прибыль",
+          _none66 is None and "вставать не под кого" in _whynone66, _whynone66)
+finally:
+    gs.seetg_get = _oget66
+
+_src66 = open("gift_sniper.py", encoding="utf-8").read()
+# Порог показа связки НИЖЕ сегментного — по просьбе «хоть и на мало
+# процентов». Это законно: число теперь считается против ближайшего
+# конкурента, а не против floor дорогого маркета.
+check("порог показа связки ниже сегментного",
+      Decimal(source_default("SEETG_ARB_MIN_ROI_PCT"))
+      < Decimal(source_default("SEGMENT_MIN_ROI_PCT")),
+      source_default("SEETG_ARB_MIN_ROI_PCT"))
+# Не прошедшие связки не теряются молча: молчание без причины неотличимо от
+# поломки — тот же довод, что у «находок не было».
+check("лучшие не прошедшие связки идут в сводку",
+      "Ближе всего к связке" in _src66)
+# Источник цен СДЕЛОК не выдумывается: он измеряется одним запросом, и до
+# тех пор уведомление обязано говорить, что его числа — цены просьбы.
+check("режим проверки истории сделок существует",
+      "def seetg_sales_probe" in _src66)
+check("историю сделок НЕ качаем пачками (их правила)",
+      "ПАЧКАМИ ЭТО КАЧАТЬ НЕЛЬЗЯ" in _src66)
+
+# Первый прогон пробы пришёлся на PlushPepe-1: ответ живой
+# (`{hasMore, items}`), а записей ноль. По такому ответу нельзя отличить
+# «эндпоинт пустой» от «этот предмет не торговался», поэтому номер минта
+# больше не угадывается — хватает слага.
+check("пробе истории достаточно слага, номер она берёт сама",
+      '"-" not in ref' in _src66 and '"on_sale": "true"' in _src66)
+check("пустая история названа фактом О ПРЕДМЕТЕ, а не об эндпоинте",
+      "по ЭТОМУ предмету истории нет" in _src66)
+# Поля с ценой ищутся по ЗНАЧЕНИЮ: имена мы уже один раз угадывали (ключи
+# борды), и это стоило вывода «у see.tg нет наших коллекций».
+check("числа, похожие на цену, ищутся по значению, а не по имени поля",
+      "ЧИСЛА, ПОХОЖИЕ НА ЦЕНУ" in _src66)
+
+
+
+# --- ЦЕНЫ СДЕЛОК: ЕДИНСТВЕННОЕ МЕСТО, ГДЕ ВИДНО, СКОЛЬКО ПЛАТЯТ ----------
+# Форма снята с живого ответа 07.10.2026 (CandyCane-86892): предмет дважды
+# за час уходил по 3.40 и 3.41 на portals, пока бот предлагал продать такой
+# же за 7.08 на getgems.
+_hist67 = {"items": [
+    {"id": "sale:1", "kind": "GIFT", "time": "2026-10-07T17:25:38.069345Z",
+     "saleAction": {"market": "portals", "kind": "purchase",
+                    "amount": "3410000000", "currency": "gram",
+                    "amountTon": "3410000000", "model": "Polka Pop"}},
+    {"id": "gift:1", "kind": "GIFT", "time": "2026-10-07T17:34:24.393326Z",
+     "giftAction": {"action": "listing", "newValue": "3420000000"}},
+    {"id": "sale:2", "kind": "GIFT", "time": "2026-10-07T16:39:38.843803Z",
+     "saleAction": {"market": "portals", "kind": "purchase",
+                    "amount": "3400000000", "currency": "gram",
+                    "amountTon": "3400000000"}},
+    {"id": "sale:3", "kind": "GIFT", "time": "2026-10-07T15:00:00.000000Z",
+     "saleAction": {"market": "telegram", "kind": "purchase",
+                    "amount": "10000", "currency": "xtr",
+                    "amountTon": "9999999999"}}]}
+_oget67 = gs.seetg_get
+try:
+    gs.seetg_get = lambda path, params=None: _hist67
+    _sales67, _skip67 = gs.seetg_gift_sales("CandyCane", 86892)
+    check("из истории берутся ПРОДАЖИ, а не листинги и снятия",
+          [s["price"] for s in _sales67] == [Decimal("3.41"), Decimal("3.4")],
+          [s["price"] for s in _sales67])
+    check("маркет и время сделки названы",
+          _sales67[0]["market"] == "portals"
+          and _sales67[0]["time"].startswith("2026-10-07"), _sales67[0])
+    # Сделки в звёздах НЕ пересчитываются: что означает amountTon для чужой
+    # валюты и по какому курсу — не измерено, а курс из воздуха запрещён.
+    check("сделки не в TON считаются отдельно, а не выдаются за TON",
+          _skip67 == 1, _skip67)
+finally:
+    gs.seetg_get = _oget67
+
+_src67 = open("gift_sniper.py", encoding="utf-8").read()
+_hsrc = _src67.split("def seetg_gift_sales")[1].split("\ndef ")[0]
+# Одна страница. У ответа есть nextCursor, и ходить по нему запрещено: их
+# правила называют выгрузку историй основанием для блокировки аккаунта.
+check("история НЕ листается курсором", "nextCursor" not in _hsrc
+      and "cursor" not in _hsrc.lower().replace("курсор", ""))
+
+# Предупреждение «выставляете дороже, чем предмет когда-либо уходил» —
+# ровно то число, которого не хватало при сверке с графиком продаж.
+_warn67 = gs._seetg_sales_lines(
+    [{"price": Decimal("3.41"), "market": "portals", "time": "2026-10-07 17:25"}],
+    0, Decimal("7.08"))
+check("цена выше всех реальных сделок названа вслух",
+      any("не уходил ни разу" in ln for ln in _warn67), _warn67)
+_ok67 = gs._seetg_sales_lines(
+    [{"price": Decimal("3.41"), "market": "portals", "time": "x"}],
+    0, Decimal("3.20"))
+check("при цене ниже реальных сделок предупреждения нет",
+      not any("не уходил" in ln for ln in _ok67), _ok67)
+# Пустая история — это «неизвестно», а не «ноль»: отличать обязательно.
+check("отсутствие сделок названо неизвестностью, а не нулём",
+      any("неизвестно" in ln for ln in gs._seetg_sales_lines([], 0, Decimal("5"))))
+
+# =============================================================================
+# [68] ПО КАРМАНУ ЛИ ЭТО ВООБЩЕ. Первый живой прогон арбитража прислал в
+# телефон «Death Note»: купить за 499.8 TON при банке около 19. Совет,
+# который невозможно выполнить, не отличается от шума, а шум перестают
+# читать — тот же довод, что у HEARTBEAT_MIN и FIND_NOTIFY_MAX_PER_HOUR.
+# =============================================================================
+print("\n[68] Проверка по банку: показываем то, что можно купить")
+
+_obank68 = (gs.BANKROLL_TON, gs.RESERVE_TON, gs.DB_PATH, gs.MAX_NOTIFY_PRICE_TON)
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "afford68.db")
+    gs.db_init()
+    # Потолок оператора проверяется НИЖЕ отдельно: здесь вопрос только про
+    # банк, и смешивать два независимых ограничения в одном тесте значит не
+    # знать потом, которое из них отсеяло лот.
+    gs.MAX_NOTIFY_PRICE_TON = Decimal("0")
+    # «Банк не задан» и «не хватает» — РАЗНЫЕ вещи. Молча заглушить всё при
+    # пустой настройке значило бы объяснять тишину поломкой.
+    gs.BANKROLL_TON = Decimal("0")
+    _ok68, _why68 = gs.owner_can_pay(Decimal("499.8"))
+    check("банк не задан — по карману НЕ отсеиваем", _ok68 is True, _why68)
+
+    gs.BANKROLL_TON, gs.RESERVE_TON = Decimal("19"), Decimal("5")
+    check("лот за 499.8 при банке 19 в телефон не идёт",
+          gs.owner_can_pay(Decimal("499.8"))[0] is False)
+    check("лот за 3.5 при банке 19 проходит",
+          gs.owner_can_pay(Decimal("3.5"))[0] is True)
+    # Резерв не тратится никогда: иначе не на что продать купленное.
+    # Свободно 19 − 5 = 14, а заплатить надо цену ПЛЮС газ.
+    check("резерв вычтен, газ прибавлен",
+          gs.owner_can_pay(Decimal("13.9"))[0] is False
+          and gs.owner_can_pay(Decimal("13.5"))[0] is True)
+    _why68b = gs.owner_can_pay(Decimal("499.8"))[1]
+    check("в причине названы и нужная сумма (с газом), и свободная",
+          "500.10" in _why68b and "14.00" in _why68b, _why68b)
+    # РИСК-ЛИМИТ БОТА (10% банка = 1.9 TON) показ НЕ блокирует: бот по этим
+    # парам всё равно не покупает, а владелец покупает руками. Но
+    # превышение называется — иначе находка выглядела бы как то, что бот
+    # когда-нибудь возьмёт сам.
+    _ok68c, _why68c = gs.owner_can_pay(Decimal("3.5"))
+    check("риск-лимит бота не блокирует, но назван",
+          _ok68c is True and "риск-лимит" in _why68c, _why68c)
+
+    # Отсеянное НЕ теряется молча: число уходит в часовую сводку.
+    gs._unaffordable_skips, gs._unaffordable_why = 0, ""
+    check("отсеянное считается", gs._affordable(Decimal("499.8"), "«X»") is False
+          and gs._unaffordable_skips == 1, gs._unaffordable_skips)
+    check("прошедшее не считается", gs._affordable(Decimal("3.5"), "«X»") is True
+          and gs._unaffordable_skips == 1)
+finally:
+    (gs.BANKROLL_TON, gs.RESERVE_TON, gs.DB_PATH,
+     gs.MAX_NOTIFY_PRICE_TON) = _obank68
+
+_src68 = open("gift_sniper.py", encoding="utf-8").read()
+# ОДНА ПРОВЕРКА НА ВСЕ ПУТИ В ТЕЛЕФОН. Урок проекта: исправление в одной
+# точке не закрывает класс ошибки, если у значения несколько потребителей —
+# так дважды выжила безымянная корзина маркета и арбитраж по TonAPI.
+_arb68 = _src68.split("def scan_seetg_arbitrage")[1].split("\ndef ")[0]
+_seg68 = _src68.split("def scan_segment_bargains")[1].split("\ndef ")[0]
+check("арбитраж спрашивает про банк", "_affordable(" in _arb68)
+check("«дешевле своих» спрашивает про банк", "_affordable(" in _seg68)
+_sum68 = _src68.split("def _seetg_summary_lines")[1].split("\ndef ")[0] \
+    if "def _seetg_summary_lines" in _src68 else _src68
+check("число отсеянного попадает в сводку", "не по банку" in _src68)
+
+# --- КНОПКА «КУПИЛ» ЕСТЬ И У СВЯЗКИ ---------------------------------------
+# Без неё купленный по связке лот не попадал в БД ВООБЩЕ: ни PnL, ни
+# риск-лимиты про него не знают, то есть учёт становится фикцией — ровно то,
+# от чего кнопки заводились для находок.
+_sent68 = []
+_o68 = (gs._tg_call, gs.SEETG_TOKEN, gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN,
+        gs.seetg_get, gs.DB_PATH)
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "btn68.db")
+    gs.db_init()
+    gs._tg_call = lambda method, payload: (
+        _sent68.append((method, payload)) or {"ok": True, "result": {"message_id": 42}})
+    gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN = "1", "t"
+    gs.SEETG_TOKEN = "12:tok"
+    gs.seetg_get = lambda path, params=None: {"items": [_gift64, _sellgift64]}
+    gs._seetg_arb_sent_ts.clear()
+    check("связка отправлена",
+          gs.notify_seetg_arb("Surge Boards", "SurgeBoard", _pair64, "0:coll")
+          is True)
+    _pay68 = _sent68[-1][1]
+    check("у связки есть кнопки «Купил / Продал»",
+          "reply_markup" in _pay68, list(_pay68))
+    _cb68 = _pay68["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+    _row68 = gs.tg_action_get(int(_cb68.split(":")[1]))
+    check("в кнопке лежит id строки, а адрес в таблице",
+          _row68 is not None and _row68["address"] == "EQD4cq", _cb68)
+    check("цена покупки взята из живого лота, а не из борды",
+          Decimal(_row68["buy_price_ton"]) == Decimal("8.8"),
+          _row68["buy_price_ton"])
+    check("коллекция записана — без неё позицию не с чем связать",
+          _row68["collection"] == "0:coll")
+    check("message_id сохранён, иначе галочку некуда поставить",
+          _row68["message_id"] == 42)
+
+    # Без адреса предмета кнопок НЕТ: записать позицию, не зная предмета,
+    # значит завести в учёте лот, который нельзя ни найти, ни закрыть.
+    _noaddr68 = dict(_gift64)
+    _noaddr68.pop("giftAddress")
+    gs.seetg_get = lambda path, params=None: {"items": [_noaddr68, _sellgift64]}
+    gs._seetg_arb_sent_ts.clear()
+    _sent68.clear()
+    gs.notify_seetg_arb("Surge Boards", "SurgeBoard", _pair64, "0:coll")
+    check("без адреса кнопок нет, и об этом сказано",
+          "reply_markup" not in _sent68[-1][1]
+          and "--bought" in _sent68[-1][1]["text"], list(_sent68[-1][1]))
+finally:
+    (gs._tg_call, gs.SEETG_TOKEN, gs.TELEGRAM_CHAT_ID, gs.TELEGRAM_BOT_TOKEN,
+     gs.seetg_get, gs.DB_PATH) = _o68
+
+# --- ПОТОЛОК ЦЕНЫ ОПЕРАТОРА (команда владельца: «лимит максимальный до 10») -
+# Это НЕ банк и НЕ риск-лимит: банк — факт о кошельке, потолок — решение
+# оператора. Поэтому он работает И при незаданном банке.
+_ocap68 = (gs.MAX_NOTIFY_PRICE_TON, gs.BANKROLL_TON)
+try:
+    gs.MAX_NOTIFY_PRICE_TON, gs.BANKROLL_TON = Decimal("10"), Decimal("0")
+    check("лот за 11 выше потолка 10 — не показываем даже при пустом банке",
+          gs.owner_can_pay(Decimal("11"))[0] is False)
+    check("лот за 9.8 проходит", gs.owner_can_pay(Decimal("9.8"))[0] is True)
+    check("в причине назван и потолок, и имя настройки",
+          "MAX_NOTIFY_PRICE_TON" in gs.owner_can_pay(Decimal("11"))[1])
+    # Потолок считается по ЦЕНЕ лота, а не по цене с газом: владелец сравнивает
+    # с ценой на витрине, и 9.9 + 0.3 не должно читаться как «выше 10».
+    check("газ в потолок не входит — сравниваем с ценой витрины",
+          gs.owner_can_pay(Decimal("9.9"))[0] is True)
+    gs.MAX_NOTIFY_PRICE_TON = Decimal("0")
+    check("ноль отключает потолок", gs.owner_can_pay(Decimal("999"))[0] is True)
+finally:
+    gs.MAX_NOTIFY_PRICE_TON, gs.BANKROLL_TON = _ocap68
+check("потолок цены — настройка со значением 10 по умолчанию",
+      source_default("MAX_NOTIFY_PRICE_TON") == "10",
+      source_default("MAX_NOTIFY_PRICE_TON"))
+
+# =============================================================================
+# [69] ЖИВОЙ ПОТОК see.tg: СНАЧАЛА ФОРМА, ПОТОМ ПАРСЕР
+# Поток — единственный законный путь к «сколько ПЛАТЯТ»: средняя по модели
+# из /history потребовала бы выгрузки сотен предметов, а это у них основание
+# для блокировки аккаунта целиком.
+# =============================================================================
+print("\n[69] Проба живого потока: снимаем форму, не угадываем её")
+
+_src69 = open("gift_sniper.py", encoding="utf-8").read()
+_p69 = _src69.split("def seetg_stream_probe")[1].split("\ndef ")[0]
+check("режим проверки потока существует", "--seetg-stream" in _src69)
+# Токен в URL попал бы в трейсбеки, лог и историю команд — тот же урок, что
+# с токеном Telegram. Он уходит ТОЛЬКО заголовком.
+check("токен уходит заголовком, а не в URL",
+      "Authorization: Bearer" in _p69
+      and "token=" not in _p69 and "?token" not in _p69)
+check("адрес потока — настройка, а не константа в коде",
+      source_default("SEETG_WS_URL") == "wss://live.see.tg/v1/ws",
+      source_default("SEETG_WS_URL"))
+# Разбора здесь нет НАМЕРЕННО: имена полей не измерены, а догадка об именах
+# уже один раз стоила вывода «у see.tg нет наших коллекций».
+check("проба печатает сырые кадры, а не разобранные поля",
+      "сыр" in _p69.lower() and "saleAction" not in _p69)
+check("тип события берётся только для счёта и его отсутствие названо",
+      "(тип не найден)" in _p69)
+# Пустой поток — ДВА разных объяснения, и по молчанию они неразличимы.
+check("молчание потока не объявлено поломкой, причины названы обе",
+      "КОМАНДУ ПОДПИСКИ" in _p69 and "не было" in _p69)
+# Команду подписки ВЫДУМЫВАТЬ нельзя: сервер молчит и на неверную, и на
+# отсутствующую. Поэтому проба её не отправляет вовсе.
+check("проба не отправляет выдуманную команду подписки",
+      ".send(" not in _p69)
+# Библиотека необязательная — как tonutils: без неё режим говорит, что
+# поставить, а не падает NameError.
+_w69 = _src69.split("def _ws_connect")[1].split("\ndef ")[0]
+check("без websocket-client режим советует пакет, а не падает",
+      "pip install websocket-client" in _w69 and "ImportError" in _w69)
+# Поток ничего не копит: это проба формы, а не сбор данных.
+check("проба в БД и в запись не пишет",
+      "record_snapshot" not in _p69 and "db_connect" not in _p69
+      and "meta_set" not in _p69)
+
+# --- РУКОПОЖАТИЕ — НЕ СОБЫТИЕ (живой прогон 07.10.2026) --------------------
+# Первый прогон прислал ровно один кадр `type: hello`, и счётчик кадров
+# объявил бы «форма снята». Рукопожатие — ответ на подключение, а не поток
+# событий; считать их вместе значит сказать «события идут» там, где их нет.
+_p69b = open("gift_sniper.py", encoding="utf-8").read()
+_p69b = _p69b.split("def seetg_stream_probe")[1].split("\ndef ")[0]
+check("служебные кадры считаются отдельно от событий",
+      "_WS_SERVICE_KINDS" in _p69b and "из них СОБЫТИЙ" in _p69b)
+check("вердикт выносится по СОБЫТИЯМ, а не по кадрам",
+      "if not events:" in _p69b and "if not seen:" not in _p69b)
+check("hello опознан как служебный", "type=hello" in gs._WS_SERVICE_KINDS)
+# Их собственный список событий — ИЗМЕРЕНИЕ (прислали они), и он печатается
+# отдельно: по нему будет писаться парсер.
+check("список событий из рукопожатия печатается",
+      "Поток называет события сам" in _p69b)
+check("отсутствие «sale» в их списке названо прямо",
+      "«sale» в списке НЕТ" in _p69b)
+# «anon» НЕ объявляется причиной молчания: влияет ли режим на доставку, мы
+# не измеряли, а назвать догадку причиной — ровно запрещённое в проекте.
+check("режим «anon» назван, но причиной молчания не объявлен",
+      "НЕ измеряли" in _p69b)
+
+# --- ТИШИНА В ПОТОКЕ НЕ ЗАКАНЧИВАЕТ ПРОГОН --------------------------------
+# События приходят рывками, и первый же тихий промежуток не должен означать
+# «поток пуст»: выйти по нему значит не дождаться отведённого времени.
+class _FakeWS69:
+    def __init__(self, script):
+        self.script, self.closed = list(script), False
+    def settimeout(self, t):
+        pass
+    def recv(self):
+        if not self.script:
+            raise TimeoutError("timed out")
+        item = self.script.pop(0)
+        if item is None:
+            raise TimeoutError("timed out")   # тихий промежуток
+        return item
+    def close(self):
+        self.closed = True
+
+_hello69 = ('{"auth":{"admin":false,"via":"app"},"events":["listing","sale"],'
+            '"mode":"anon","type":"hello"}')
+_sale69 = '{"type":"sale","slug":"CandyCane","num":1,"amount":"3410000000"}'
+_ows69, _otok69, _otick69 = gs._ws_connect, gs.SEETG_TOKEN, gs._WS_TICK_SEC
+try:
+    gs.SEETG_TOKEN, gs._WS_TICK_SEC = "407:x", 0.01
+    _fake69 = _FakeWS69([_hello69, None, None, _sale69, _sale69])
+    gs._ws_connect = lambda url, headers, timeout: (_fake69, None)
+    check("проба отработала", gs.seetg_stream_probe(2) is True)
+    check("тихий промежуток не оборвал прогон — события после него учтены",
+          not _fake69.script, _fake69.script)
+    check("соединение закрыто", _fake69.closed is True)
+
+    # Один hello и ничего больше — это НЕ «форма снята».
+    _only69 = _FakeWS69([_hello69])
+    gs._ws_connect = lambda url, headers, timeout: (_only69, None)
+    _logged69 = []
+    _olog69 = gs.log.info
+    gs.log.info = lambda msg, *a, **k: _logged69.append(str(msg))
+    try:
+        gs.seetg_stream_probe(1)
+    finally:
+        gs.log.info = _olog69
+    check("на одном рукопожатии форма НЕ объявляется снятой",
+          not any("Форма снята" in m for m in _logged69),
+          [m for m in _logged69 if "Форма" in m])
+    check("их список событий при этом напечатан",
+          any("Поток называет события сам" in m for m in _logged69))
+finally:
+    gs._ws_connect, gs.SEETG_TOKEN, gs._WS_TICK_SEC = _ows69, _otok69, _otick69
+
+# --- КАК УЗНАТЬ ФОРМУ ПОДПИСКИ, НЕ ВЫДУМЫВАЯ ЕЁ ---------------------------
+# Правило запрещает ДЕЙСТВОВАТЬ по догадке, а не спрашивать. Кадр
+# отправляется, чтобы измерить ОТВЕТ сервера; решает ответ, а не наша
+# догадка — тот же приём, что круговая проверка /v1/resolve.
+_cands = gs._ws_candidate_frames(["transfer", "sale", "listing", "stats"])
+check("кандидаты подписки собираются из ИХ списка событий",
+      all("sale" in str(f) for _n, f, _s in _cands[1:]), _cands)
+check("имя события не выдумано: взято из рукопожатия",
+      all("stats" not in str(f) for _n, f, _s in _cands))
+# ОБЁРТКА ИЗМЕРЕНА живым ответом «unknown message TYPE»: сервер смотрит
+# именно `type`. Значит перебирать надо значение, а не ключ — иначе кадры
+# тратятся на то, что уже известно.
+check("все кандидаты идут с измеренным ключом type",
+      all("type" in f for _n, f, _s in _cands), _cands)
+check("кандидатов немного — это не перебор ради перебора", len(_cands) <= 8)
+check("ping стоит первым: он отделяет «слово не то» от «молчит на всё»",
+      _cands[0][1] == {"type": "ping"}, _cands[0])
+# ping ОТВЕТ ПОЛУЧАЕТ (измерено: pong), но ни на что не подписывает.
+# Остановка на нём объявила бы команду найденной, не найдя её.
+check("ping помечен как НЕ попытка подписки", _cands[0][2] is False)
+check("остальные кандидаты — попытки подписки",
+      all(_s for _n, _f, _s in _cands[1:]))
+
+# Отказ опознаётся по их же форме ответа (живая строка 07.10.2026).
+check("отказ опознан и его текст извлечён",
+      gs._ws_is_error('{"code":"bad_request","message":"unknown message type",'
+                      '"type":"error"}') == "unknown message type")
+check("обычный кадр отказом не считается",
+      gs._ws_is_error('{"type":"sale","amount":"1"}') == "")
+
+_src70 = open("gift_sniper.py", encoding="utf-8").read()
+_sp70 = _src70.split("def seetg_subscribe_probe")[1].split("\ndef ")[0]
+# Перебор прекращается на первом ответе: лишний трафик к ним запрещён их же
+# правилами, а ответ любого рода — уже измерение.
+check("перебор прекращается на ПРИНЯТОМ кадре, а не на отказе",
+      "Сервер ПРИНЯЛ" in _sp70 and "это отказ — слово не то" in _sp70)
+check("ответ на диагностический кадр перебор не останавливает",
+      "словарь работает" in _sp70 and "иду дальше" in _sp70)
+check("слова отказов собираются и печатаются — это их словарь",
+      "refusals" in _sp70 and "Сервер отказал так" in _sp70)
+check("молчание на все кандидаты названо НЕ доказательством отсутствия",
+      'НЕ значит «подписки' in _sp70)
+check("ответы печатаются сырыми, парсер по ним здесь не пишется",
+      "ОТВЕТ:" in _sp70 and "saleAction" not in _sp70)
+check("токен и здесь уходит заголовком",
+      "Authorization: Bearer" in _sp70 and "token=" not in _sp70)
+check("режим доступен как --seetg-subscribe", "--seetg-subscribe" in _src70)
+
+# Проба на поддельном соединении: сервер отвечает на второй кандидат.
+class _FakeWS70:
+    """Отказывает на всё, кроме subscribe+channels — как живой сервер."""
+    def __init__(self):
+        self.sent, self.queue, self.closed = [], [_hello69], False
+    def settimeout(self, t):
+        pass
+    def send(self, data):
+        self.sent.append(data)
+        if '"ping"' in data:                      # живой случай: pong
+            self.queue.append('{"type":"pong"}')
+        elif "channels" in data:
+            self.queue.append('{"type":"subscribed","events":["sale"]}')
+        else:
+            self.queue.append('{"code":"bad_request",'
+                              '"message":"unknown message type","type":"error"}')
+    def recv(self):
+        if not self.queue:
+            raise TimeoutError("timed out")
+        return self.queue.pop(0)
+    def close(self):
+        self.closed = True
+
+_ows70, _otok70 = gs._ws_connect, gs.SEETG_TOKEN
+try:
+    gs.SEETG_TOKEN = "407:x"
+    _f70 = _FakeWS70()
+    gs._ws_connect = lambda url, headers, timeout: (_f70, None)
+    check("проба подписки отработала", gs.seetg_subscribe_probe(1) is True)
+    # ОТКАЗЫ перебор не останавливают, а ПРИНЯТЫЙ кадр — останавливает:
+    # после него ни одного лишнего.
+    # pong на ping и отказ на subscribe+events перебор НЕ останавливают,
+    # а принятый subscribe+channels — останавливает.
+    check("ни pong, ни отказ перебор не останавливают",
+          len(_f70.sent) == 3 and "channels" in _f70.sent[-1], _f70.sent)
+    check("соединение закрыто", _f70.closed is True)
+finally:
+    gs._ws_connect, gs.SEETG_TOKEN = _ows70, _otok70
+
+# --- ПОДПИСКА ИЗМЕРЕНА, ЦЕНА СДЕЛКИ — ЕЩЁ НЕТ ------------------------------
+# Живой ответ 07.10.2026:
+#   -> {"type":"subscribe","events":["listing","price","sale"]}
+#   <- {"type":"subscribed","events":[...],"stats":false}
+#   <- {"type":"event","event":"sale","at":...,"market":...,"gift":{...}}
+print("\n[70] Поток: подписка измерена, кадры пишем целиком")
+
+_src71 = open("gift_sniper.py", encoding="utf-8").read()
+check("формат подписки взят из ответа сервера, а не из документации",
+      gs._WS_SUBSCRIBE["type"] == "subscribe"
+      and isinstance(gs._WS_SUBSCRIBE.get("events"), list), gs._WS_SUBSCRIBE)
+_lc = _src71.split("def seetg_listen_capture")[1].split("\ndef ")[0]
+# Кадры режутся до 1200 символов в пробе, и у sale с mrkt/tonnel видимая
+# часть несла resellAmountTon=0 — значит цена дальше. Поле, которого не
+# видел, парсить нельзя.
+check("кадры пишутся ЦЕЛИКОМ, без обрезки", "[:1200]" not in _lc)
+check("строка пишется как пришла, без пересборки JSON",
+      "json.dumps(frame" not in _lc and "str(frame)" in _lc)
+check("разбора цены сделки здесь НЕТ",
+      "compute_net_profit" not in _lc and "amountTon" not in _lc)
+check("файл кадров — настройка",
+      gs.source_default("SEETG_FRAMES_FILE") == "seetg-frames.jsonl"
+      if hasattr(gs, "source_default") else
+      source_default("SEETG_FRAMES_FILE") == "seetg-frames.jsonl")
+check("файл кадров в .gitignore — его перезаписывает бот",
+      "seetg-frames.jsonl" in open(".gitignore", encoding="utf-8").read())
+# Пустой поток — не поломка: подписка подтверждена сервером.
+check("отсутствие событий названо НЕ поломкой", "не поломка" in _lc)
+
+_ofile71, _otok71, _ows71 = gs.SEETG_FRAMES_FILE, gs.SEETG_TOKEN, gs._ws_connect
+try:
+    gs.SEETG_FRAMES_FILE = os.path.join(_tmpdir, "frames71.jsonl")
+    gs.SEETG_TOKEN = "407:x"
+    _long71 = ('{"type":"event","event":"sale","market":"tonnel","gift":{"x":"'
+               + "9" * 3000 + '"}}')
+    class _FakeWS71:
+        def __init__(self):
+            self.sent, self.queue, self.closed = [], [], False
+        def settimeout(self, t):
+            pass
+        def send(self, data):
+            self.sent.append(data)
+            self.queue += ['{"type":"subscribed","events":["sale"]}', _long71]
+        def recv(self):
+            if not self.queue:
+                raise TimeoutError("timed out")
+            return self.queue.pop(0)
+        def close(self):
+            self.closed = True
+    _f71 = _FakeWS71()
+    gs._ws_connect = lambda url, headers, timeout: (_f71, None)
+    check("захват отработал", gs.seetg_listen_capture(1, "sale") is True)
+    check("подписка ушла измеренным кадром",
+          json.loads(_f71.sent[0]) == {"type": "subscribe", "events": ["sale"]},
+          _f71.sent)
+    _lines71 = open(gs.SEETG_FRAMES_FILE, encoding="utf-8").read().splitlines()
+    check("длинный кадр записан целиком, а не обрезан",
+          any(len(ln) > 3000 for ln in _lines71), [len(x) for x in _lines71])
+    check("служебный кадр тоже сохранён — он часть протокола",
+          any("subscribed" in ln for ln in _lines71))
+finally:
+    gs.SEETG_FRAMES_FILE, gs.SEETG_TOKEN, gs._ws_connect = (
+        _ofile71, _otok71, _ows71)
+
+# =============================================================================
+# [71] ЦЕНЫ СДЕЛОК ИЗ ПОТОКА. Кадры ДОСЛОВНЫЕ, из 116 живых событий,
+# присланных владельцем 09.10.2026. Разбор написан по ним, а не по памяти.
+# =============================================================================
+print("\n[71] Сделки из потока: цена рядом с gift и в нанотонах")
+
+_sale71 = json.loads('{"type": "event", "event": "sale", "at": "2026-10-09T08'
+    ':20:27.682444+00:00", "market": "portals", "price": {"amount": 500000000,'
+    ' "currency": "gram"}, "price_ton": 500000000, "sale_kind": "purchase", "g'
+    'ift": {"id": 5848429011021071715, "num": 3391, "slug": "SnakeBox", "resel'
+    'lAmountTon": "0", "details": {"slug": "SnakeBox", "num": 3391, "model": {"'
+    'name": "Bento", "rarityPermille": 6}, "backdrop": {"name": "Coral Red", "r'
+    'arityPermille": 10}, "pattern": {"name": "Turban", "rarityPermille": 10}, '
+    '"giftId": "6023679164349940429", "estimate": {"ton": 3.425569105, "backdro'
+    'pMult": 1}}}}')
+_lucky71 = json.loads('{"type": "event", "event": "sale", "at": "2026-10-09T08'
+    ':21:48.188014+00:00", "market": "portals", "price": {"amount": 4320000000,'
+    ' "currency": "gram"}, "price_ton": 4320000000, "sale_kind": "lucky_buy_win'
+    '", "gift": {"num": 183808, "slug": "PetSnake", "resellAmountTon": "0", "de'
+    'tails": {"slug": "PetSnake", "num": 183808, "model": {"name": "Sketchy"}}}}')
+
+_s71, _why71 = gs.seetg_sale_from_frame(_sale71)
+check("сделка разобрана", _s71 is not None, _why71)
+# ГЛАВНАЯ ЛОВУШКА: price_ton ВОПРЕКИ ИМЕНИ в нанотонах. 500000000 = 0.5 TON,
+# а не 500 миллионов. Имя поля обещает одно, значение другое.
+check("price_ton прочитан как НАНОТОНЫ, а не как TON",
+      _s71["price_ton"] == Decimal("0.5"), _s71["price_ton"])
+# Цена лежит РЯДОМ с gift. Внутри gift есть resellAmountTon, и он здесь "0":
+# прочитать оттуда значило бы получить ноль там, где заплатили.
+check("цена взята с верхнего уровня, а не из gift.resellAmountTon",
+      _s71["price_ton"] > 0 and _sale71["gift"]["resellAmountTon"] == "0")
+check("модель, фон и узор разобраны",
+      (_s71["model"], _s71["backdrop"], _s71["pattern"])
+      == ("Bento", "Coral Red", "Turban"), _s71)
+check("их оценка сохраняется рядом для будущей сверки",
+      str(_s71["estimate_ton"]) == "3.425569105", _s71["estimate_ton"])
+
+# Расхождение price.amount и price_ton означает, что одно из полей значит не
+# то, что мы думаем. Во всех 116 кадрах они совпали — разойдутся, пропускаем.
+_bad71, _w71 = gs.seetg_sale_from_frame(
+    dict(_sale71, price_ton=999, price={"amount": 500000000, "currency": "gram"}))
+check("расхождение price.amount и price_ton — пропуск, а не догадка",
+      _bad71 is None and "означают разное" in _w71, _w71)
+# Звёзды и USDT: курса у нас нет, выдумать его значит придумать цену.
+_st71, _w71b = gs.seetg_sale_from_frame(
+    dict(_sale71, price={"amount": 10000, "currency": "stars"}))
+check("цена не в TON пропускается", _st71 is None and "валюта" in _w71b, _w71b)
+check("листинг и прочие события сделкой не считаются",
+      gs.seetg_sale_from_frame(dict(_sale71, event="listing"))[0] is None)
+
+# lucky_buy_win — выигрыш в «счастливой покупке», а не покупка на витрине.
+# Что эта цена означает, НЕ ИЗМЕРЕНО, поэтому в среднюю она не идёт.
+_lk71, _ = gs.seetg_sale_from_frame(_lucky71)
+check("lucky_buy_win разбирается, но видом сделки отличается",
+      _lk71 is not None and _lk71["sale_kind"] == "lucky_buy_win")
+check("в среднюю идут только purchase и sale",
+      gs._SALE_KINDS_REAL == ("purchase", "sale"), gs._SALE_KINDS_REAL)
+
+_osales71 = gs.DB_PATH
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "sales71.db")
+    gs.db_init()
+    check("сделка записана", gs.record_sale(_s71) is True)
+    # Поток переподключается, и то же событие приходит снова. Дважды
+    # засчитанная сделка сдвинула бы медиану.
+    check("повтор того же события второй записи НЕ делает",
+          gs.record_sale(_s71) is False)
+    with gs.db_connect() as _c:
+        _n = _c.execute("SELECT COUNT(*) c FROM sales").fetchone()["c"]
+        _p = _c.execute("SELECT price_ton FROM sales").fetchone()["price_ton"]
+    check("в базе одна строка", _n == 1, _n)
+    # Цена лежит СТРОКОЙ: через float она потеряла бы нанотоны, ровно как в
+    # записи рынка, где цены хранятся строками намеренно.
+    check("цена хранится строкой, а не float", isinstance(_p, str) and
+          Decimal(_p) == Decimal("0.5"), _p)
+
+    # Фильтр по своим коллекциям: поток — это весь рынок (в пробе 116 сделок
+    # пришлись на 20+ коллекций). Складывать всё значило бы копить их базу.
+    check("слаги берутся из доказанных, а не из воздуха",
+          gs.known_seetg_slugs() == {})
+    gs.meta_set("seetg_slug:0:abc", "SnakeBox")
+    check("доказанный слаг виден фильтру",
+          gs.known_seetg_slugs() == {"SnakeBox": "0:abc"})
+    check("отчёт по сделкам отрабатывает", gs.sales_report() is True)
+finally:
+    gs.DB_PATH = _osales71
+
+_src72 = open("gift_sniper.py", encoding="utf-8").read()
+_w72 = _src72.split("def seetg_watch_sales")[1].split("\ndef ")[0]
+# Без доказанных слагов — отказ, а не «запишем всё и разберёмся потом».
+check("без своих слагов watch отказывается писать",
+      "Слаги наших коллекций не доказаны" in _w72)
+check("подписка идёт тем же измеренным кадром", "_WS_SUBSCRIBE" in _w72)
+check("соединение переподключается с выдержкой",
+      "2.0 ** attempt" in _w72 and "min(60.0" in _w72)
+# Молчание объясняется: в пробе 116 сделок за 2 минуты пришлись на весь
+# рынок, и наши коллекции попадают туда не каждую минуту.
+check("пустой результат назван НЕ поломкой", "не поломка" in _w72)
+_r72 = _src72.split("def sales_report")[1].split("\ndef ")[0]
+check("отчёт берёт медиану, а не среднее",
+      "медиана" in _r72 and "_median(" in _r72 and "sum(ests)" not in _r72)
+check("сегмент с одной сделкой назван вслух", "ОДНОЙ сделкой" in _r72)
+check("отчёт не разрешает поднимать премию",
+      "PREMIUM_MULT" in _r72 and "ЧЕГО ЭТО ЕЩЁ НЕ ДАЁТ" in _r72)
+
+# --- СХЕМА СОЗДАЁТСЯ ПРИ ЛЮБОМ ОБРАЩЕНИИ К БД (живой баг 09.10.2026) -------
+# `--seetg-watch` и `--sales` упали с «no such table: sales»: таблицу
+# добавили в db_init(), а эти режимы её не звали, и база владельца
+# существовала с прошлых запусков — то есть таблица не появлялась НИКОГДА.
+_osch = (gs.DB_PATH, gs._schema_ready_for)
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "old72.db")
+    gs.db_init()
+    with gs.db_connect() as _c:          # база «как её создавал прошлый код»
+        _c.execute("DROP TABLE sales")
+    gs._schema_ready_for = None          # процесс, который db_init() не звал
+    _tables = lambda: {r["name"] for r in gs.db_connect().execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    gs._schema_ready_for = None
+    check("на старой базе запись сделки НЕ падает",
+          gs.record_sale({"slug": "S", "num": 1, "model": "M", "backdrop": None,
+                          "pattern": None, "market": "portals",
+                          "price_ton": Decimal("3.41"), "sale_kind": "purchase",
+                          "estimate_ton": None, "at_iso": "t"}) is True)
+    check("недостающая таблица создалась сама", "sales" in _tables())
+    check("отчёт на той же базе отрабатывает", gs.sales_report() is True)
+
+    # Флаг — это ПУТЬ, а не «да/нет»: иначе вторая база осталась бы пустой.
+    gs.DB_PATH = os.path.join(_tmpdir, "second72.db")
+    check("смена базы заново создаёт схему", "sales" in _tables())
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osch
+
+_src72b = open("gift_sniper.py", encoding="utf-8").read()
+_dc72 = _src72b.split("def db_connect")[1].split("\ndef ")[0]
+# Оговорка обязана жить в коде: CREATE TABLE IF NOT EXISTS добавляет только
+# ТАБЛИЦЫ. Новая КОЛОНКА в существующей таблице требует ALTER TABLE, и
+# забыть про это значит получить ту же ошибку под другим именем.
+check("ограничение миграции названо прямо в коде",
+      "ALTER TABLE" in _dc72 and "КОЛОНКА" in _dc72)
+
+# =============================================================================
+# [72] ОТЧЁТ ПО СДЕЛКАМ: СХОДИМОСТЬ С ИХ ОЦЕНКОЙ, МАРКЕТЫ, ПОВТОРЫ.
+# Данные — ИЗ ЧАСОВОГО ПРОГОНА ВЛАДЕЛЬЦА 09.10.2026 (286 сделок). В нём один
+# и тот же предмет приходил несколько раз с ОДНОЙ И ТОЙ ЖЕ ценой, и эти
+# строки тянули медиану сегмента к 0.5 TON при настоящих сделках 3.65.
+# =============================================================================
+# Медиана при чётном N: ВЕРХНЯЯ из двух серединных смещает цену продажи
+# ВВЕРХ, то есть завышает расчётную выручку. Среднее — безопасная сторона.
+check("медиана при чётном N — среднее, а не верхняя из двух",
+      gs._median([Decimal("1"), Decimal("2")]) == Decimal("1.5"))
+check("медиана при нечётном N — серединный элемент",
+      gs._median([Decimal("3"), Decimal("1"), Decimal("2")]) == Decimal("2"))
+# None, а не ноль: ноль — это цена, и он прочитался бы как «отдают даром».
+check("медиана пустого — None, а не ноль", gs._median([]) is None)
+
+# Перцентиль отчёта отдаёт НАБЛЮДЁННОЕ значение. Интерполяция между двумя
+# настоящими ценами однажды дала «floor сегмента 10.35» там, где лоты стояли
+# по 4.47 и 11.00, — точку, по которой никто ничего не выставлял.
+_vals72 = [Decimal(str(i)) for i in range(1, 11)]
+check("перцентиль берёт наблюдённое значение, а не интерполирует",
+      gs._nearest_rank(_vals72, 0.10) in _vals72
+      and gs._nearest_rank(_vals72, 0.90) in _vals72)
+check("перцентиль пустого — None", gs._nearest_rank([], 0.5) is None)
+
+
+def _sale72(slug, num, model, market, price, est=None, at="t1",
+            kind="purchase"):
+    return {"slug": slug, "num": num, "model": model, "backdrop": "Olive",
+            "pattern": "P", "market": market, "price_ton": Decimal(price),
+            "sale_kind": kind,
+            "estimate_ton": (Decimal(est) if est else None), "at_iso": at}
+
+
+_osales72, _osch72 = gs.DB_PATH, gs._schema_ready_for
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "sales72.db")
+    gs._schema_ready_for = None
+    # ДОСЛОВНО ПО ПРОГОНУ: повторы приходят с РАЗНЫМ временем, поэтому
+    # UNIQUE(slug, num, at_iso, price_ton) их не склеивает — и не должен:
+    # для базы это разные события, а что они означают, не измерено.
+    _rows72 = [
+        ("ChillFlame", 15347, "Bowl of Hygeia", "tonnel", "0.5", "3.4", "a1"),
+        ("ChillFlame", 15347, "Bowl of Hygeia", "tonnel", "0.5", "3.4", "a2"),
+        ("ChillFlame", 15347, "Bowl of Hygeia", "tonnel", "3.65", "3.4", "a3"),
+        ("ChillFlame", 258898, "Prometheus", "tonnel", "0.51", "3.4", "b1"),
+        ("ChillFlame", 258898, "Prometheus", "tonnel", "0.5", "3.4", "b2"),
+        ("ChillFlame", 258898, "Prometheus", "tonnel", "0.51", "3.4", "b3"),
+        ("ChillFlame", 258898, "Prometheus", "tonnel", "0.5", "3.4", "b4"),
+        # Та же цена 0.5 у ДРУГОГО предмета — это не повтор, а рынок.
+        ("CandyCane", 35055, "Phantom", "mrkt", "0.5", "3.3", "c1"),
+        ("PoolFloat", 201727, "Leonardo", "portals", "3.774", "3.7", "d1"),
+        # Сделки с getgems из того же прогона: цена ВЫШЕ их оценки.
+        ("CandyCane", 11, "Tiki Torch", "getgems", "5.0", "3.34", "e1"),
+        ("ViceCream", 12, "Birthday", "getgems", "32", "22.67", "e2"),
+        ("FaithAmulet", 13, "Rose Pearl", "getgems", "7.0", "5.06", "e3"),
+        ("LibertyFigure", 14, "Fire Opal", "getgems", "7.0", "5.50", "e4"),
+    ]
+    for _a in _rows72:
+        gs.record_sale(_sale72(*_a))
+    with gs.db_connect() as _c72:
+        _db72 = _c72.execute("SELECT * FROM sales ORDER BY id").fetchall()
+    check("повтор с другим временем записан как отдельное событие",
+          len(_db72) == len(_rows72))
+
+    _s72 = gs.suspicious_sales(_db72)
+    # Признак — повтор ПО ПРЕДМЕТУ, а не уровень цены: порог «дешевле 0.5»
+    # был бы придуманным критерием, а повтор — наблюдаемый факт.
+    check("повторы по одному предмету найдены", len(_s72["ids"]) == 6)
+    check("предметов с повторами ровно два", len(_s72["items"]) == 2)
+    check("настоящая сделка того же предмета не помечена",
+          not any(r["id"] in _s72["ids"] for r in _db72
+                  if r["price_ton"] == "3.65"))
+    check("та же цена у другого предмета повтором не считается",
+          not any(r["id"] in _s72["ids"] for r in _db72
+                  if r["slug"] == "CandyCane" and r["num"] == 35055))
+    # Какие цены повторяются — ИЗМЕРЕНИЕ, а не критерий: 0.5 называет себя сам.
+    check("повторяющиеся цены названы", _s72["prices"].get("0.5") == 4
+          and _s72["prices"].get("0.51") == 2)
+    check("повторы посчитаны по маркетам",
+          _s72["by_market"].get("tonnel") == 6
+          and "mrkt" not in _s72["by_market"])
+
+    # МЕДИАНА НЕ ИСПРАВЛЕНА: выбросить дешёвые строки значит ПОДНЯТЬ её, то
+    # есть увеличить расчётную выручку — направление, требующее данных.
+    _prom = [Decimal(r["price_ton"]) for r in _db72
+             if r["num"] == 258898]
+    check("медиана сегмента считается ВКЛЮЧАЯ повторы",
+          gs._median(_prom) == Decimal("0.505"))
+
+    class _Collect72(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    _h72 = _Collect72()
+    gs.log.addHandler(_h72)
+    try:
+        check("отчёт отрабатывает на этих данных", gs.sales_report() is True)
+    finally:
+        gs.log.removeHandler(_h72)
+    _out72 = "\n".join(_h72.lines)
+
+    # Сходимость их оценки с деньгами — одно число на всю выборку, и оно
+    # считается ПО КАЖДОЙ СДЕЛКЕ: усреднение медиан сегментов дало бы
+    # сегменту с одной сделкой тот же вес, что сегменту с тридцатью.
+    check("сходимость с их оценкой названа числом",
+          "медиана цена/оценка" in _out72 and "10-й перцентиль" in _out72)
+    check("левый хвост назван ошибкой продавца, а не шумом",
+          "ЛЕВЫЙ ХВОСТ" in _out72)
+    # Таблица по маркетам — первый в проекте ответ про арбитраж ДЕНЬГАМИ.
+    check("таблица по маркетам печатает все маркеты выборки",
+          all(m in _out72 for m in ("tonnel", "mrkt", "portals", "getgems")))
+    check("маркет с малой выборкой назван «мало»", "мало" in _out72)
+    check("оговорки стоят рядом с таблицей, а не в документации",
+          "ИХ число" in _out72 and "СОСТАВ" in _out72
+          and "Комиссии измерены только у Getgems" in _out72)
+    # Пометка обязана стоять РЯДОМ с числом: оговорку двадцатью строками
+    # ниже читают после того, как вывод уже сделан.
+    # Повтор не выбрасывается, а СЧИТАЕТСЯ ОДИН РАЗ: предмет по этой цене,
+    # похоже, ушёл однажды. Bowl of Hygeia: строки 0.5, 0.5, 3.65 дают по
+    # одному на пару «предмет+цена» -> [0.5, 3.65] -> медиана 2.075.
+    check("подозрительные сегменты названы со свёрнутой медианой",
+          "по одному на предмет" in _out72 and "2.075" in _out72)
+    check("колонка уникальных объясняет себя рядом с таблицей",
+          "«уник»" in _out72)
+    check("неисправленная медиана названа намеренной",
+          "НЕ ИСПРАВЛЕНА НАМЕРЕННО" in _out72)
+    check("отчёт по-прежнему не разрешает поднимать премию",
+          "ЧЕГО ЭТО ЕЩЁ НЕ ДАЁТ" in _out72)
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osales72, _osch72
+
+# --- ДЛИННАЯ ТАБЛИЦА ОБРЕЗАЕТСЯ, НО СЧЁТ ИДЁТ ПО ВСЕМУ (09.10.2026) --------
+# Восемь часов потока дали 8701 сделку и больше тысячи сегментов. Отчёт на
+# тысячу строк не дочитывают, а недочитанный не отличается от неотправленного.
+# Обрезается ПЕЧАТЬ: числа ниже обязаны считаться по всем строкам, иначе
+# отчёт показывал бы одно, а считал другое.
+_osales73, _osch73 = gs.DB_PATH, gs._schema_ready_for
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "sales73.db")
+    gs._schema_ready_for = None
+    for _i in range(45):
+        gs.record_sale(_sale72("BigColl", 1000 + _i, f"Model{_i}", "portals",
+                               "5.0", "5.0", at=f"t{_i}"))
+    _h73 = _Collect72()
+    gs.log.addHandler(_h73)
+    try:
+        gs.sales_report()
+    finally:
+        gs.log.removeHandler(_h73)
+    _out73 = "\n".join(_h73.lines)
+    check("длинная таблица обрезана по числу сегментов",
+          f"Показаны {gs._SALES_TOP_SEGMENTS}" in _out73)
+    # Молча обрезанный список читается как «больше ничего нет».
+    check("скрытые сегменты названы числом", "Остальные 5" in _out73)
+    _mk73 = next((l for l in _h73.lines
+                  if "portals" in l and " 45 " in l), "")
+    check("скрытые сегменты ВХОДЯТ в счёт по маркетам", bool(_mk73))
+    check("скрытые сегменты входят в общий счёт", "Всего сделок: 45" in _out73)
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osales73, _osch73
+
+
+# --- ЧТО ИМЕННО ПОВТОРЯЕТСЯ: ПАЧКА ИЛИ РЫНОК (09.10.2026) -----------------
+# Восьмичасовой прогон дал 4707 повторов из 9275 строк, и они легли на
+# portals (4272) при нуле у getgems и tonnel. Повтор на уровне транспорта
+# бьёт по всем маркетам одинаково, поэтому вопрос решается измерением:
+# сколько РАЗНЫХ моментов времени приходится на эти строки.
+_osales74, _osch74 = gs.DB_PATH, gs._schema_ready_for
+try:
+    # ПАЧКА: восемь предметов, два одинаковых момента времени на всех.
+    gs.DB_PATH = os.path.join(_tmpdir, "sales74a.db")
+    gs._schema_ready_for = None
+    for _i in range(8):
+        for _k in range(2):
+            gs.record_sale(_sale72("Batch", 100 + _i, "M", "portals", "3.8",
+                                   "3.8", at=f"2026-10-09T10:0{_k}:00+00:00"))
+    with gs.db_connect() as _c74:
+        _rows74 = _c74.execute("SELECT * FROM sales").fetchall()
+    _s74 = gs.suspicious_sales(_rows74)
+    _p74 = gs.suspicious_profile(_rows74, _s74["ids"])
+    check("пачка видна по числу моментов времени",
+          _p74["rows"] == 16 and _p74["stamps"] == 2 and _p74["busiest"] == 8)
+
+    # РЫНОК: один предмет, у каждого повтора своё время с шагом 300с.
+    gs.DB_PATH = os.path.join(_tmpdir, "sales74b.db")
+    gs._schema_ready_for = None
+    for _k in range(5):
+        gs.record_sale(_sale72("Mkt", 7, "M", "portals", "3.8", "3.8",
+                               at=f"2026-10-09T10:{_k * 5:02d}:00+00:00"))
+    with gs.db_connect() as _c74b:
+        _rows74b = _c74b.execute("SELECT * FROM sales").fetchall()
+    _s74b = gs.suspicious_sales(_rows74b)
+    _p74b = gs.suspicious_profile(_rows74b, _s74b["ids"])
+    check("у отдельных событий своё время у каждого",
+          _p74b["stamps"] == 5 and _p74b["busiest"] == 1)
+    # Шаг между повторами — то, что отличает механику от рынка.
+    check("шаг между повторами измерен",
+          gs._median(_p74b["gaps"]) == 300 and _p74b["top_n"] == 5)
+    # Неразобранное время не роняет отчёт и не выдумывает секунды.
+    check("непонятное время даёт None, а не ноль",
+          gs._iso_seconds("не время") is None and gs._iso_seconds(None) is None)
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osales74, _osch74
+
+
+# --- ВЛАДЕЛЕЦ И id ПРЕДМЕТА ИЗ КАДРА; НОВАЯ КОЛОНКА В СТАРОЙ БАЗЕ ---------
+# По сырым кадрам 09.10.2026: у восьми «продаж» PoolFloat-128385 подряд
+# совпали и цена, и id, и владелец «Po***l» — то есть это один и тот же
+# предмет в одном и том же состоянии, а не восемь переходов из рук в руки.
+# Владелец лежит в `gift`, а НЕ в `gift.details` — проверено, не угадано.
+_frame75 = {
+    "type": "event", "event": "sale",
+    "at": "2026-10-09T08:21:01.905487+00:00", "market": "portals",
+    "price": {"amount": 500000000, "currency": "gram"},
+    "price_ton": 500000000, "sale_kind": "purchase",
+    "gift": {"id": "5900012238260930601", "owner_name": "Po***l",
+             "owner_masked": True,
+             "details": {"slug": "PoolFloat", "num": 128385,
+                         "model": {"name": "Leonardo"}}},
+}
+_s75, _why75 = gs.seetg_sale_from_frame(_frame75)
+check("владелец берётся из gift, а не из details",
+      _s75 is not None and _s75["owner_name"] == "Po***l")
+check("id предмета сохраняется", _s75["gift_id"] == "5900012238260930601")
+
+_osales75, _osch75 = gs.DB_PATH, gs._schema_ready_for
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "sales75.db")
+    gs._schema_ready_for = None
+    gs.db_init()
+    # БАЗА ВЛАДЕЛЬЦА СТАРАЯ: таблица есть, новых колонок нет. CREATE TABLE
+    # IF NOT EXISTS их не добавит — нужен явный ALTER TABLE.
+    with gs.db_connect() as _c75:
+        _c75.execute("DROP TABLE sales")
+        _c75.execute("CREATE TABLE sales (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                     " slug TEXT NOT NULL, num INTEGER, model TEXT,"
+                     " backdrop TEXT, pattern TEXT, market TEXT,"
+                     " price_ton TEXT NOT NULL, sale_kind TEXT,"
+                     " estimate_ton TEXT, at_iso TEXT, seen_ts REAL NOT NULL,"
+                     " UNIQUE(slug, num, at_iso, price_ton))")
+    gs._schema_ready_for = None
+    check("запись в старую базу без колонки не падает",
+          gs.record_sale(_s75) is True)
+    with gs.db_connect() as _c75b:
+        _got75 = _c75b.execute(
+            "SELECT owner_name, gift_id FROM sales").fetchone()
+    check("колонка добавлена и заполнена",
+          _got75["owner_name"] == "Po***l"
+          and _got75["gift_id"] == "5900012238260930601")
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osales75, _osch75
+
+
+# --- ТА ЖЕ МОДЕЛЬ НА РАЗНЫХ МАРКЕТАХ (09.10.2026) -------------------------
+# Таблица по маркетам сравнивает их по ВСЕМ сделкам, то есть вместе с
+# составом: маркет, где чаще торгуют дорогими моделями, окажется дороже,
+# ничего не сказав о спросе. Поэтому модель сравнивается сама с собой.
+_osales76, _osch76 = gs.DB_PATH, gs._schema_ready_for
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "sales76.db")
+    gs._schema_ready_for = None
+    # «Rich» продаётся только на getgems и стоит дорого — если бы состав не
+    # исключался, getgems вышел бы дорогим из-за неё одной.
+    for _k in range(3):
+        gs.record_sale(_sale72("C", 500 + _k, "Rich", "getgems", "50",
+                               "50", at=f"r{_k}"))
+    # «Common» продаётся на обоих: 5.0 на getgems против 4.0 на mrkt.
+    for _k in range(3):
+        gs.record_sale(_sale72("C", 600 + _k, "Common", "getgems", "5.0",
+                               "5.0", at=f"g{_k}"))
+        gs.record_sale(_sale72("C", 700 + _k, "Common", "mrkt", "4.0",
+                               "4.0", at=f"m{_k}"))
+    _h76 = _Collect72()
+    gs.log.addHandler(_h76)
+    try:
+        gs.sales_report()
+    finally:
+        gs.log.removeHandler(_h76)
+    _out76 = "\n".join(_h76.lines)
+    check("сравнение того же самого напечатано",
+          "ТО ЖЕ САМОЕ НА РАЗНЫХ МАРКЕТАХ" in _out76
+          and "по МОДЕЛИ И ФОНУ" in _out76)
+    # 5.0 / 4.0 = 1.25 у getgems и 0.8 у mrkt, и ТОЛЬКО по «Common»:
+    # модель, виденная на одном маркете, в сравнение не идёт вовсе.
+    _gg76 = next((l for l in _h76.lines if "getgems" in l and "x1.250" in l), "")
+    _mk76 = next((l for l in _h76.lines if "mrkt" in l and "x0.800" in l), "")
+    check("дорогая модель с одного маркета в сравнение не попала",
+          bool(_gg76) and " 1 " in _gg76)
+    check("обратная сторона посчитана симметрично", bool(_mk76))
+    # Знак устойчивее величины: по 16 наблюдениям медиана скачет, а
+    # «сколько из них выше единицы» остаётся утверждением о направлении.
+    check("счёт знаков напечатан рядом с медианой",
+          "выше 1" in _out76 and "1/1" in _gg76)
+    # «10 из 16» выпадает само по себе почти в четверти случаев — и по
+    # этой колонке решают, тратить ли деньги: вероятность стоит рядом.
+    check("перекос монетки назван случайностью",
+          abs(gs.sign_test_p(10, 16) - 0.2272) < 0.001)
+    check("сильный перекос случайностью не назван",
+          gs.sign_test_p(148, 202) < 0.0001)
+    check("сторона берётся та, в которую перекос",
+          gs.sign_test_p(57, 205) == gs.sign_test_p(148, 205))
+    check("пустая выборка ничего не доказывает", gs.sign_test_p(0, 0) == 1.0)
+    check("неисключённое названо и после второй таблицы",
+          "узор и номер" in _out76 and "КАК ДОЛГО лот ждал" in _out76)
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osales76, _osch76
+
+
+# --- ЛОГ НЕ ПАДАЕТ НА СИМВОЛЕ ВНЕ КОДИРОВКИ ВЫВОДА (живой баг 10.10.2026) --
+# `run.bat --seetg-arb > arb.txt` на Windows положил КАЖДУЮ строку со
+# стрелкой: chcp 65001 меняет кодировку КОНСОЛИ, а при перенаправлении в
+# файл Python берёт локаль (cp1251), где «→» нет.
+_src77 = open("gift_sniper.py", encoding="utf-8").read()
+_ms77 = _src77.split("def _make_log_stream_safe")[1].split("\ndef ")[0]
+# В файл — UTF-8 (его открывают блокнотом), в консоль кодировку НЕ трогаем:
+# консоль бывает в cp866, и UTF-8 превратил бы кириллицу в мусор.
+check("в файл лог пишется в UTF-8",
+      'reconfigure(encoding="utf-8"' in _ms77)
+check("кодировка консоли не трогается, только errors",
+      'reconfigure(errors="replace")' in _ms77)
+
+
+class _Stream77:
+    def __init__(self, tty):
+        self._tty, self.enc, self.err = tty, None, None
+
+    def isatty(self):
+        return self._tty
+
+    def reconfigure(self, encoding=None, errors=None):
+        self.enc, self.err = encoding, errors
+
+
+_f77 = gs._make_log_stream_safe(_Stream77(False))
+check("перенаправление в файл -> utf-8 и замена символов",
+      _f77.enc == "utf-8" and _f77.err == "replace")
+_c77 = gs._make_log_stream_safe(_Stream77(True))
+check("консоль -> кодировка прежняя, но без падения",
+      _c77.enc is None and _c77.err == "replace")
+
+
+class _NoReconf77:
+    def isatty(self):
+        return False
+
+
+# Поток без reconfigure (подменён тестом, чужая труба) не должен ронять
+# импорт: диагностика, которая падает сама, хуже её отсутствия.
+check("поток без reconfigure не роняет запуск",
+      gs._make_log_stream_safe(_NoReconf77()) is not None)
+
+# --- ОТЧЁТ АРБИТРАЖА РЕШАЕТ ПО ЛЕСТНИЦЕ, А НЕ ПО БОРДЕ -------------------
+# Борда даёт floor каждого маркета, но не говорит, сколько лотов стоит
+# МЕЖДУ ними. Живой случай Candy Canes: борда обещала +3.29, лестница −0.17.
+_ar77 = _src77.split("def seetg_arb_report")[1].split("\ndef ")[0]
+check("строка по борде названа предварительной", "ПРЕДВАРИТЕЛЬНО" in _ar77)
+check("отчёт зовёт ту же проверку лестницей, что и уведомления",
+      "seetg_confirm_pair(" in _ar77)
+check("в итоге названы оба числа — по борде и по лестнице",
+      "подтверждено" in _ar77 and "ПО ЛЕСТНИЦЕ" in _ar77)
+
+
+# =============================================================================
+# [78] ЦЕНЫ СДЕЛОК ПРОТИВ ЦЕН ПРОСЬБЫ: СВЕРКА ПЛАНА ВЫСТАВЛЕНИЯ
+# =============================================================================
+# Лестница see.tg отвечает ценами ПРОСЬБЫ («купить 3.90, встать под 5.10»),
+# а с 09.10.2026 в проекте впервые есть ЦЕНЫ СДЕЛОК. Прогон 10.10.2026 дал
+# связку JesterHat «Lemon Spin»: купить 3.8964 на mrkt, встать под 5.10 —
+# то есть выставить за 4.947, при измеренной медиане сделок 3.6-3.8.
+print("\n[78] Сверка плана выставления с ценами СДЕЛОК")
+
+_o78, _osch78 = gs.DB_PATH, gs._schema_ready_for
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "fact78.db")
+    gs._schema_ready_for = None
+    # Шесть сделок по модели: четыре настоящих и ДВА ПОВТОРА одного предмета
+    # по одной цене (измеренный артефакт portals — 104 строки на предмет).
+    for _a in [
+        ("JesterHat", 501, "Lemon Spin", "mrkt", "3.70", "3.65", "t1"),
+        ("JesterHat", 502, "Lemon Spin", "portals", "3.80", "3.65", "t2"),
+        ("JesterHat", 503, "Lemon Spin", "mrkt", "4.20", "3.65", "t3"),
+        ("JesterHat", 504, "Lemon Spin", "portals", "3.60", "3.65", "t4"),
+        ("JesterHat", 505, "Lemon Spin", "portals", "0.50", "3.65", "t5"),
+        ("JesterHat", 505, "Lemon Spin", "portals", "0.50", "3.65", "t6"),
+    ]:
+        gs.record_sale(_sale72(*_a))
+
+    _f78 = gs.model_sales_fact("JesterHat", "Lemon Spin")
+    # ПОВТОР СЧИТАЕТСЯ ОДИН РАЗ. Без свёртки медиана уехала бы вниз на
+    # артефакте, и предупреждение срабатывало бы на верных связках.
+    check("повтор предмета по одной цене считается одной сделкой",
+          _f78["trades"] == 5 and _f78["rows"] == 6)
+    # 0.50, 3.60, 3.70, 3.80, 4.20 — серединная 3.70. Повтор по 0.50 вошёл
+    # ОДНОЙ строкой: оставь оба, и медиана съехала бы на 3.60.
+    check("медиана по сделкам считается по представителям",
+          _f78["median"] == Decimal("3.70"))
+    check("максимум — наблюдённая цена, а не вычисленная",
+          _f78["max"] == Decimal("4.20"))
+
+    # ГЛАВНОЕ ЧИСЛО — СЧЁТ, А НЕ МЕДИАНА: дошёл ли кто-нибудь до нашей цены.
+    _hi78 = gs.model_sales_lines("JesterHat", "Lemon Spin", Decimal("4.947"))
+    _t78 = " | ".join(_hi78)
+    check("план выше всех сделок — сказано, что не ушла НИ ОДНА",
+          "НИ ОДНА" in _t78 and "4.95" in _t78)
+    check("рядом с предупреждением названы медиана и число сделок",
+          "медиана" in _t78 and "5" in _t78)
+
+    _lo78 = gs.model_sales_lines("JesterHat", "Lemon Spin", Decimal("3.70"))
+    _tl78 = " | ".join(_lo78)
+    check("план ниже части сделок — назван счёт K из N",
+          "3 из 5" in _tl78 and "НИ ОДНА" not in _tl78)
+
+    # ПУСТАЯ ЗАПИСЬ НАЗЫВАЕТСЯ ПУСТОЙ, а не выдаёт нулевую медиану: за
+    # восемь часов потока две коллекции из двенадцати не дали ни сделки,
+    # и это измерение их оборота, а не поломка.
+    _no78 = " | ".join(gs.model_sales_lines("JesterHat", "Нет такой",
+                                           Decimal("5")))
+    check("нет сделок по модели — сказано прямо, без числа",
+          "неизвестно" in _no78 and "медиана" not in _no78)
+
+    # СЧЁТ ПО ПРЕДСТАВИТЕЛЯМ — ОДНА ФУНКЦИЯ НА ВСЕХ ЧИТАТЕЛЕЙ. Десять раз в
+    # проекте исправление в одной точке не закрывало класс ошибки, потому
+    # что у значения было несколько потребителей.
+    with gs.db_connect() as _c78:
+        _rows78 = _c78.execute("SELECT * FROM sales").fetchall()
+    check("свёртка повторов вынесена в общую функцию",
+          len(gs._sale_reps(_rows78)) == 5)
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _o78, _osch78
+
+_src78 = open("gift_sniper.py", encoding="utf-8").read()
+check("sales_report зовёт ту же свёртку, а не свою копию",
+      "_sale_reps(rows)" in _src78.split("def sales_report")[1]
+      .split("\ndef ")[0])
+# У значения ДВА пути в глаза владельца: уведомление и ручной отчёт. Сверка
+# обязана стоять в обоих — иначе это одиннадцатый случай того же класса.
+check("сверка с деньгами стоит в уведомлении о связке",
+      "model_sales_lines(slug, pair[\"model\"], sale)" in _src78)
+check("сверка с деньгами стоит и в ручном отчёте",
+      "model_sales_lines(" in _src78.split("def seetg_arb_report")[1]
+      .split("\ndef ")[0])
+# Локальная БД: ни одного запроса к see.tg, поэтому можно на каждую пару.
+_mf78 = _src78.split("def model_sales_fact")[1].split("\ndef ")[0]
+check("сверка по деньгам не ходит в сеть",
+      "_seetg_get" not in _mf78 and "requests" not in _mf78)
+
+
+# =============================================================================
+# [79] ОТЧЁТ В ФАЙЛ ПИШЕТ БОТ, А НЕ ОБОЛОЧКА
+# =============================================================================
+# Одна и та же команда сломалась дважды за день 10.10.2026, и по-разному:
+#   cmd        -> Python писал кодировку локали (cp1251), где нет «→», и
+#                 отчёт стал трейсбеками UnicodeEncodeError;
+#   PowerShell -> Python писал верный UTF-8, но PowerShell декодировал его
+#                 по cp866 и перекодировал в UTF-16LE: файл начался с BOM
+#                 ff fe, кириллица пришла двойным мусором.
+# Второй случай нашей кодировкой не лечится вовсе: перекодирует ПОТРЕБИТЕЛЬ,
+# уже после нас. Значит поток оболочке отдавать нельзя.
+print("\n[79] Лог-файл: UTF-8 без BOM, без ANSI, дописывает")
+
+_lf79 = os.path.join(_tmpdir, "report79.txt")
+check("лог-файл открылся", gs.add_log_file(_lf79) is True)
+gs.log.info(f"{gs._Color.GREY}«Bitcoin»: mrkt 49.98 \u2192 getgems 63.9{gs._Color.RESET}")
+gs.log.info("\U0001F4C8 ЧИСТЫМИ +1.79 TON")
+_raw79 = open(_lf79, "rb").read()
+
+# BOM БЫТЬ НЕ ДОЛЖНО: именно по нему и опознали, что файл писал PowerShell.
+check("файл без BOM", not _raw79.startswith(b"\xff\xfe")
+      and not _raw79.startswith(b"\xef\xbb\xbf"))
+_txt79 = _raw79.decode("utf-8")      # упадёт, если кодировка не UTF-8
+check("стрелка и эмодзи уцелели",
+      "\u2192" in _txt79 and "\U0001F4C8" in _txt79)
+# Двойной мусор PowerShell («╨Р╤А╨▒╨╕╤В╤А╨░╨╢» вместо «Арбитраж») узнаётся
+# по тому, что кириллица в файле НЕ читается как кириллица.
+check("кириллица читается, а не двойным мусором",
+      "ЧИСТЫМИ" in _txt79 and "Bitcoin" in _txt79 and "╨" not in _txt79)
+# ANSI в файле — мусор: блокнот рисует его как «[90m14:55:27[0m».
+check("цветовых кодов в файле нет", "\x1b[" not in _txt79)
+check("в консоли цвет остался", gs._Color.GREY in
+      gs._ColorFormatter().format(logging.LogRecord(
+          "x", logging.INFO, "f", 1, "m", None, None)))
+
+# ДОПИСЫВАЕТ, А НЕ ПЕРЕЗАПИСЫВАЕТ: go.bat склеивает в один отчёт три
+# ПРОГОНА подряд, каждый — отдельный запуск Python. Чистка файла стоит в
+# самом .bat, то есть видна глазами.
+_n79 = len(_txt79)
+gs.log.handlers = [h for h in gs.log.handlers
+                   if not isinstance(h, logging.FileHandler)]
+gs.add_log_file(_lf79)
+gs.log.info("второй прогон")
+_txt79b = open(_lf79, encoding="utf-8").read()
+check("второй запуск дописывает, а не затирает",
+      len(_txt79b) > _n79 and "ЧИСТЫМИ" in _txt79b and "второй прогон" in _txt79b)
+
+# Отчёт не пишется — прогон НЕ прерывается: он стоит запросов к see.tg, и
+# бросить его из-за файла значит потратить квоту зря.
+check("неоткрываемый путь не роняет прогон",
+      gs.add_log_file(os.path.join(_tmpdir, "нет-такого-каталога", "x.txt"))
+      is False)
+gs.log.handlers = [h for h in gs.log.handlers
+                   if not isinstance(h, logging.FileHandler)]
+
+_src79 = open("gift_sniper.py", encoding="utf-8").read()
+check("--log-file есть в разборе аргументов", '"--log-file"' in _src79)
+# Первые строки отчёта (бюджет, источник, ритм) решают, как читать
+# остальное: файл обязан открываться ДО любого режима.
+_m79 = _src79.split('args = parse_args()')[1][:400]
+check("файл открывается до запуска режимов",
+      "add_log_file(args.log_file)" in _m79)
+# .bat'ы должны звать --log-file, а не перенаправление: иначе кодировку
+# снова задаёт оболочка (одиннадцатый случай «несколько потребителей»).
+for _b79 in ("deploy/arb.bat", "deploy/go.bat"):
+    _t79 = open(_b79, encoding="utf-8").read()
+    check(f"{_b79} пишет отчёт через --log-file", "--log-file" in _t79)
+    check(f"{_b79} не перенаправляет вывод бота",
+          ">> \"%LOG%\" 2>&1" not in _t79 and "> \"%LOG%\" 2>&1" not in _t79)
+    # Правила Windows из этого проекта: в .bat только латиница (cmd в cp866
+    # покажет кириллицу мусором), и никаких «)» внутри echo — она закрывает
+    # блок if ( ... ) else ( ... ).
+    check(f"{_b79} только латиница",
+          all(ord(c) < 128 for c in _t79))
+    for _ln79 in _t79.splitlines():
+        _l = _ln79.strip().lower()
+        if _l.startswith("echo") and ")" in _ln79 and "^)" not in _ln79:
+            check(f"{_b79}: скобка в echo закрыла бы блок", False)
+
+
+# =============================================================================
+# [80] СПИСОК КОЛЛЕКЦИЙ: КАЖДЫЙ АДРЕС НАЗВАН ПО ИМЕНИ
+# =============================================================================
+# Список — двенадцать (теперь одиннадцать) строк по 48 символов, и по нему
+# невозможно сказать, какая из них какая коллекция. Когда 10.10.2026
+# понадобилось убрать `GingerCookie`, адрес пришлось ВЫВОДИТЬ: отчёт
+# печатает слаг заголовком и обходит список по порядку, значит двенадцатый
+# заголовок — двенадцатый адрес. Вывод верный, но это вывод, а в этом
+# проекте ровно так и появлялись неверные утверждения.
+# Поэтому соответствие записано в сам `settings.bat`, а тест стережёт,
+# чтобы оно не разошлось со списком при добавлении коллекции.
+print("\n[80] Адреса коллекций названы по имени в settings.bat")
+
+_sb80 = open("deploy/settings.bat", encoding="utf-8").read()
+_act80 = [a for a in _sb80.split("\nset TARGET_COLLECTIONS=")[1]
+          .split("\n")[0].split(",") if a.strip()]
+check("активный список непуст", len(_act80) >= 1)
+# Имя берётся из строки-комментария вида «REM   1. SurgeBoard EQ...».
+_named80 = {}
+for _ln80 in _sb80.splitlines():
+    _p80 = _ln80.split()
+    # «REM   1. SurgeBoard EQ...» — четыре поля, последнее начинается с EQ.
+    if len(_p80) == 4 and _p80[0] == "REM" and _p80[3].startswith("EQ"):
+        _named80[_p80[2]] = _p80[3]
+_missing80 = [a for a in _act80 if a not in _named80.values()]
+check("каждый активный адрес назван в таблице имён", not _missing80)
+check("имена не повторяются", len(set(_named80)) == len(_named80))
+
+# Убранная коллекция НЕ удалена из файла: вернуть её — дописать адрес, а не
+# искать его заново. Тот же приём, что со списком из 32.
+check("GingerCookie убрана из активного списка",
+      "EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG" not in _act80)
+check("её адрес сохранён в комментарии для возврата",
+      "EQBCe75G0AhjqC64B7H_BHP0wgfONX_x98rszmsEwndDVAjG" in _sb80)
+# Причина должна быть НАЗВАНА: «ноль сделок за 8 часов» — измерение, и
+# без него следующая сессия вернёт коллекцию как «случайно выпавшую».
+check("причина удаления записана рядом",
+      "NOL sdelok" in _sb80 or "nol sdelok" in _sb80.lower())
+
+# Whitelist раскрывается СРАЗУ, поэтому обязан стоять ПОСЛЕ выбора списка
+# (эта ошибка уже была 22.09.2026: список сменили, whitelist остался старый).
+check("whitelist стоит после выбора списка",
+      _sb80.rindex("set TARGET_COLLECTIONS=")
+      < _sb80.index("set COLLECTION_WHITELIST="))
+
+
+# =============================================================================
+# [81] ВОРОНКА СВЯЗОК: ОТВЕТ НА «СТАЛО НАХОДИТЬСЯ МЕНЬШЕ»
+# =============================================================================
+# Каждый отказ в арбитраже считался и раньше по отдельности, но ни одно число
+# не говорило, сколько пар было ДО отказов, — и вопрос «почему меньше» можно
+# было решить только чтением кода. Задаёт его владелец с телефона.
+#
+# ТРИ СОСТОЯНИЯ, И ОНИ НЕ ДОЛЖНЫ ВЫГЛЯДЕТЬ ОДИНАКОВО: не смотрели (ритм
+# растянут квотой), смотрели и пар нет (рынок сошёлся), пары были и осыпались
+# на воротах. Ноль связок в телефоне у всех трёх один и тот же, а решения
+# разные: первое проходит к полуночи UTC само, второе не лечится вовсе,
+# третье лечится только списком коллекций.
+print("\n[81] Воронка связок: почему стало находиться меньше")
+
+_o81 = (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.SEETG_ONLY,
+        gs.SEETG_TOKEN, gs.requests, gs.seetg_confirm_pair, gs._last_heartbeat)
+try:
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "123:test", "42"
+    gs.SEETG_ONLY, gs.SEETG_TOKEN = True, "1:tok"
+    gs.requests = _CaptureRequests()
+
+    def _hb81():
+        """Сводка принудительно; возвращает её текст."""
+        _sent.clear()
+        gs._last_heartbeat = 0.0
+        gs.notify_heartbeat([], force=True)
+        return _sent[-1][1]["text"]
+
+    gs._seetg_rounds = gs._seetg_pairs_total = gs._seetg_pairs_looked = 0
+    gs._seetg_above_thr = gs._seetg_ladder_cut = gs._seetg_arb_sent = 0
+    _t81 = _hb81()
+    check("прогонов не было — сказано, что НЕ СМОТРЕЛИ",
+          "не смотрели" in _t81, _t81)
+    check("и пустым рынком это не объявлено", "НЕТ ВОВСЕ" not in _t81, _t81)
+
+    # Смотрели, а положительных пар нет — это ответ РЫНКА, и он другой.
+    gs._seetg_rounds = 11
+    _t81b = _hb81()
+    check("смотрели, а пар нет — отдельное состояние",
+          "НЕТ ВОВСЕ" in _t81b, _t81b)
+    check("и названо число прогонов", "11" in _t81b, _t81b)
+
+    # Полная воронка: по этой строке владелец видит, где именно осыпалось.
+    gs._seetg_rounds, gs._seetg_pairs_total = 11, 37
+    gs._seetg_pairs_looked, gs._seetg_above_thr = 15, 6
+    gs._seetg_ladder_cut, gs._seetg_arb_sent = 4, 2
+    _t81c = _hb81()
+    check("воронка названа: пары и осмотренные",
+          "пар по борде 37" in _t81c and "смотрели 15" in _t81c, _t81c)
+    check("названы порог, срез лестницей и отправленное",
+          "прошли 6" in _t81c and "срезала 4" in _t81c
+          and "в телефон 2" in _t81c, _t81c)
+    check("счётчики обнулены после сводки",
+          (gs._seetg_rounds, gs._seetg_pairs_total, gs._seetg_pairs_looked,
+           gs._seetg_above_thr, gs._seetg_ladder_cut, gs._seetg_arb_sent)
+          == (0, 0, 0, 0, 0, 0))
+
+    # ЛЕСТНИЦА СРЕЗАЛА — ГЛАВНЫЙ ОТКАЗ ПОСЛЕ 10.10.2026 (51 пара по борде ->
+    # 9 выживших), и он единственный, у которого не было числа вовсе:
+    # «Ближе всего к связке» печатает три лучших, а сколько их было — нет.
+    gs._seetg_arb_sent_ts.clear()
+    gs._seetg_ladder_cut = 0
+    gs.seetg_confirm_pair = lambda slug, model, pair: (
+        {"buy": {"price": Decimal("5"), "market": "mrkt"},
+         "sell": {"price": Decimal("5.1"), "market": "mrkt"},
+         "sell_floor": Decimal("5.1"), "profit": Decimal("-0.2"),
+         "roi": Decimal("-4"), "same_market": True,
+         "ladder": [], "top": None, "note": ""}, "")
+    _pair81 = {"model": "M", "buy_floor": Decimal("5"),
+               "sell_floor": Decimal("5.1"), "buy_market": "mrkt",
+               "sell_market": "mrkt", "markets": []}
+    check("срезанная лестницей пара в телефон не идёт",
+          gs.notify_seetg_arb("X", "S", _pair81) is False)
+    check("и она посчитана для воронки",
+          gs._seetg_ladder_cut == 1, gs._seetg_ladder_cut)
+
+    # ПОТОЛОК НА КОЛЛЕКЦИЮ — единственная ручка, которая режет УЖЕ прошедшее
+    # порог, и крутят её именно когда уведомлений хочется больше. Молча
+    # выброшенная вторая пара скрывала, что потолок вообще что-то режет.
+    gs._seetg_cap_skips = 7
+    _t81d = _hb81()
+    check("отброшенное потолком на коллекцию названо",
+          "вторых по коллекции не отправлено: 7" in _t81d, _t81d)
+    # ЧЕСТНО НАЗВАНО ПОТОЛКОМ ДОБАВКИ: банк, лестницу и выдержку эти пары
+    # ещё не проходили, поэтому обещать по этому числу уведомления нельзя.
+    check("и названо потолком добавки, а не обещанием",
+          "ПОТОЛОК добавки" in _t81d, _t81d)
+    check("счётчик потолка обнулён после сводки",
+          gs._seetg_cap_skips == 0, gs._seetg_cap_skips)
+finally:
+    (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID, gs.SEETG_ONLY,
+     gs.SEETG_TOKEN, gs.requests, gs.seetg_confirm_pair,
+     gs._last_heartbeat) = _o81
+    gs._seetg_rounds = gs._seetg_pairs_total = gs._seetg_pairs_looked = 0
+    gs._seetg_above_thr = gs._seetg_ladder_cut = gs._seetg_arb_sent = 0
+    gs._seetg_cap_skips = 0
+    gs._seetg_arb_sent_ts.clear()
+    gs._seetg_near.clear()
+
+# --- ССЫЛКА ВМЕСТО АДРЕСА: ТУПИК ЖИВОЙ ПОКУПКИ 10.10.2026 -----------------
+# Лот куплен по уведомлению, в котором САМО сказано «адреса нет, отметить
+# --bought АДРЕС ЦЕНА». Команда без адреса невыполнима, и купленный лот не
+# попадал в учёт ВООБЩЕ. Ссылка `Slug-N` в сообщении есть всегда.
+check("ссылка see.tg опознаётся как ссылка",
+      gs._looks_like_seetg_ref("JesterHat-110668") is True)
+check("адрес ссылкой не считается",
+      gs._looks_like_seetg_ref(
+          "EQDLda715GocP1sYDkCecPhO7eFNsNvARD4pumbGSan96wvZ") is False)
+check("мусор ссылкой не считается",
+      gs._looks_like_seetg_ref("-5") is False
+      and gs._looks_like_seetg_ref("JesterHat-abc") is False)
+
+_oget82 = gs.seetg_get
+try:
+    # Их карточка отдаёт giftAddress — это ИЗМЕРЕНО: тем же полем
+    # `seetg_prove_slug()` доказывает слаг.
+    _addr82 = "0:" + "ab" * 32
+    gs.seetg_get = lambda path, params=None: (
+        {"gift": {"giftAddress": _addr82}} if path == "/gift/JesterHat-110668"
+        else {})
+    _got82, _why82 = gs.seetg_gift_address("JesterHat-110668")
+    check("адрес берётся из карточки see.tg",
+          _got82 == gs.normalize_ton_address(_addr82), (_got82, _why82))
+    # Нет поля — НЕ выдумываем адрес, а называем причину и печатаем сырьё.
+    gs.seetg_get = lambda path, params=None: {"gift": {}}
+    _none82, _whynone82 = gs.seetg_gift_address("X-1")
+    check("без giftAddress возвращается None с причиной",
+          _none82 is None and "giftAddress" in _whynone82, _whynone82)
+
+    # --bought принимает ссылку и открывает позицию по разрешённому адресу.
+    gs.seetg_get = lambda path, params=None: {"gift": {"giftAddress": _addr82}}
+    _pos82 = gs.record_manual_purchase("JesterHat-110668", "3.99")
+    check("покупка по ссылке занесена", _pos82 is not None, _pos82)
+    # ПОВТОР ТОГО ЖЕ ЛОТА ВТОРОЙ ПОЗИЦИИ НЕ ОТКРЫВАЕТ — то же правило, что у
+    # кнопки «Купил»: в учёте не должно появиться лота, которого нет.
+    check("повтор по ссылке второй позиции не открывает",
+          gs.record_manual_purchase("JesterHat-110668", "3.99") is None)
+    if _pos82:
+        gs.close_position(_pos82, Decimal("4.84"))
+finally:
+    gs.seetg_get = _oget82
+
+# В уведомлении при отсутствии адреса — РАБОЧАЯ строка, а не плейсхолдер.
+_src82 = open("gift_sniper.py", encoding="utf-8").read()
+_notif82 = _src82.split("def notify_seetg_arb")[1].split("\ndef ")[0]
+check("уведомление даёт команду со ссылкой, а не «АДРЕС ЦЕНА»",
+      "--bought {slug}-{buy['num']}" in _notif82)
+
+# ТА ЖЕ ВОРОНКА В РУЧНОМ ОТЧЁТЕ. У значения два читателя — сводка в телефоне
+# и `--seetg-arb` на экране, — и поставить её в одном значило бы повторить
+# класс ошибки, который в этом проекте выжил одиннадцать раз.
+_src81 = open("gift_sniper.py", encoding="utf-8").read()
+_rep81 = _src81.split("def seetg_arb_report")[1].split("\ndef ")[0]
+# Подстроки берутся ТАКИМИ, КАК ОНИ ЛЕЖАТ В ИСХОДНИКЕ: f-строка разбита по
+# строкам, и «по карману и потолку» целиком в тексте не встречается — проверка
+# на него упала бы, хотя отчёт верен. Сверяем то, что непрерывно.
+check("ручной отчёт называет воронку целиком",
+      "ROI >= " in _rep81 and "карману и потолку" in _rep81
+      and "подтверждено лестницей" in _rep81)
+# Потолок считается ТЕМ ЖЕ owner_can_pay(): вторая формула разошлась бы с
+# первой в первый же день, и отчёт обещал бы то, чего в телефон не придёт.
+check("потолок в отчёте считается общей функцией",
+      "owner_can_pay(" in _rep81)
+check("второй формулы потолка в отчёте нет",
+      "MAX_NOTIFY_PRICE_TON >" not in _rep81)
+
+
+# =============================================================================
+print("\n" + "=" * 60)
+if _failures:
+    print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
+    sys.exit(1)
+print("ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ")
+sys.exit(0)
