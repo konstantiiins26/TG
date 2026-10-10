@@ -6255,6 +6255,60 @@ finally:
     gs.DB_PATH, gs._schema_ready_for = _osales76, _osch76
 
 
+# --- ЛОГ НЕ ПАДАЕТ НА СИМВОЛЕ ВНЕ КОДИРОВКИ ВЫВОДА (живой баг 10.10.2026) --
+# `run.bat --seetg-arb > arb.txt` на Windows положил КАЖДУЮ строку со
+# стрелкой: chcp 65001 меняет кодировку КОНСОЛИ, а при перенаправлении в
+# файл Python берёт локаль (cp1251), где «→» нет.
+_src77 = open("gift_sniper.py", encoding="utf-8").read()
+_ms77 = _src77.split("def _make_log_stream_safe")[1].split("\ndef ")[0]
+# В файл — UTF-8 (его открывают блокнотом), в консоль кодировку НЕ трогаем:
+# консоль бывает в cp866, и UTF-8 превратил бы кириллицу в мусор.
+check("в файл лог пишется в UTF-8",
+      'reconfigure(encoding="utf-8"' in _ms77)
+check("кодировка консоли не трогается, только errors",
+      'reconfigure(errors="replace")' in _ms77)
+
+
+class _Stream77:
+    def __init__(self, tty):
+        self._tty, self.enc, self.err = tty, None, None
+
+    def isatty(self):
+        return self._tty
+
+    def reconfigure(self, encoding=None, errors=None):
+        self.enc, self.err = encoding, errors
+
+
+_f77 = gs._make_log_stream_safe(_Stream77(False))
+check("перенаправление в файл -> utf-8 и замена символов",
+      _f77.enc == "utf-8" and _f77.err == "replace")
+_c77 = gs._make_log_stream_safe(_Stream77(True))
+check("консоль -> кодировка прежняя, но без падения",
+      _c77.enc is None and _c77.err == "replace")
+
+
+class _NoReconf77:
+    def isatty(self):
+        return False
+
+
+# Поток без reconfigure (подменён тестом, чужая труба) не должен ронять
+# импорт: диагностика, которая падает сама, хуже её отсутствия.
+check("поток без reconfigure не роняет запуск",
+      gs._make_log_stream_safe(_NoReconf77()) is not None)
+
+# --- ОТЧЁТ АРБИТРАЖА РЕШАЕТ ПО ЛЕСТНИЦЕ, А НЕ ПО БОРДЕ -------------------
+# Борда даёт floor каждого маркета, но не говорит, сколько лотов стоит
+# МЕЖДУ ними. Живой случай Candy Canes: борда обещала +3.29, лестница −0.17.
+_ar77 = _src77.split("def seetg_arb_report")[1].split("\ndef ")[0]
+check("строка по борде названа предварительной", "ПРЕДВАРИТЕЛЬНО" in _ar77)
+check("отчёт зовёт ту же проверку лестницей, что и уведомления",
+      "seetg_confirm_pair(" in _ar77)
+check("в итоге названы оба числа — по борде и по лестнице",
+      "подтверждено" in _ar77 and "ПО ЛЕСТНИЦЕ" in _ar77)
+
+
 # =============================================================================
 print("\n" + "=" * 60)
 if _failures:

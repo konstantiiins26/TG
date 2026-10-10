@@ -512,7 +512,46 @@ class _ColorFormatter(logging.Formatter):
 
 log = logging.getLogger("gift_sniper")
 log.setLevel(logging.INFO)
-_handler = logging.StreamHandler(sys.stdout)
+def _make_log_stream_safe(stream):
+    """
+    Лог не должен падать на символе, которого нет в кодировке вывода.
+
+    ЖИВОЙ СЛУЧАЙ 10.10.2026: `deploy\\run.bat --seetg-arb > arb.txt` на
+    Windows положил КАЖДУЮ строку со стрелкой «→». `chcp 65001` тут не
+    помогает: он меняет кодировку КОНСОЛИ, а при перенаправлении в ФАЙЛ
+    Python берёт кодировку локали (cp1251), где стрелки нет. В отчёте
+    вместо полусотни строк оказались трейсбеки `UnicodeEncodeError`, а сам
+    текст — в поле `Message:` внутри них.
+
+    Два разных случая лечатся по-разному, поэтому и ветки две:
+
+    - **вывод в ФАЙЛ** — ставим UTF-8: файл потом открывают блокнотом и
+      шлют в чат, и он обязан быть читаемым целиком;
+    - **вывод в КОНСОЛЬ** — кодировку НЕ трогаем. Консоль может быть в
+      cp866, и UTF-8 превратил бы всю кириллицу в мусор; ставим только
+      `errors="replace"`, чтобы редкий символ стал «?», а не уронил строку.
+
+    Правило то же по духу, что «в .bat только латиница»: кодировка вывода
+    на Windows — не мелочь оформления, она решает, увидит ли владелец
+    отчёт вообще.
+    """
+    try:
+        to_file = not stream.isatty()
+    except Exception:                                   # noqa: BLE001
+        to_file = False
+    try:
+        if to_file:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        else:
+            stream.reconfigure(errors="replace")
+    except Exception:                                   # noqa: BLE001
+        # Поток без reconfigure (подменён тестом, перенаправлен в трубу
+        # чужим кодом) — не повод падать при импорте.
+        pass
+    return stream
+
+
+_handler = logging.StreamHandler(_make_log_stream_safe(sys.stdout))
 _handler.setFormatter(_ColorFormatter())
 log.addHandler(_handler)
 
@@ -5861,7 +5900,7 @@ def seetg_arb_report(limit_collections: int = 0):
     log.info(f"{_Color.BOLD}Арбитраж маркетов по see.tg: {len(colls)} "
              f"коллекций. Бюджет: осталось {seetg_budget_left()} из "
              f"{SEETG_DAILY_BUDGET}.{_Color.RESET}")
-    total = 0
+    total, shown = 0, 0
     for coll in colls:
         key = f"seetg_slug:{normalize_ton_address(coll) or coll}"
         slug = meta_get(key)
@@ -5895,14 +5934,48 @@ def seetg_arb_report(limit_collections: int = 0):
             continue
         for pair in pairs[:SEETG_ARB_LOG_TOP]:
             total += 1
-            log.info(f"  «{pair['model']}»: купить на {pair['buy_market']} "
-                     f"{pair['buy_floor']} (лотов {pair['buy_n']}) → продать "
-                     f"на {pair['sell_market']} {pair['sell_floor']} (лотов "
-                     f"{pair['sell_n']}) → {pair['profit']:+.4f} TON, "
-                     f"ROI {pair['roi']}%")
+            # ПО БОРДЕ — ПРЕДВАРИТЕЛЬНО, И ЭТО НАЗВАНО. Борда даёт floor
+            # КАЖДОГО маркета, но не говорит, сколько лотов стоит МЕЖДУ
+            # ними: между «mrkt 4.40» и «portals 6.48» могут стоять
+            # шестнадцать лотов самого mrkt по 4.5-5.0. Живой случай Candy
+            # Canes: борда обещала +3.29, лестница дала −0.17.
+            log.info(f"  {_Color.GREY}«{pair['model']}» по борде "
+                     f"(ПРЕДВАРИТЕЛЬНО): {pair['buy_market']} "
+                     f"{pair['buy_floor']} → {pair['sell_market']} "
+                     f"{pair['sell_floor']} → {pair['profit']:+.4f} TON, "
+                     f"ROI {pair['roi']}%{_Color.RESET}")
             log.info(f"      по маркетам: {_seetg_markets_line(pair['markets'])}")
+            # ЛЕСТНИЦА — ТО ЖЕ, ЧТО ВИДИТ ПОКУПАТЕЛЬ, и решение по ней.
+            # Один запрос на пару; расход печатается в итоге отчёта.
+            try:
+                conf, why = seetg_confirm_pair(slug, pair["model"], pair)
+            except RateLimited as e:
+                log.error(f"      {e}")
+                break
+            except Exception as e:                      # noqa: BLE001
+                log.warning(f"      лестницу не получили: {e}")
+                continue
+            if conf is None:
+                log.info(f"      {_Color.YELLOW}связки нет: {why}"
+                         f"{_Color.RESET}")
+                continue
+            shown += 1
+            ok = conf["roi"] >= SEETG_ARB_MIN_ROI_PCT
+            col = _Color.GREEN if ok else _Color.YELLOW
+            log.info(f"      {col}ПО ЛЕСТНИЦЕ: купить {conf['buy']['price']} "
+                     f"на «{conf['buy']['market']}» → встать под "
+                     f"{conf['sell']['price']} на «{conf['sell']['market']}» "
+                     f"→ {conf['profit']:+.4f} TON, ROI {conf['roi']}%"
+                     f"{_Color.RESET}")
+            log.info(f"      {conf['note']}"
+                     + ("; покупка и продажа на ОДНОМ маркете"
+                        if conf.get("same_market") else ""))
     log.info("")
-    log.info(f"{_Color.BOLD}Пар показано: {total}. Потрачено see.tg за сутки: "
+    log.info(f"{_Color.BOLD}Пар по борде: {total}, из них подтверждено "
+             f"лестницей: {shown}. Решение принимается ПО ЛЕСТНИЦЕ — борда "
+             f"не знает, сколько лотов стоит между двумя floor'ами."
+             f"{_Color.RESET}")
+    log.info(f"{_Color.BOLD}Потрачено see.tg за сутки: "
              f"{seetg_budget_load()}/{SEETG_DAILY_BUDGET}. Прогон раз в "
              f"{seetg_scan_gap_sec() / 60:.0f} мин хватит до полуночи UTC."
              f"{_Color.RESET}")
