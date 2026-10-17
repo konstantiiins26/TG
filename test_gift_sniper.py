@@ -6688,6 +6688,83 @@ check("второй формулы потолка в отчёте нет",
 
 
 # =============================================================================
+# [82] ДВОЕ СУТОК В ДВА ОКНА: ОДНА БАЗА, ДВА ПИШУЩИХ ПРОЦЕССА
+# =============================================================================
+# Цикл наблюдения (`--record`) и слушатель потока (`--seetg-watch`) работают
+# ОДНОВРЕМЕННО и сутками. В обычном журнале SQLite писатель берёт монопольную
+# блокировку на всю базу, и второй процесс получает «database is locked».
+print("\n[82] Два процесса на одной базе")
+
+with gs.db_connect() as _c82:
+    _mode82 = _c82.execute("PRAGMA journal_mode").fetchone()[0]
+check("журнал базы — WAL", str(_mode82).lower() == "wal", _mode82)
+
+# Два ОТКРЫТЫХ соединения пишут в одну базу, не отбирая её друг у друга.
+_a82, _b82 = gs.db_connect(), gs.db_connect()
+try:
+    _a82.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", ("k82a", "1"))
+    _a82.commit()
+    _b82.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", ("k82b", "1"))
+    _b82.commit()
+    check("второе соединение пишет в ту же базу", True)
+except Exception as _e82:                              # noqa: BLE001
+    check("второе соединение пишет в ту же базу", False, _e82)
+finally:
+    _a82.close()
+    _b82.close()
+
+# СБОЙ ЗАПИСИ НЕ ДОЛЖЕН ЗАКАНЧИВАТЬ ПРОГОН. Раньше исключение из
+# `record_sale()` уходило наружу мимо обработчика `recv`, и один «database is
+# locked» стоил бы всей оставшейся записи: поток живой, переиграть его нельзя.
+_ows82, _otok82 = gs._ws_connect, gs.SEETG_TOKEN
+_oslugs82, _orec82 = gs.known_seetg_slugs, gs.record_sale
+try:
+    gs.SEETG_TOKEN = "407:x"
+    gs.known_seetg_slugs = lambda: {"SnakeBox"}
+
+    def _boom82(sale):
+        raise gs.sqlite3.OperationalError("database is locked")
+
+    gs.record_sale = _boom82
+
+    class _FakeWS82:
+        def __init__(self):
+            self.queue, self.closed = [], False
+
+        def settimeout(self, t):
+            pass
+
+        def send(self, data):
+            self.queue += ['{"type":"subscribed","events":["sale"]}',
+                           json.dumps(_sale71)]
+
+        def recv(self):
+            if not self.queue:
+                raise TimeoutError("timed out")
+            return self.queue.pop(0)
+
+        def close(self):
+            self.closed = True
+
+    gs._ws_connect = lambda url, headers, timeout: (_FakeWS82(), None)
+    check("сбой записи НЕ роняет слушателя потока",
+          gs.seetg_watch_sales(1) is True)
+finally:
+    (gs._ws_connect, gs.SEETG_TOKEN, gs.known_seetg_slugs,
+     gs.record_sale) = _ows82, _otok82, _oslugs82, _orec82
+
+# Потерянное НАЗЫВАЕТСЯ: сделка из потока невосстановима, и тихая дыра в
+# записи выглядела бы как спокойный рынок.
+_w82 = open("gift_sniper.py", encoding="utf-8").read().split(
+    "def seetg_watch_sales")[1].split("\ndef ")[0]
+check("непринятые базой сделки считаются и называются",
+      "НЕ ЗАПИСАНО сделок" in _w82 and "failed += 1" in _w82)
+# «Сделок не было» и «сделки были, но база их не приняла» — разные состояния.
+check("при сбоях записи это НЕ объявляется тихим рынком",
+      "Это поломка, а не тихий рынок" in _w82)
+
+
+# =============================================================================
 print("\n" + "=" * 60)
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

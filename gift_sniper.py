@@ -5106,6 +5106,7 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
              f"{', '.join(sorted(slugs))}")
 
     started, saved, dup, foreign, skipped, lucky = time.time(), 0, 0, 0, 0, 0
+    failed = 0
     reasons, by_slug = {}, {}
     attempt = 0
     while time.time() - started < seconds:
@@ -5162,7 +5163,21 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
                              f"«{sale['sale_kind']}», в среднюю не идёт"
                              f"{_Color.RESET}")
                     continue
-                if record_sale(sale):
+                # СБОЙ ЗАПИСИ НЕ РОНЯЕТ НАБЛЮДЕНИЕ. Раньше исключение
+                # отсюда уходило наружу мимо обработчика `recv` и
+                # ЗАКАНЧИВАЛО прогон: за двое суток один «database is
+                # locked» стоил бы всей оставшейся записи. Поток живой,
+                # переиграть его нельзя — пропущенная сделка потеряна
+                # навсегда, поэтому молчать тоже нельзя (тот же принцип,
+                # что у сброса бюджета на диск).
+                try:
+                    stored = record_sale(sale)
+                except Exception as e:                 # noqa: BLE001
+                    failed += 1
+                    log.warning(f"Сделка {sale['slug']}-{sale['num']} НЕ "
+                                f"записана ({type(e).__name__}: {e})")
+                    continue
+                if stored:
                     saved += 1
                     by_slug[sale["slug"]] = by_slug.get(sale["slug"], 0) + 1
                     est = sale.get("estimate_ton")
@@ -5186,11 +5201,23 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
     if lucky:
         log.info(f"Сделок вида не «purchase/sale»: {lucky} — в среднюю не "
                  f"идут, потому что что они означают, не измерено")
+    if failed:
+        # Потерянное называется вслух: сделка из потока невосстановима, и
+        # тихая дыра в записи выглядела бы как спокойный рынок.
+        log.warning(f"{_Color.YELLOW}НЕ ЗАПИСАНО сделок: {failed} — поток шёл, "
+                    f"а база не приняла. Эти сделки потеряны: переиграть "
+                    f"поток нельзя.{_Color.RESET}")
     for r, n in sorted(reasons.items(), key=lambda x: -x[1]):
         log.warning(f"Не разобрано ({n}): {r}")
     if saved:
         log.info(f"{_Color.GREEN}Отчёт: deploy\\run.bat --sales"
                  f"{_Color.RESET}")
+    elif failed:
+        # «Сделок не было» и «сделки были, но база их не приняла» — разные
+        # состояния с разными решениями. Печатать про спокойный рынок там,
+        # где шли ошибки записи, значит дать сделать неверный вывод.
+        log.warning("Сделки ШЛИ, но ни одна не записана — см. строку выше. "
+                    "Это поломка, а не тихий рынок.")
     else:
         log.warning("Сделок по нашим коллекциям не было. Это не поломка: "
                     "в пробе 116 сделок за 2 минуты пришлись на 20+ "
@@ -6809,8 +6836,25 @@ def db_connect():
         except Exception:
             _schema_ready_for = None
             raise
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    # ДВА ПРОЦЕССА НА ОДНОЙ БАЗЕ — это ШТАТНЫЙ режим, а не исключение: цикл
+    # наблюдения (`--record`) и слушатель потока (`--seetg-watch`) работают
+    # сутками ОДНОВРЕМЕННО. В обычном журнале писатель берёт монопольную
+    # блокировку на всю базу, и второй процесс получает «database is
+    # locked». WAL разводит их: читатель не блокирует писателя, а окно
+    # блокировки писателя короткое.
+    #
+    # Режим ХРАНИТСЯ В ФАЙЛЕ базы, то есть ставится один раз и переживает
+    # перезапуск; команда идемпотентна. Рядом появляются файлы `-wal` и
+    # `-shm` — это нормально, они часть базы.
+    #
+    # Сбой здесь НЕ фатален: на сетевом диске WAL недоступен, и тогда
+    # остаётся прежнее поведение — ожидание блокировки до таймаута.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.Error as e:
+        log.debug(f"WAL не включился: {e}")
     return conn
 
 
