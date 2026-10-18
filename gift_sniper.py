@@ -8990,7 +8990,8 @@ def run_backtest(path: str = None, hold_hours: int = None):
     for coll, coll_snaps in by_coll.items():
         trades.extend(_backtest_one(coll_snaps, hold_hours, bought_addrs))
 
-    return _report_backtest(trades, hold_hours, span_h, len(by_coll))
+    return _report_backtest(trades, hold_hours, span_h, len(by_coll),
+                            _observed_hours(snaps))
 
 
 def _backtest_one(snaps, hold_hours: int, bought_addrs: set):
@@ -9012,7 +9013,11 @@ def _backtest_one(snaps, hold_hours: int, bought_addrs: set):
             bought_addrs.add(item["address"])
             trade = {"address": item["address"], "buy": ev["buy_price"],
                      "expected": ev["net_profit"], "roi": ev["roi_pct"],
-                     "entry_floor": ev["eff_floor"]}
+                     "entry_floor": ev["eff_floor"],
+                     # ПОКРЫТИЕ СНАПШОТА, по которому сделка отобрана. У
+                     # записей старше 23.09.2026 его нет вовсе, и floor там
+                     # посчитан кодом, который завышал его примерно вдвое.
+                     "coverage": snap.get("coverage_pct")}
             trade.update(_simulate_exit(snaps, snap["ts"], ev["buy_price"],
                                         hold_hours,
                                         ev["is_rare"] or ev["is_pretty"]))
@@ -9976,9 +9981,25 @@ def rank_collections(path: str = None):
     stats = [_collection_stats(c, sn) for c, sn in by_coll.items()]
     stats.sort(key=lambda st: st["turnover_per_hour"], reverse=True)
 
+    # «ЗАМЕРЛА» И «ЗА НЕЙ НЕ СМОТРЯТ» — РАЗНЫЕ СОСТОЯНИЯ С РАЗНЫМИ РЕШЕНИЯМИ,
+    # и в таблице они выглядели одинаково: «оборота нет». Коллекция, выбывшая
+    # из списка месяц назад, честно показывает ноль — потому что её снапшоты
+    # кончились тогда же, а не потому что рынок умер. Отчёт на этом предлагал
+    # выкинуть её «за ненадобностью» — то есть ПОДТВЕРЖДАЛ решение, которое
+    # сам же и породил.
+    #
+    # Порог в сутки не с потолка: коллекция из активного списка попадает в
+    # запись десятки раз в день даже на самом медленном ритме, так что сутки
+    # тишины у неё не бывает.
+    newest = max((st["last_ts"] for st in stats), default=0.0)
+    for st in stats:
+        st["idle_h"] = max(0.0, (newest - st["last_ts"]) / 3600)
+        if st["idle_h"] > _RANK_STALE_HOURS:
+            st["status"] = "не наблюдается"
+
     log.info("")
     log.info(f"{'Коллекция':<16} {'Оборот/ч':>9} {'Лотов':>7} {'Floor':>10} "
-             f"{'Разброс':>9} {'Скидка':>8} {'Банк':>6}  Статус")
+             f"{'Разброс':>9} {'Скидка':>8} {'Банк':>6} {'Видели':>8}  Статус")
     for st in stats:
         colour = (_Color.RED if st["status"] != "живая"
                   else _Color.GREEN if st["turnover_per_hour"] >= 1 else "")
@@ -9995,7 +10016,8 @@ def rank_collections(path: str = None):
                  f"{st['median_floor']:>10.2f} "
                  f"{st['floor_spread_pct']:>8.1f}% "
                  f"{aff['discount_pct']:>7.0f}% "
-                 f"{aff_colour}{aff['verdict']:>6}{_Color.RESET}  "
+                 f"{aff_colour}{aff['verdict']:>6}{_Color.RESET} "
+                 f"{_rank_seen(st['idle_h']):>8}  "
                  f"{colour}{st['status']}{_Color.RESET}")
 
     # Активная коллекция, в которой банк не может купить, — потраченные впустую
@@ -10007,17 +10029,44 @@ def rank_collections(path: str = None):
                     f"{max_position_size()} TON ниже их прибыльного диапазона. "
                     f"Наблюдать за ними можно, купить в них — нет.{_Color.RESET}")
 
-    alive = [st for st in stats if st["status"] == "живая"]
+    watched = [st for st in stats if st["idle_h"] <= _RANK_STALE_HOURS]
+    stale = [st for st in stats if st["idle_h"] > _RANK_STALE_HOURS]
+    alive = [st for st in watched if st["status"] == "живая"]
     log.info("")
+    if stale:
+        days = sorted(st["idle_h"] / 24 for st in stale)
+        log.info(f"Из них {len(stale)} коллекций СЕЙЧАС НЕ НАБЛЮДАЮТСЯ "
+                 f"(последний снапшот от {days[0]:.1f} до {days[-1]:.1f} суток "
+                 f"назад): их нулевой оборот — про тот период, а не про "
+                 f"сегодняшний рынок. Чтобы судить о них, надо вернуть их в "
+                 f"TARGET_COLLECTIONS и понаблюдать.")
     if not alive:
-        log.warning(f"{_Color.YELLOW}Ни одной живой коллекции. Либо запись слишком "
-                    f"короткая, либо выбранные коллекции не торгуются.{_Color.RESET}")
+        log.warning(f"{_Color.YELLOW}Ни одной живой коллекции среди наблюдаемых. "
+                    f"Либо запись слишком короткая, либо выбранные коллекции "
+                    f"не торгуются.{_Color.RESET}")
     else:
-        log.info(f"Живых коллекций: {len(alive)} из {len(stats)}. "
-                 f"Рекомендую оставить в TARGET_COLLECTIONS верхние "
-                 f"{min(3, len(alive))} — остальные только жгут лимиты API.")
+        # ЧИСЛА «оставьте N» здесь нет намеренно: прежняя версия называла
+        # фиксированное число, и оно противоречило измеренному. Квота фиксирует
+        # СУММУ осмотров, поэтому короткий список даёт не больше наблюдений,
+        # а более частые по каждой коллекции. Это обмен широты на свежесть, и
+        # выбирает его владелец.
+        log.info(f"Живых коллекций: {len(alive)} из {len(watched)} "
+                 f"наблюдаемых. Сужать список стоит ради СВЕЖЕСТИ: суточная "
+                 f"квота фиксирует сумму осмотров, и короткий список значит "
+                 f"чаще смотреть на каждую, а не больше смотреть всего.")
     _warn_if_recording_short(snaps)
     return stats
+
+
+# Сколько часов тишины считать «за коллекцией не смотрят». Коллекция из
+# активного списка попадает в запись десятки раз в сутки даже на самом
+# медленном ритме наблюдения, поэтому сутки — с большим запасом.
+_RANK_STALE_HOURS = float(os.getenv("RANK_STALE_HOURS", "24"))
+
+
+def _rank_seen(idle_h: float) -> str:
+    """«Видели»: сейчас или сколько суток назад."""
+    return "сейчас" if idle_h <= _RANK_STALE_HOURS else f"{idle_h / 24:.0f}д наз"
 
 
 def _collection_stats(collection: str, snaps: list) -> dict:
@@ -10056,7 +10105,34 @@ def _collection_stats(collection: str, snaps: list) -> dict:
         "median_floor": float(median_floor),
         "floor_spread_pct": float(spread),
         "status": status,
+        # КОГДА ЭТУ КОЛЛЕКЦИЮ ВИДЕЛИ В ПОСЛЕДНИЙ РАЗ. Запись копится месяцами
+        # и помнит коллекции, которых в списке давно нет: их «оборота нет»
+        # описывает ТОТ период, а не сегодняшний рынок.
+        "last_ts": snaps[-1]["ts"],
+        "first_ts": snaps[0]["ts"],
     }
+
+
+def _observed_hours(snaps, max_gap_h: float = None) -> float:
+    """
+    Сколько часов бот НА САМОМ ДЕЛЕ смотрел на рынок.
+
+    Запись копится месяцами, а ПК выключают: между соседними снапшотами
+    бывают сутки. Делить число находок на КАЛЕНДАРНЫЙ срок — значит мерить
+    частоту рынка выключенным ботом и получить «одна в сутки» там, где при
+    непрерывной работе их было бы вдесятеро больше. Для владельца это
+    решающая разница: по этому числу он решает, стоит ли держать ПК включённым.
+
+    Перерыв длиннее `BACKTEST_MAX_SLACK_HOURS` считается ОСТАНОВКОЙ, а не
+    редким шагом наблюдения. Порог не новый: это тот же, по которому бэктест
+    не засчитывает позицию закрытой через дыру в записи, и заводить рядом
+    второе число значило бы отвечать на один вопрос двумя способами.
+    """
+    max_gap = (max_gap_h or BACKTEST_MAX_SLACK_HOURS) * 3600
+    ts = sorted({s["ts"] for s in snaps})
+    if len(ts) < 2:
+        return 0.0
+    return sum(b - a for a, b in zip(ts, ts[1:]) if (b - a) <= max_gap) / 3600
 
 
 def _warn_if_recording_short(snaps):
@@ -10068,7 +10144,8 @@ def _warn_if_recording_short(snaps):
                     f"выводы по выборке меньше суток ненадёжны.{_Color.RESET}")
 
 
-def _report_backtest(trades, hold_hours, span_h=None, collections=None):
+def _report_backtest(trades, hold_hours, span_h=None, collections=None,
+                     observed_h=None):
     """Печатает итоги бэктеста и возвращает их словарём."""
     closed = [t for t in trades if t["status"] == "closed"]
     unresolved = len(trades) - len(closed)
@@ -10117,6 +10194,36 @@ def _report_backtest(trades, hold_hours, span_h=None, collections=None):
     worst = min(closed, key=lambda t: t["pnl"])
     log.info(f"Лучшая: {best['pnl']:+.4f} TON | Худшая: {worst['pnl']:+.4f} TON")
 
+    # ПОКРЫТИЕ РЕШАЕТ, МОЖНО ЛИ ВЕРИТЬ ЭТИМ ДЕНЬГАМ, и проверить это надо
+    # ДО того, как читатель запомнит winrate. 23.09.2026 выяснилось, что floor
+    # считался по ~12% коллекции и был завышен ВДВОЕ (`FLOOR_PAGE_SIZE` стоял
+    # 100 при максимуме TonAPI 1000). Снапшоты той поры лежат в записи с
+    # `floor_reliable = true`, потому что тогдашнее правило смотрело только на
+    # ЧИСЛО лотов, — и `evaluate_trade()` пропускает их как исправные.
+    # Завышенный floor завышает выручку от перепродажи, то есть ошибка идёт
+    # в самую опасную сторону, а отчёт об этом молчал.
+    old_cov = [t for t in closed if t.get("coverage") is None]
+    if old_cov:
+        good = [t for t in closed if t.get("coverage") is not None]
+        log.warning(f"{_Color.YELLOW}ПОКРЫТИЕ НЕИЗВЕСТНО у {len(old_cov)} из "
+                    f"{len(closed)} закрытых сделок: снапшоты записаны ДО "
+                    f"появления проверки покрытия, когда floor считался по "
+                    f"части коллекции и был завышен примерно вдвое. Прибыль "
+                    f"по ним завышена в ту же сторону.{_Color.RESET}")
+        if good:
+            g_pnl = sum((t["pnl"] for t in good), Decimal("0"))
+            g_inv = sum((t["buy"] for t in good), Decimal("0"))
+            g_wins = len([t for t in good if t["pnl"] > 0])
+            g_roi = (g_pnl / g_inv * Decimal("100")) if g_inv > 0 else Decimal("0")
+            log.info(f"ПО СДЕЛКАМ С ИЗМЕРЕННЫМ ПОКРЫТИЕМ (только им и можно "
+                     f"верить): {len(good)} шт, winrate "
+                     f"{Decimal(g_wins) / Decimal(len(good)) * 100:.1f}%, "
+                     f"PnL {g_pnl:+.4f} TON, ROI {g_roi:.2f}%")
+        else:
+            log.warning(f"{_Color.YELLOW}Сделок с измеренным покрытием НЕТ "
+                        f"ВООБЩЕ — числа выше посчитаны целиком по floor, "
+                        f"который мы сами признали неверным.{_Color.RESET}")
+
     # --- Почему цифрам выше можно или нельзя верить -----------------------
     # Эти предупреждения стоят ПОСЛЕ чисел намеренно: их читают последними,
     # и именно они решают, что с числами делать.
@@ -10133,7 +10240,24 @@ def _report_backtest(trades, hold_hours, span_h=None, collections=None):
         if collections:
             line += f" на {collections} коллекциях"
         log.info(line)
-        if per_day > 0:
+        # КАЛЕНДАРЬ И НАБЛЮДЕНИЕ — РАЗНЫЕ ЗНАМЕНАТЕЛИ, и путать их дорого.
+        # Строка выше делит на срок ЗАПИСИ, то есть считает вместе с ночами,
+        # когда ПК был выключен. Она верна как ответ на вопрос «сколько
+        # находок приходило при моём режиме работы» и НЕВЕРНА как ответ на
+        # «сколько их даёт рынок». Второй вопрос и есть тот, по которому
+        # решают, держать ли ПК включённым.
+        if observed_h and span_h and observed_h < span_h * 0.9:
+            obs_rate = len(trades) / (observed_h / 24)
+            log.info(f"{_Color.BOLD}Но наблюдение шло только {observed_h:.0f}ч "
+                     f"из {span_h:.0f} ({observed_h / span_h * 100:.0f}% "
+                     f"времени): на НЕПРЕРЫВНОЙ записи это "
+                     f"{obs_rate:.2f} сделок в сутки.{_Color.RESET} Верхняя "
+                     f"строка — про ваш режим работы, эта — про рынок.")
+            if obs_rate > 0:
+                log.info(f"При непрерывной работе на {MIN_BACKTEST_TRADES} "
+                         f"сделок нужно примерно "
+                         f"{MIN_BACKTEST_TRADES / obs_rate:.1f} суток.")
+        elif per_day > 0:
             days_needed = MIN_BACKTEST_TRADES / per_day
             log.info(f"При такой частоте на {MIN_BACKTEST_TRADES} сделок "
                      f"нужно примерно {days_needed:.0f} суток записи.")
