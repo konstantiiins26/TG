@@ -293,8 +293,12 @@ REM SEETG_ONLY=0 vozvrashchaet staryy put (po nashey vyborke iz TonAPI).
 REM Nuzhen tolko esli kvota see.tg konchilas, a smotret chem-to nado.
 set SEETG_ONLY=1
 
-REM Sutochnaya kvota see.tg. U Free tarifa potolok 1000 zaprosov v sutki,
-REM poetomu 900 - s zapasom. Rashod HRANITSYA V BD: kvota zhivet na ih
+REM Sutochnaya kvota see.tg. TARIF SMENILSYA 18.10.2026 - server skazal
+REM doslovno: "Besplatnye 100 zaprosov na segodnya zakonchilis, a na balanse
+REM API ne hvataet na sleduyushchiy (0.00005 TON)". Bylo 1000, stalo 100
+REM besplatnyh plus oplata po zaprosu. 95 - tot zhe zapas 5 procentov.
+REM POPOLNILI BALANS API ^(see.tg -^> Poleznoe -^> API^) - podnimite eto
+REM chislo: po ih cene 0.00005 TON za zapros odna TON eto okolo 20000. Rashod HRANITSYA V BD: kvota zhivet na ih
 REM storone, i bot, perezapushchennyy v obed, inache schital by ee netronutoy.
 REM Ritm progonov bot schitaet SAM tak, chtoby ostatka hvatilo do polunochi
 REM UTC. Izmereno 10.10.2026: 3 zaprosa na kollekciyu, 11 kollekciy = 33 na
@@ -303,7 +307,7 @@ REM VAZHNO: ruchnoy "deploy\arb.bat" EST TU ZHE KVOTU. Dva progona po ~200
 REM zaprosov rastyagivayut pauzu nablyudeniya s 18 do 31 min na ostatok sutok,
 REM to est uvedomleniy v telefon budet MENSHE. Hotite bolshe - ne zhgite
 REM kvotu otchetami.
-set SEETG_DAILY_BUDGET=900
+set SEETG_DAILY_BUDGET=95
 
 REM POTOLOK CENY LOTA V UVEDOMLENII. Pryamaya komanda vladelca 07.10.2026:
 REM "limit maksimalnyy do 10". Lot dorozhe etogo v telefon NE idet voobshche

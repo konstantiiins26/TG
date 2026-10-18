@@ -85,7 +85,7 @@ _PINNED = {
     "FLIP_BUY_SCORE": 70, "FLIP_WATCH_SCORE": 50,
     "FLIP_TARGET_MULT": Decimal("1.5"),
     # see.tg: источник чужих цен и его суточная квота
-    "SEETG_TOKEN": "", "SEETG_ONLY": True, "SEETG_DAILY_BUDGET": 900,
+    "SEETG_TOKEN": "", "SEETG_ONLY": True, "SEETG_DAILY_BUDGET": 95,
     "SEETG_MIN_INTERVAL": Decimal("1.2"),
     "SEETG_ARB_MAX_PER_COLLECTION": 1,
     "SEETG_ARB_NOTIFY_MAX_PER_HOUR": 12,
@@ -4358,6 +4358,31 @@ try:
         check("суточная квота распознана", False)
     except gs.RateLimited as e:
         check("суточная квота распознана по телу", "уточная" in str(e), str(e))
+    # Суточная квота ДОВОДИТ СЧЁТЧИК ДО ПОТОЛКА — до полуночи UTC мы даже не
+    # отправляем запрос. Поэтому следующий случай надо начинать с чистого
+    # счётчика, иначе он упрётся в бюджет и до ветки 429 не дойдёт.
+    check("исчерпанная квота закрывает дальнейшие запросы",
+          gs.seetg_budget_left() == 0, gs.seetg_budget_left())
+    # Сбрасываем через те же глобальные, что читает seetg_budget_load():
+    # подменять саму функцию нельзя — она нужна живой в следующих секциях.
+    gs._seetg_spent_today, gs._seetg_spent_date = 0, gs._seetg_today()
+
+    # 402 — ЭТО НЕ «СЛИШКОМ ЧАСТО», А КОНЕЦ СУТОЧНОЙ КВОТЫ (измерено
+    # 18.10.2026: тариф сменился, бесплатных запросов 100, дальше платно).
+    # Повторять бессмысленно, поэтому счётчик доводится до потолка и до
+    # полуночи UTC мы даже не отправляем запрос.
+    gs.requests = _Req63(_Resp63(402, {"description": "free quota spent"}))
+    try:
+        gs.seetg_get("/floors")
+        check("402 распознан как квота", False)
+    except gs.RateLimited as e:
+        check("402 распознан как исчерпанная квота, а не ошибка запроса",
+              "бесплатные запросы" in str(e).lower(), str(e))
+        check("названо лечение — пополнение баланса API",
+              "пополнен" in str(e).lower() and "0.00005" in str(e), str(e))
+    check("после 402 запросы до полуночи не уходят",
+          gs.seetg_budget_left() == 0, gs.seetg_budget_left())
+    gs._seetg_spent_today, gs._seetg_spent_date = 0, gs._seetg_today()
 
     gs.requests = _Req63(_Resp63(429, {"ok": False}, {"Retry-After": "7"}))
     try:

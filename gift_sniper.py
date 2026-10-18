@@ -1941,7 +1941,17 @@ SEETG_MIN_INTERVAL = Decimal(os.getenv("SEETG_MIN_INTERVAL", "1.2"))
 # Расход хранится В БД по той же причине, что и у TonAPI: квота живёт на их
 # стороне, а счётчик в памяти процесса, и перезапущенный в обед бот считал бы
 # бюджет нетронутым.
-SEETG_DAILY_BUDGET = int(os.getenv("SEETG_DAILY_BUDGET", "900"))
+# СУТОЧНЫЙ БЮДЖЕТ see.tg. 18.10.2026 сервер сказал ДОСЛОВНО:
+# «Бесплатные 100 запросов на сегодня закончились, а на балансе API не хватает
+#  на следующий (0.00005 TON). Бесплатные запросы вернутся в 00:00 UTC».
+# То есть тариф сменился: было 1000 в сутки, стало 100 бесплатных плюс оплата
+# по запросу. Прежние 900 были не просто велики — они ОБЕЩАЛИ ритм, которого
+# нет, и бот сжигал сотню за первый час, а дальше получал 402 до полуночи.
+# 95 — тот же запас в 5%, что был у 900 от 1000.
+#
+# ПОПОЛНИЛИ БАЛАНС — поднимите это число в settings.bat: по их же цене
+# 0.00005 TON за запрос одна TON это около 20 000 запросов.
+SEETG_DAILY_BUDGET = int(os.getenv("SEETG_DAILY_BUDGET", "95"))
 _seetg_spent_today = 0
 _seetg_spent_date = ""
 
@@ -1963,6 +1973,26 @@ def seetg_budget_load():
         _seetg_spent_today = 0
     _seetg_spent_date = today
     return _seetg_spent_today
+
+
+def seetg_budget_exhaust():
+    """
+    Объявить суточную квоту see.tg исчерпанной ДО ПОЛУНОЧИ UTC.
+
+    Нужна потому, что лимит живёт на ИХ стороне, а счётчик — у нас, и они
+    расходятся: квоту могли сжечь другим приложением, счётчик мог потеряться
+    со свежей БД. Отказ сервера — единственный ИЗМЕРЕННЫЙ факт о лимите,
+    который у нас бывает, и выбрасывать его глупо (тот же довод, что у
+    `budget_learn_limit()` для TonAPI).
+    """
+    global _seetg_spent_today
+    seetg_budget_load()
+    if _seetg_spent_today < SEETG_DAILY_BUDGET:
+        _seetg_spent_today = SEETG_DAILY_BUDGET
+    try:
+        meta_set(f"seetg_spent:{_seetg_spent_date}", _seetg_spent_today)
+    except Exception as e:                                 # noqa: BLE001
+        log.warning(f"Расход see.tg не сохранён: {e}")
 
 
 def seetg_budget_left() -> int:
@@ -2004,8 +2034,9 @@ def seetg_get(path: str, params: dict = None):
     if seetg_budget_left() <= 0:
         raise RateLimited(
             f"Суточный бюджет see.tg исчерпан ({SEETG_DAILY_BUDGET} запросов). "
-            f"Сбрасывается в полночь UTC. Поднять: SEETG_DAILY_BUDGET, но у "
-            f"бесплатного тарифа потолок 1000 в сутки.")
+            f"Сбрасывается в полночь UTC. У бесплатного тарифа 100 запросов в "
+            f"сутки (измерено 18.10.2026); дальше они берут 0.00005 TON за "
+            f"запрос с баланса API. Пополнили — поднимите SEETG_DAILY_BUDGET.")
     seetg_budget_spend()
 
     url = f"{SEETG_BASE}{path}"
@@ -2021,12 +2052,34 @@ def seetg_get(path: str, params: dict = None):
         except Exception:  # noqa: BLE001 — тело может быть не JSON
             pass
         if str(body.get("window", "")) == "day":
+            seetg_budget_exhaust()
             raise RateLimited(
-                "Суточная квота see.tg исчерпана (1000 запросов на бесплатном "
-                "тарифе). Она восстанавливается в течение суток, ждать "
-                "полуночи не нужно. Тариф Plus снимает суточный лимит.")
+                "Суточная квота see.tg исчерпана. Бесплатных запросов 100 в "
+                "сутки (измерено 18.10.2026), возвращаются в 00:00 UTC. "
+                "Снимается пополнением баланса API или тарифом Plus.")
         raise RateLimited(f"Лимит see.tg, повторить через "
                           f"{resp.headers.get('Retry-After', '?')}с")
+    if resp.status_code == 402:
+        # ПЛАТИТЬ НЕЧЕМ — значит до полуночи UTC запросов больше не будет.
+        # Это НЕ «слишком часто» (429) и не ошибка запроса: повторять
+        # бессмысленно, а каждый повтор ещё и уводит счётчик от правды.
+        # Счётчик доводится до потолка, поэтому `seetg_budget_left()` вернёт
+        # ноль и до полуночи мы даже не отправим запрос — тот же приём, что
+        # у `_tonapi_quota_until`. Расход лежит в БД, так что перезапуск
+        # посреди дня не «забудет» про исчерпанную квоту.
+        detail = ""
+        try:
+            detail = str((resp.json() or {}).get("description") or "")
+        except Exception:                                  # noqa: BLE001
+            detail = (resp.text or "")[:200]
+        seetg_budget_exhaust()
+        raise RateLimited(
+            f"see.tg: бесплатные запросы на сегодня кончились, а на балансе "
+            f"API нечем платить за следующий. До полуночи UTC see.tg не "
+            f"спрашиваем. Лечится пополнением: see.tg -> Полезное -> API "
+            f"(их цена 0.00005 TON за запрос, то есть 1 TON ~ 20 000). "
+            f"После пополнения поднимите SEETG_DAILY_BUDGET." +
+            (f" Ответ сервера: {detail}" if detail else ""))
     if resp.status_code == 401:
         raise RuntimeError("see.tg: токен не принят (401). Проверьте, что "
                            "скопирован целиком в виде id:secret.")
