@@ -322,6 +322,17 @@ REM to est uvedomleniy v telefon budet MENSHE. Hotite bolshe - ne zhgite
 REM kvotu otchetami.
 set SEETG_DAILY_BUDGET=95
 
+REM POSLE POPOLNENIYA BALANSA ETO CHISLO NADO PODNYAT RUKAMI. 402 ot nih
+REM propadet sam, a nash schetchik ostanetsya na 95 - to est bot budet
+REM tormozit sebya pri zhivom balanse, i popolnenie nichego ne izmenit.
+REM Arifmetika dlya 3 kollekciy: 3 zaprosa na kollekciyu = 9 na progon.
+REM   progon raz v 10 min -> 144 progona -> 1300 zaprosov -> 0.065 TON/sutki
+REM   progon raz v  5 min -> 288 progonov -> 2600 zaprosov -> 0.13 TON/sutki
+REM Chashche 2-3 min smysla net: nizhniy predel derzhit cikl zapisi TonAPI.
+REM Ubrat REM s nuzhnoy stroki i postavit na stroku "set ...=95" vyshe.
+REM set SEETG_DAILY_BUDGET=1300
+REM set SEETG_DAILY_BUDGET=2600
+
 REM POTOLOK CENY LOTA V UVEDOMLENII. Pryamaya komanda vladelca 07.10.2026:
 REM "limit maksimalnyy do 10". Lot dorozhe etogo v telefon NE idet voobshche
 REM - ni svyazka, ni "deshevle svoih". Eto NE bank i NE risk-limit bota:
