@@ -6372,14 +6372,16 @@ try:
           _f78["max"] == Decimal("4.20"))
 
     # ГЛАВНОЕ ЧИСЛО — СЧЁТ, А НЕ МЕДИАНА: дошёл ли кто-нибудь до нашей цены.
-    _hi78 = gs.model_sales_lines("JesterHat", "Lemon Spin", Decimal("4.947"))
+    _hi78 = gs.model_sales_lines("JesterHat", "Lemon Spin", Decimal("4.947"),
+                                 Decimal("3.00"))
     _t78 = " | ".join(_hi78)
     check("план выше всех сделок — сказано, что не ушла НИ ОДНА",
           "НИ ОДНА" in _t78 and "4.95" in _t78)
     check("рядом с предупреждением названы медиана и число сделок",
           "медиана" in _t78 and "5" in _t78)
 
-    _lo78 = gs.model_sales_lines("JesterHat", "Lemon Spin", Decimal("3.70"))
+    _lo78 = gs.model_sales_lines("JesterHat", "Lemon Spin", Decimal("3.70"),
+                                 Decimal("3.00"))
     _tl78 = " | ".join(_lo78)
     check("план ниже части сделок — назван счёт K из N",
           "3 из 5" in _tl78 and "НИ ОДНА" not in _tl78)
@@ -6388,7 +6390,7 @@ try:
     # восемь часов потока две коллекции из двенадцати не дали ни сделки,
     # и это измерение их оборота, а не поломка.
     _no78 = " | ".join(gs.model_sales_lines("JesterHat", "Нет такой",
-                                           Decimal("5")))
+                                           Decimal("5"), Decimal("3")))
     check("нет сделок по модели — сказано прямо, без числа",
           "неизвестно" in _no78 and "медиана" not in _no78)
 
@@ -6409,7 +6411,8 @@ check("sales_report зовёт ту же свёртку, а не свою коп
 # У значения ДВА пути в глаза владельца: уведомление и ручной отчёт. Сверка
 # обязана стоять в обоих — иначе это одиннадцатый случай того же класса.
 check("сверка с деньгами стоит в уведомлении о связке",
-      "model_sales_lines(slug, pair[\"model\"], sale)" in _src78)
+      "model_sales_lines(slug, pair[\"model\"], sale, pair[\"buy_floor\"])"
+      in _src78)
 check("сверка с деньгами стоит и в ручном отчёте",
       "model_sales_lines(" in _src78.split("def seetg_arb_report")[1]
       .split("\ndef ")[0])
@@ -6929,6 +6932,87 @@ for _fn84 in ("seetg_arb_report", "notify_startup"):
           "seetg_pace_line" in _body84)
     check(f"{_fn84} не форматирует ритм сам",
           "seetg_scan_gap_sec" not in _body84)
+
+# =============================================================================
+# [85] «ВЫШЕ НАШЕЙ ЦЕНЫ УШЛО 8 ИЗ 19» ПРИ УБЫТОЧНОМ ПЛАНЕ
+# =============================================================================
+# Живой прогон 19.10.2026, ChillFlame «Dark Souls». Отчёт печатал:
+#
+#     ПО ЛЕСТНИЦЕ: купить 4.3962 на «mrkt» → встать под 4.437 → ROI −7.55%
+#     💸 По сделкам этой модели: 19 шт, медиана 4.16, макс 4.57
+#     ✅ Выше нашей цены 4.30 ушло 8 из 19
+#
+# Галочка читается как спрос, а плановая цена 4.30 стоит при ROI −7.55%:
+# продажа по ней УБЫТОЧНА, то есть восемь покупателей доходили до цены,
+# которая нам не годится. Безубыток там 4.64 — ВЫШЕ максимума за всю
+# запись (4.57). Решающее число не печаталось вовсе.
+print("\n[85] Безубыток рядом со счётом сделок")
+
+# ОДНА ФОРМУЛА ПРИБЫЛИ: безубыток — её обратная, и это проверяется, а не
+# утверждается. Разойдись они — отчёт называл бы безубытком цену, при
+# которой сделка убыточна.
+for _b85 in ("0.30", "3.8658", "4.3962", "10.608", "408"):
+    _be85 = gs.breakeven_sale_price(Decimal(_b85))
+    _floor85 = _be85 / (Decimal("1") - gs.UNDERCUT_PCT)
+    check(f"безубыток {_b85} сходится с compute_net_profit до нанотона",
+          abs(gs.compute_net_profit(_floor85, Decimal(_b85)))
+          < Decimal("0.000000001"),
+          (str(_be85), str(gs.compute_net_profit(_floor85, Decimal(_b85)))))
+
+_o85, _osch85 = gs.DB_PATH, gs._schema_ready_for
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "be85.db")
+    gs._schema_ready_for = None
+    # Форма живого случая: часть сделок выше ПЛАНА, но ни одной выше
+    # БЕЗУБЫТКА, причём максимум записи ниже безубытка.
+    for _a in [
+        ("ChillFlame", 601, "Dark Souls", "mrkt", "4.16", "4.2", "u1"),
+        ("ChillFlame", 602, "Dark Souls", "mrkt", "4.35", "4.2", "u2"),
+        ("ChillFlame", 603, "Dark Souls", "portals", "4.57", "4.2", "u3"),
+    ]:
+        gs.record_sale(_sale72(*_a))
+
+    _t85 = " | ".join(gs.model_sales_lines(
+        "ChillFlame", "Dark Souls", Decimal("4.30"), Decimal("4.3962")))
+    check("счёт выше ПЛАНА по-прежнему печатается", "2 из 3" in _t85, _t85)
+    # Число НЕ захардкожено: в тестах роялти пришпилено к 0.05 (чтобы
+    # забывший его расчёт падал), и безубыток там свой. Сверяемся с самой
+    # функцией — иначе тест мерил бы чужую конфигурацию.
+    _exp85 = gs.breakeven_sale_price(Decimal("4.3962")).quantize(Decimal("0.01"))
+    check("безубыток назван числом", str(_exp85) in _t85, (str(_exp85), _t85))
+    check("сказано, что столько не платили ни разу",
+          "МАКСИМУМА" in _t85 and "4.57" in _t85, _t85)
+
+    # Обратный случай: тот же набор сделок, но покупка дешёвая — безубыток
+    # ниже части сделок, и строка обязана быть СЧЁТОМ, а не запретом.
+    _ok85 = " | ".join(gs.model_sales_lines(
+        "ChillFlame", "Dark Souls", Decimal("4.30"), Decimal("3.00")))
+    check("при дешёвой покупке назван счёт выше безубытка",
+          "выше него ушло" in _ok85 and "МАКСИМУМА" not in _ok85, _ok85)
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _o85, _osch85
+
+# ЦЕНА ПОКУПКИ — ОБЯЗАТЕЛЬНЫЙ ДОВОД. Забытый вызов должен падать, а не
+# молча терять решающую строку: в этом проекте дважды выживала ошибка
+# «поправили одного потребителя из двух».
+try:
+    gs.model_sales_lines("ChillFlame", "Dark Souls", Decimal("4.30"))
+    check("без цены покупки вызов не проходит", False)
+except TypeError:
+    check("без цены покупки вызов не проходит", True)
+
+_src85 = open("gift_sniper.py", encoding="utf-8").read()
+# Безубыток считается ОТ ТОЙ ЖЕ цены, по которой считается прибыль
+# (pair["buy_floor"]), иначе отчёт сверял бы деньги с чужой покупкой.
+for _fn85 in ("notify_seetg_arb", "seetg_arb_report"):
+    _b85b = _src85.split(f"def {_fn85}(")[1].split("\ndef ")[0]
+    check(f"{_fn85} передаёт в сверку цену покупки",
+          'pair["buy_floor"]' in _b85b
+          and "model_sales_lines" in _b85b)
+_be85b = _src85.split("def breakeven_sale_price")[1].split("\ndef ")[0]
+check("безубыток не заводит своей комиссии и своего газа",
+      "MARKETPLACE_FEE_PCT" in _be85b and "GAS_FEE_TON" in _be85b
+      and "0.02" not in _be85b and "0.15" not in _be85b)
 
 # =============================================================================
 print("\n" + "=" * 60)

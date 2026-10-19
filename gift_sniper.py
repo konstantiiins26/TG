@@ -4600,7 +4600,7 @@ def notify_seetg_arb(name: str, slug: str, pair: dict,
     # Лестница назвала цену ПРОСЬБЫ («встать под 5.10»), а здесь деньги: за
     # эту модель реально платили столько-то, и выше нашей цены ушло K из N.
     lines.append("")
-    lines += model_sales_lines(slug, pair["model"], sale)
+    lines += model_sales_lines(slug, pair["model"], sale, pair["buy_floor"])
 
     # ЦЕНЫ СДЕЛОК ЭТОГО ПРЕДМЕТА — один запрос, одна страница. Сбой здесь
     # уведомление не роняет: без них оно просто беднее, но не выдумано.
@@ -5423,7 +5423,8 @@ def model_sales_fact(slug: str, model: str) -> dict:
     }
 
 
-def model_sales_lines(slug: str, model: str, planned_sale: Decimal) -> list:
+def model_sales_lines(slug: str, model: str, planned_sale: Decimal,
+                      buy_price: Decimal) -> list:
     """
     Блок «а платили ли столько за эту модель» для лога и уведомления.
 
@@ -5444,6 +5445,13 @@ def model_sales_lines(slug: str, model: str, planned_sale: Decimal) -> list:
     было» — разные утверждения: за восемь часов потока две коллекции из
     двенадцати не дали ни одной сделки, и это измерение их оборота, а не
     поломка.
+
+    СЧЁТ ВЫШЕ ПЛАНОВОЙ ЦЕНЫ САМ ПО СЕБЕ ВВОДИТ В ЗАБЛУЖДЕНИЕ, когда план
+    убыточен: плановая цена при отрицательном ROI ниже безубытка, и «8 из
+    19 выше неё» читается как спрос там, где ни одна из этих восьми сделок
+    не окупила бы покупку. Поэтому рядом всегда стоит БЕЗУБЫТОК и счёт выше
+    НЕГО, а `buy_price` — обязательный довод: забытый вызов должен падать,
+    а не молча терять решающую строку.
     """
     q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
     fact = model_sales_fact(slug, model)
@@ -5462,6 +5470,22 @@ def model_sales_lines(slug: str, model: str, planned_sale: Decimal) -> list:
         lines.append(f"⚠️ ВЫШЕ НАШЕЙ ЦЕНЫ {q(planned_sale)} не ушла НИ ОДНА "
                      f"из {fact['trades']} — это цены просьбы против денег, "
                      f"и деньги до неё не доходили")
+
+    # БЕЗУБЫТОК — число, по которому решают. Плановая цена отвечает «уйдёт
+    # ли лот», а это — «окупится ли он»; при минусовом ROI они расходятся, и
+    # первое читается оптимистичнее второго.
+    be = breakeven_sale_price(buy_price)
+    paid = [p for p in fact["prices"] if p >= be]
+    if fact["max"] < be:
+        lines.append(f"⛔ БЕЗУБЫТОК {q(be)} — выше МАКСИМУМА за всю запись "
+                     f"({q(fact['max'])}): столько за эту модель не платили "
+                     f"ни разу из {fact['trades']}")
+    elif paid:
+        lines.append(f"🧾 Безубыток {q(be)}: выше него ушло {len(paid)} из "
+                     f"{fact['trades']}")
+    else:
+        lines.append(f"⛔ Безубыток {q(be)}: выше него не ушла НИ ОДНА из "
+                     f"{fact['trades']}")
     return lines
 
 
@@ -6353,7 +6377,8 @@ def seetg_arb_report(limit_collections: int = 0):
             # владельца, и ставить сверку только в уведомление значило бы
             # повторить класс ошибки, который в этом проекте выжил десять раз.
             for _ln in model_sales_lines(
-                    slug, pair["model"], target_sale_price(conf["sell_floor"])):
+                    slug, pair["model"], target_sale_price(conf["sell_floor"]),
+                    pair["buy_floor"]):
                 log.info(f"      {_ln}")
     log.info("")
     # ВОРОНКА ЦЕЛИКОМ, А НЕ ДВА ЕЁ КРАЯ. «Пар 53, подтверждено 53» звучит
@@ -6863,6 +6888,35 @@ def compute_net_profit(floor_price: Decimal, buy_price: Decimal,
     sale = target_sale_price(floor_price, premium)
     proceeds = sale * (Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT)
     return proceeds - buy_price - GAS_FEE_TON
+
+
+def breakeven_sale_price(buy_price: Decimal) -> Decimal:
+    """
+    За сколько надо продать, чтобы выйти В НОЛЬ. Обратное к
+    `compute_net_profit()`, и вторая формула прибыли тут НЕ заводится:
+
+        proceeds - buy - gas = 0
+        S * (1 - fee - royalty) = buy + gas
+        S = (buy + gas) / (1 - fee - royalty)
+
+    Тест сверяет это с `compute_net_profit()` до нанотона — разойдись они,
+    отчёт называл бы безубытком цену, при которой сделка убыточна.
+
+    ЗАЧЕМ ОНО НУЖНО (живой прогон 19.10.2026, «Dark Souls»). Сверка с
+    деньгами печатала «выше нашей цены 4.30 ушло 8 из 19» — читается как
+    спрос. Но плановая цена 4.30 стояла при ROI −7.55%, то есть продажа по
+    ней УБЫТОЧНА, и восемь покупателей доходили до цены, которая нам не
+    годится. Безубыток там 4.64, а максимум за всю запись 4.57: столько за
+    эту модель не платили НИ РАЗУ. Два числа, читаемые противоположно, и
+    решающее из них не печаталось.
+
+    Это ровно тот класс, что «Winrate: 100.0% (1/1)»: отчёт, из которого
+    можно с уверенным видом сделать неверный вывод, опаснее отсутствующего.
+    """
+    left = Decimal("1") - MARKETPLACE_FEE_PCT - ROYALTY_PCT
+    if left <= 0:                       # мыслимо только при битой настройке
+        return Decimal("0")
+    return (Decimal(buy_price) + GAS_FEE_TON) / left
 
 
 def compute_roi_pct(net_profit: Decimal, buy_price: Decimal) -> Decimal:
