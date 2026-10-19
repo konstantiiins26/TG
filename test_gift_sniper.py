@@ -6486,7 +6486,7 @@ check("файл открывается до запуска режимов",
       "add_log_file(args.log_file)" in _m79)
 # .bat'ы должны звать --log-file, а не перенаправление: иначе кодировку
 # снова задаёт оболочка (одиннадцатый случай «несколько потребителей»).
-for _b79 in ("deploy/arb.bat", "deploy/go.bat"):
+for _b79 in ("deploy/arb.bat", "deploy/go.bat", "deploy/mrkt.bat"):
     _t79 = open(_b79, encoding="utf-8").read()
     check(f"{_b79} пишет отчёт через --log-file", "--log-file" in _t79)
     check(f"{_b79} не перенаправляет вывод бота",
@@ -7013,6 +7013,124 @@ _be85b = _src85.split("def breakeven_sale_price")[1].split("\ndef ")[0]
 check("безубыток не заводит своей комиссии и своего газа",
       "MARKETPLACE_FEE_PCT" in _be85b and "GAS_FEE_TON" in _be85b
       and "0.02" not in _be85b and "0.15" not in _be85b)
+
+# =============================================================================
+# [86] РАЗРЫВ ВНУТРИ ОДНОГО МАРКЕТА: «давай только mrkt, на нём купить и продать»
+# =============================================================================
+# Просьба владельца 19.10.2026. Это не сужение ради удобства: разрыв между
+# двумя лотами НА ОДНОЙ витрине — самый сравнимый случай (состав лотов там
+# один), а главное — кандидат по БОРДЕ такие модели не видит вовсе. Борда
+# сравнивает floor маркетов, поэтому модель с лотами 3.00 и 4.50 на mrkt, но
+# без межмаркетной разницы, до лестницы не доходила НИКОГДА. В прогоне того
+# же дня у всех шести выживших пар конкурент стоял на том же маркете — то
+# есть внутримаркетные разрывы и были всем результатом, но попадали в
+# просмотр случайно.
+print("\n[86] Разрывы внутри одного маркета")
+
+
+def _lot86(num, price, market="mrkt", addr=None):
+    return {"num": num, "giftAddress": addr or f"EQ{num}",
+            "model": {"name": "Flamethrower"},
+            "saleInfo": [{"amount": str(int(Decimal(price) * 10 ** 9)),
+                          "currency": "gram", "market": market,
+                          "link": f"https://t.me/{market}/{num}"}]}
+
+
+_calls86 = []
+_oget86 = gs.seetg_get
+try:
+    def _page86(path, params=None):
+        _calls86.append((path, dict(params or {})))
+        return {"items": [
+            _lot86(1, "3.00"),                      # наш кандидат
+            _lot86(2, "3.20", market="portals"),    # чужой маркет — не наш
+            _lot86(3, "4.50"),                      # второй лот на mrkt
+            {"num": 4, "giftAddress": "EQ4",        # модель-одиночка
+             "model": {"name": "Solo"},
+             "saleInfo": [{"amount": "3500000000", "currency": "gram",
+                           "market": "mrkt"}]},
+        ]}
+    gs.seetg_get = _page86
+    _gaps86, _note86 = gs.seetg_market_gaps("ChillFlame", "mrkt")
+    check("на коллекцию уходит РОВНО один запрос", len(_calls86) == 1, _calls86)
+    check("модель с одним лотом в разрывы не идёт",
+          [g["model"] for g in _gaps86] == ["Flamethrower"], _gaps86)
+    _g86 = _gaps86[0]
+    # Лот с ДРУГОГО маркета в пару не попал, хотя стоит между нашими двумя:
+    # маркет решает ОТВЕТ (saleInfo.market), а не параметр запроса — их API
+    # фильтр может игнорировать.
+    check("конкурент взят с того же маркета, а не ближайший по цене",
+          _g86["buy"]["price"] == Decimal("3.00")
+          and _g86["rival"]["price"] == Decimal("4.50"), _g86)
+    # Прибыль — ТОЙ ЖЕ функцией, что принимает торговое решение.
+    check("прибыль считает compute_net_profit, а не своя формула",
+          _g86["profit"] == gs.compute_net_profit(Decimal("4.50"),
+                                                  Decimal("3.00")))
+    check("пояснение называет, сколько лотов на этом маркете нашлось",
+          "на «mrkt» 3" in _note86, _note86)
+
+    # Два одинаковых ценника — это не разрыв, а два продавца рядом.
+    gs.seetg_get = lambda path, params=None: {"items": [
+        _lot86(5, "3.00"), _lot86(6, "3.00")]}
+    check("одинаковые цены разрывом не считаются",
+          gs.seetg_market_gaps("ChillFlame", "mrkt")[0] == [])
+
+    # ВЕРДИКТ ПО ВСЕМ МАРКЕТАМ, даже когда сделка внутри одного: покупатель
+    # видит пять витрин сразу. Живой случай Candy Canes 07.10.2026.
+    gs.seetg_get = lambda path, params=None: {"items": [
+        _lot86(1, "3.00"), _lot86(7, "3.60", market="portals"),
+        _lot86(3, "4.50")]}
+    _conf86, _why86 = gs.seetg_confirm_market_gap("ChillFlame", _g86)
+    check("конкурент берётся с ЛЮБОГО маркета, если он ближе",
+          _conf86 and _conf86["sell"]["price"] == Decimal("3.60"), _why86)
+    check("и это названо: продать внутри своего маркета по той цене нельзя",
+          _conf86 and not _conf86["same_market"])
+    check("лестница двигает прибыль только ВНИЗ",
+          _conf86["profit"] < _g86["profit"],
+          (str(_conf86["profit"]), str(_g86["profit"])))
+
+    # СВОЙ ЛОТ ВЫЧЁРКИВАЕТСЯ: иначе лот сравнивался бы со статистикой, в
+    # которую сам входит (та же ошибка, что чинилась в cheapest_rival()).
+    gs.seetg_get = lambda path, params=None: {"items": [
+        _lot86(1, "3.00"), _lot86(3, "4.50")]}
+    _conf86b, _ = gs.seetg_confirm_market_gap("ChillFlame", _g86)
+    check("свой лот не становится собственным конкурентом",
+          _conf86b and _conf86b["sell"]["price"] == Decimal("4.50"))
+    check("покупка и продажа на одном маркете — названо",
+          _conf86b and _conf86b["same_market"])
+
+    # На другом маркете та же модель ДЕШЕВЛЕ нашей покупки — сделки нет
+    # вовсе, и причина названа маркетом и ценой.
+    gs.seetg_get = lambda path, params=None: {"items": [
+        _lot86(8, "2.50", market="tonnel"), _lot86(1, "3.00"),
+        _lot86(3, "4.50")]}
+    _conf86c, _why86c = gs.seetg_confirm_market_gap("ChillFlame", _g86)
+    check("конкурент дешевле нашей покупки — отказ с причиной",
+          _conf86c is None and "tonnel" in _why86c and "2.5" in _why86c,
+          _why86c)
+finally:
+    gs.seetg_get = _oget86
+
+_src86 = open("gift_sniper.py", encoding="utf-8").read()
+_rep86 = _src86.split("def seetg_market_report")[1].split("\ndef ")[0]
+# Потолок и банк — ТЕМ ЖЕ owner_can_pay(), что у уведомлений: вторая формула
+# разошлась бы с первой в первый же день.
+check("отчёт считает карман тем же owner_can_pay", "owner_can_pay" in _rep86)
+# Сверка с деньгами стоит и здесь: у значения теперь ТРИ читателя, и забыть
+# одного — это тот же класс ошибки, что выжил в проекте двенадцать раз.
+check("сверка с ценами сделок есть и в этом отчёте",
+      "model_sales_lines" in _rep86)
+check("в сверку идёт цена покупки", 'gap["buy_floor"]' in _rep86)
+# Второй формулы прибыли в проекте нет.
+_gap86src = _src86.split("def seetg_market_gaps")[1].split("\ndef ")[0]
+check("разрыв считает compute_net_profit, а не свою арифметику",
+      "compute_net_profit" in _gap86src
+      and "UNDERCUT_PCT" not in _gap86src
+      and "MARKETPLACE_FEE_PCT" not in _gap86src)
+# Один запрос на коллекцию: постраничного обхода их базы быть не должно,
+# их правила блокируют за это АККАУНТ целиком, а не токен.
+check("по коллекции идёт один запрос, без курсора",
+      _gap86src.count("seetg_get(") == 1 and "cursor" not in _gap86src)
 
 # =============================================================================
 print("\n" + "=" * 60)

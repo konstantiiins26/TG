@@ -23,5 +23,10 @@ deploy/my-secrets.sh
 
 # Otchet rezhima --flip: rezultat progona, ne ishodnik
 flip-report.txt
+# Отчёты бот пишет САМ через --log-file (arb.bat, mrkt.bat, go.bat).
+# Отслеживаемый файл, который бот перезаписывает, ломается на первом
+# же `git pull` — это уже было с ключами в start-windows.bat.
+*-report.txt
+bot-log.txt
 model_colors.json
 seetg-frames.jsonl

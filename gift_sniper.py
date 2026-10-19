@@ -4303,6 +4303,150 @@ def seetg_cheapest_on(slug: str, model: str, market: str):
     return best, f"лотов на «{market}» в выборке: {seen} из {len(rows)}"
 
 
+# Сколько самых дешёвых лотов КОЛЛЕКЦИИ просматривать в поиске разрыва
+# внутри одного маркета. 50 — проверенное значение: с ним уже работает
+# `seetg_scan_collection()`.
+SEETG_MARKET_SCAN_LIMIT = int(os.getenv("SEETG_MARKET_SCAN_LIMIT", "50"))
+# Сколько кандидатов коллекции доводить до лестницы (по запросу на каждого).
+SEETG_MARKET_SCAN_TOP = int(os.getenv("SEETG_MARKET_SCAN_TOP", "3"))
+# Маркет по умолчанию для `--market-scan`. Выбран не нами: в прогоне
+# 19.10.2026 все шесть пар покупались на mrkt, и по сделкам он же крупнейший
+# (2910 уникальных против 1804 у portals за восемь часов потока).
+SEETG_BUY_MARKET = os.getenv("SEETG_BUY_MARKET", "mrkt")
+
+
+def seetg_market_gaps(slug: str, market: str):
+    """
+    Модели, у которых НА ОДНОМ МАРКЕТЕ есть разрыв между первым и вторым
+    лотом. Один запрос на коллекцию. (список, пояснение).
+
+    ЗАЧЕМ ЭТО ОТДЕЛЬНО ОТ `seetg_cross_market()`. Там кандидат выбирается по
+    БОРДЕ: модель попадает в просмотр, только если floor одного маркета ниже
+    floor другого. Значит модель, у которой на mrkt стоят лоты 3.00 и 4.50, а
+    межмаркетной разницы нет, не становится кандидатом ВООБЩЕ — её лестницу
+    никто не запрашивает. Это дыра в покрытии, а не осторожность, и видно её
+    стало на числах: в прогоне 19.10.2026 у всех шести выживших пар конкурент
+    стоял на ТОМ ЖЕ маркете, то есть внутримаркетные разрывы и были
+    единственным, что доходило до вердикта, — но доходило случайно, попутно с
+    межмаркетной разницей.
+
+    ПОЧЕМУ ВТОРОЙ ЛОТ МОДЕЛИ В СТРАНИЦЕ — ДЕЙСТВИТЕЛЬНО ВТОРОЙ, А НЕ «ТОТ,
+    ЧТО МЫ УВИДЕЛИ». Страница — это N самых дешёвых лотов коллекции по
+    возрастанию цены. Значит в ней лежат ВСЕ лоты дешевле её последней
+    строки. Если мы видим два лота модели по 3.00 и 4.50, то третьего между
+    ними быть не может: он был бы дешевле 4.50 и тоже попал бы в страницу.
+    Это доказательство, а не допущение, — в отличие от пяти случаев в этом
+    проекте, где вывод о целом делался по куску выборки. Обрезка страницы
+    может только СКРЫТЬ модель, то есть ошибается в безопасную сторону.
+
+    Рассуждение не зависит от того, работает ли их фильтр `market`: если он
+    игнорируется, страница — самые дешёвые лоты по всем маркетам, и любой
+    лот нужного маркета дешевле нашего конкурента всё равно был бы в ней.
+    Поэтому маркет решает ОТВЕТ (`saleInfo.market`), а не параметр запроса —
+    тот же приём, что в `seetg_cheapest_on()`.
+    """
+    rows = _seetg_rows(seetg_get("/gifts", {
+        "collection": slug, "on_sale": "true", "market": market,
+        "sort": "price", "limit": SEETG_MARKET_SCAN_LIMIT}))
+    if not rows:
+        return [], "выставленных лотов не отдали"
+    by_model, on_market = {}, 0
+    for gift in rows:
+        offer = _seetg_offer_on(gift, market)
+        if offer is None:
+            continue
+        on_market += 1
+        model = ((gift.get("model") or {}).get("name") or "")
+        if not model:
+            continue
+        by_model.setdefault(model, []).append({
+            "price": offer["price"], "market": offer.get("market") or market,
+            "link": offer.get("link"), "num": gift.get("num"),
+            "address": gift.get("giftAddress") or ""})
+    note = (f"лотов в выборке {len(rows)}, из них на «{market}» {on_market}, "
+            f"моделей с двумя и более лотами "
+            f"{sum(1 for v in by_model.values() if len(v) > 1)}")
+    out = []
+    for model, lots in by_model.items():
+        if len(lots) < 2:
+            continue
+        lots.sort(key=lambda x: x["price"])
+        buy, rival = lots[0], lots[1]
+        if rival["price"] <= buy["price"]:
+            continue                     # два одинаковых ценника — не разрыв
+        profit = compute_net_profit(rival["price"], buy["price"])
+        if profit <= 0:
+            continue
+        out.append({
+            "model": model, "buy": buy, "rival": rival,
+            "buy_floor": buy["price"], "sell_floor": rival["price"],
+            "profit": profit,
+            "roi": compute_roi_pct(profit, buy["price"]),
+            "seen": len(lots)})
+    out.sort(key=lambda g: g["roi"], reverse=True)
+    return out, note
+
+
+def _same_lot(a: dict, b: dict) -> bool:
+    """Один и тот же лот: сначала по адресу, иначе по номеру и маркету."""
+    if a.get("address") and b.get("address"):
+        return a["address"] == b["address"]
+    if a.get("num") is not None and b.get("num") is not None:
+        return (a["num"] == b["num"]
+                and str(a.get("market") or "").lower()
+                == str(b.get("market") or "").lower())
+    return False
+
+
+def seetg_confirm_market_gap(slug: str, gap: dict):
+    """
+    Проверка разрыва ВНУТРИ маркета полной лестницей. (вердикт, причина).
+
+    ПОЧЕМУ ОДНОГО МАРКЕТА МАЛО, хотя покупка и продажа идут на нём.
+    Продаём мы не маркету, а ПОКУПАТЕЛЮ, и он видит все пять витрин сразу —
+    это измерено 07.10.2026 на Candy Canes, где борда обещала +3.29, а
+    ближайший лот на соседнем маркете превратил связку в −0.17. Владелец
+    сказал это и сам: «покупаю на Getgems — я плачу больше, на MRKT меньше
+    стоит». Значит конкурент берётся из лестницы ПО ВСЕМ МАРКЕТАМ, даже
+    когда сделка планируется внутри одного.
+
+    Свой лот из лестницы ВЫЧЁРКИВАЕТСЯ ровно один раз — иначе лот
+    сравнивался бы со статистикой, в которую сам входит (та же ошибка, что
+    чинилась в `cheapest_rival()` 23.09.2026).
+
+    Оценка от этой проверки только ПАДАЕТ: конкурент на чужом маркете может
+    быть дешевле нашего соседа по витрине, но не дороже — дороже мы его
+    просто не возьмём, останется сосед.
+    """
+    ladder = seetg_model_ladder(slug, gap["model"])
+    if not ladder:
+        return None, "лотов этой модели не отдали"
+    buy = gap["buy"]
+    rest, dropped = [], False
+    for lot in ladder:
+        if not dropped and _same_lot(lot, buy):
+            dropped = True
+            continue
+        rest.append(lot)
+    if not rest:
+        return None, f"в лестнице из {len(ladder)} лотов нет никого, кроме нашего"
+    rival = rest[0]
+    if rival["price"] <= buy["price"]:
+        return None, (f"на «{rival.get('market')}» та же модель стоит "
+                      f"{rival['price']} — дешевле нашей покупки "
+                      f"{buy['price']}, вставать не под кого")
+    profit = compute_net_profit(rival["price"], buy["price"])
+    return {
+        "buy": buy, "sell": rival, "ladder": ladder,
+        "sell_floor": rival["price"], "profit": profit,
+        "roi": compute_roi_pct(profit, buy["price"]),
+        "same_market": (str(buy.get("market") or "").lower()
+                        == str(rival.get("market") or "").lower()),
+        "note": (f"лестница: {len(ladder)} лотов, конкурент на "
+                 f"«{rival.get('market')}»"),
+    }, ""
+
+
 def seetg_confirm_pair(slug: str, model: str, pair: dict):
     """
     ЖИВЫЕ ЛОТЫ ПОД ОБЕ СТОРОНЫ ПАРЫ. Возвращает (данные, причина отказа).
@@ -6274,6 +6418,130 @@ def seetg_sales_probe(ref: str = ""):
     log.info("Что искать в сырье: поле с ЦЕНОЙ и типом события «продажа». "
              "Если оно есть — средняя цена сделок считается по нему и идёт "
              "в уведомление. Если нет — источника цен сделок у нас нет.")
+    return True
+
+
+def seetg_market_report(market: str = "", limit_collections: int = 0):
+    """
+    `--market-scan [МАРКЕТ]`: разрывы ВНУТРИ одного маркета (по умолчанию
+    mrkt) — купить самый дешёвый лот модели и встать под второй на той же
+    витрине. Ничего не покупает и в телефон не шлёт.
+
+    ПРОСЬБА ВЛАДЕЛЬЦА ДОСЛОВНО: «всех маркетов не надо, давай только mrkt
+    проверим — на нём купить и продать». Это не сужение ради удобства, а
+    самый СРАВНИМЫЙ случай: обе цены стоят на одной витрине, состав лотов
+    там один, и межмаркетные комиссии (измерены только у Getgems) в
+    сравнение не входят.
+
+    ЧЕМ ЭТО ОТЛИЧАЕТСЯ ОТ `--seetg-arb` И ЗАЧЕМ ОТДЕЛЬНЫЙ РЕЖИМ. Там
+    кандидат выбирается по БОРДЕ, то есть по разнице floor между маркетами,
+    и модель без такой разницы до лестницы не доходит вовсе. Здесь кандидат
+    берётся из самой витрины маркета, поэтому видны разрывы, которых тот
+    путь не искал.
+
+    ВЕРДИКТ ВСЁ РАВНО ПО ВСЕМ МАРКЕТАМ. Покупатель видит пять витрин сразу,
+    и лот с соседнего маркета уводит его независимо от того, где мы решили
+    торговать. Поэтому кандидат подтверждается полной лестницей, а числа от
+    этого только падают.
+
+    Расход: 1 запрос на коллекцию плюс по одному на кандидата
+    (`SEETG_MARKET_SCAN_TOP`). При трёх коллекциях это 12 из суточных 95.
+    """
+    if not SEETG_TOKEN:
+        log.error("SEETG_TOKEN не задан. Токен: мини-апп see.tg -> Полезное "
+                  "-> API. Вписать в deploy\\my-secrets.bat.")
+        return False
+    market = (market or SEETG_BUY_MARKET).strip().lower()
+    colls = TARGET_COLLECTIONS[:limit_collections] if limit_collections \
+        else TARGET_COLLECTIONS
+    log.info(f"{_Color.BOLD}Разрывы ВНУТРИ маркета «{market}»: "
+             f"{len(colls)} коллекций. Бюджет: осталось "
+             f"{seetg_budget_left()} из {SEETG_DAILY_BUDGET}.{_Color.RESET}")
+
+    total, shown, passed, fits = 0, 0, 0, 0
+    for coll in colls:
+        key = f"seetg_slug:{normalize_ton_address(coll) or coll}"
+        slug, name = meta_get(key), ""
+        if not slug:
+            try:
+                snap = get_market_snapshot(coll)
+            except Exception as e:                      # noqa: BLE001
+                log.error(f"{_short(coll)}: {e}")
+                continue
+            items = snap.get("on_sale") or []
+            name = items[0].get("collection_name") if items else ""
+            slug, why = seetg_slug_for(coll, name or "", items)
+            if not slug:
+                log.warning(f"{_short(coll)}: слаг неизвестен — {why}")
+                continue
+        log.info("")
+        log.info(f"{_Color.BOLD}{slug}{_Color.RESET}")
+        try:
+            gaps, note = seetg_market_gaps(slug, market)
+        except RateLimited as e:
+            log.error(f"  {e}")
+            break
+        except Exception as e:                          # noqa: BLE001
+            log.error(f"  сбой: {e}")
+            continue
+        log.info(f"  {note}")
+        if not gaps:
+            # Пустота НАЗЫВАЕТСЯ: «разрывов нет» и «лотов не дали» — разные
+            # состояния с разными решениями, и молчание их не различает.
+            log.info(f"  положительных разрывов на «{market}» нет")
+            continue
+        for gap in gaps[:SEETG_MARKET_SCAN_TOP]:
+            total += 1
+            log.info(f"  {_Color.GREY}«{gap['model']}» по витрине "
+                     f"«{market}» (ПРЕДВАРИТЕЛЬНО): купить "
+                     f"{gap['buy']['price']} → встать под "
+                     f"{gap['rival']['price']} → {gap['profit']:+.4f} TON, "
+                     f"ROI {gap['roi']}% (лотов модели в выборке "
+                     f"{gap['seen']}){_Color.RESET}")
+            try:
+                conf, why = seetg_confirm_market_gap(slug, gap)
+            except RateLimited as e:
+                log.error(f"      {e}")
+                break
+            except Exception as e:                      # noqa: BLE001
+                log.warning(f"      лестницу не получили: {e}")
+                continue
+            if conf is None:
+                log.info(f"      {_Color.YELLOW}связки нет: {why}"
+                         f"{_Color.RESET}")
+                continue
+            shown += 1
+            ok = conf["roi"] >= SEETG_ARB_MIN_ROI_PCT
+            if ok:
+                passed += 1
+                if owner_can_pay(conf["buy"]["price"])[0]:
+                    fits += 1
+            col = _Color.GREEN if ok else _Color.YELLOW
+            log.info(f"      {col}ПО ЛЕСТНИЦЕ: купить {conf['buy']['price']} "
+                     f"на «{conf['buy']['market']}» → встать под "
+                     f"{conf['sell']['price']} на «{conf['sell']['market']}» "
+                     f"→ {conf['profit']:+.4f} TON, ROI {conf['roi']}%"
+                     f"{_Color.RESET}")
+            log.info(f"      {conf['note']}"
+                     + ("; покупка и продажа на ОДНОМ маркете"
+                        if conf.get("same_market")
+                        else "; конкурент НА ДРУГОМ маркете — продать внутри "
+                             "«" + market + "» по этой цене не выйдет"))
+            if conf["buy"].get("link"):
+                log.info(f"      купить: {conf['buy']['link']}")
+            for _ln in model_sales_lines(
+                    slug, gap["model"], target_sale_price(conf["sell_floor"]),
+                    gap["buy_floor"]):
+                log.info(f"      {_ln}")
+    log.info("")
+    log.info(f"{_Color.BOLD}Разрывов на «{market}»: {total} → подтверждено "
+             f"лестницей по ВСЕМ маркетам: {shown} → ROI >= "
+             f"{SEETG_ARB_MIN_ROI_PCT}%: {passed} → по карману и потолку "
+             f"{MAX_NOTIFY_PRICE_TON} TON: {fits}.{_Color.RESET}")
+    log.info(f"{_Color.BOLD}Ритм see.tg: {seetg_pace_line()}."
+             f"{_Color.RESET}")
+    log.info("Бот сам вне Getgems купить не может — сделка ручная, отметить: "
+             "--bought СЛАГ-НОМЕР ЦЕНА.")
     return True
 
 
@@ -10808,6 +11076,11 @@ def parse_args(argv=None):
                         help="арбитраж маркетов по МОДЕЛЯМ по данным see.tg: "
                              "где модель дешевле и где дороже; ничего не "
                              "покупает")
+    parser.add_argument("--market-scan", nargs="?", const="", metavar="МАРКЕТ",
+                        help="разрывы ВНУТРИ одного маркета (по умолчанию "
+                             "mrkt): купить самый дешёвый лот модели и "
+                             "встать под второй на той же витрине; вердикт "
+                             "всё равно по лестнице всех маркетов")
     parser.add_argument("--seetg-watch", nargs="?", const=0, type=int,
                         metavar="SEC",
                         help="слушать поток и копить ЦЕНЫ СДЕЛОК по своим "
@@ -10923,6 +11196,9 @@ if __name__ == "__main__":
         if getattr(args, "seetg_arb", False):
             # Ходит в сеть, НИЧЕГО не покупает и в запись не пишет.
             sys.exit(0 if seetg_arb_report() else 1)
+        if getattr(args, "market_scan", None) is not None:
+            # То же самое: сеть, но ни покупок, ни записи.
+            sys.exit(0 if seetg_market_report(args.market_scan) else 1)
         if args.bought:
             if not 2 <= len(args.bought) <= 3:
                 log.error("Нужно: --bought АДРЕС ЦЕНА [FLOOR_КОНКУРЕНТА]")
