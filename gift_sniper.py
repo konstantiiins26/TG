@@ -5117,6 +5117,10 @@ SEETG_WS_URL = os.getenv("SEETG_WS_URL", "wss://live.see.tg/v1/ws")
 SEETG_WS_SECONDS = int(os.getenv("SEETG_WS_SECONDS", "60"))
 SEETG_WS_SHOW = int(os.getenv("SEETG_WS_SHOW", "10"))
 _WS_TICK_SEC = 30.0        # как часто говорить «жду» при тихом потоке
+# Сколько должно прожить соединение, чтобы считаться удачным. Короче — это
+# обрыв, и повтор обязан идти с выдержкой: иначе получается горячий перезвон
+# к их серверу, а это прямо то, за что блокируется аккаунт see.tg целиком.
+_WS_GOOD_SESSION_SEC = 30.0
 # Кадры, которые НЕ являются событиями рынка. `hello` измерен живым прогоном
 # 07.10.2026; остальные типичны для WebSocket и стоят здесь на случай, если
 # придут, — лишнее имя тут безопасно, а пропущенное служебное имя завысило
@@ -5335,6 +5339,7 @@ SEETG_LISTING_CHECKS_PER_HOUR = int(
 SEETG_WATCH_LISTINGS = os.getenv("SEETG_WATCH_LISTINGS", "1") != "0"
 
 _listing_check_ts: list = []
+_listing_quota_said = False
 
 
 def seetg_listing_from_frame(obj: dict):
@@ -5445,6 +5450,18 @@ def check_listing_candidate(lst: dict) -> bool:
     `sell_floor = None` — честное «борды нет»: у листинга из потока нет
     обещания борды вовсе, и сторону продажи целиком решает лестница.
     """
+    # КВОТА КОНЧИЛАСЬ — ЛЕСТНИЦУ НЕ СПРАШИВАЕМ ВОВСЕ. Проверка локальная и
+    # бесплатная, а без неё КАЖДЫЙ листинг печатал бы одно и то же
+    # предупреждение на полэкрана (живой лог 23.10.2026). Повторяющаяся
+    # строка становится фоном — тот же довод, что у `HEARTBEAT_MIN`.
+    global _listing_quota_said
+    if seetg_budget_left() <= 0:
+        if not _listing_quota_said:
+            _listing_quota_said = True
+            log.warning(f"{_Color.YELLOW}Листинги больше не проверяются: "
+                        f"суточный бюджет see.tg исчерпан. Сделки писать "
+                        f"продолжаю — поток квоты не тратит.{_Color.RESET}")
+        return False
     now = time.time()
     _listing_check_ts[:] = [t for t in _listing_check_ts if now - t < 3600]
     if len(_listing_check_ts) >= SEETG_LISTING_CHECKS_PER_HOUR:
@@ -5681,7 +5698,18 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
                 break
             time.sleep(pause)
             continue
-        attempt = 0
+        # ВЫДЕРЖКА СЧИТАЕТСЯ ПО ЖИЗНИ СЕССИИ, А НЕ ПО ОТКАЗУ ОТКРЫТИЯ.
+        # Раньше `attempt` обнулялся СРАЗУ после удачного `connect`, и если
+        # соединение тут же рвалось («Connection to remote host was lost»),
+        # цикл уходил в ГОРЯЧИЙ ПЕРЕЗВОН: открыть — упало — открыть, десятки
+        # раз в секунду. Живой лог 23.10.2026 это и показал — тридцать строк
+        # обрыва за пять секунд.
+        #
+        # Это не косметика: правила see.tg запрещают обход лимитов и нагрузку,
+        # а блокируется АККАУНТ целиком. Удачным считается соединение, которое
+        # ПРОЖИЛО `_WS_GOOD_SESSION_SEC`; всё короче — такая же неудача, как
+        # не открывшееся вовсе.
+        opened_at = time.time()
         ticked = 0.0
         try:
             ws.send(json.dumps(dict(_WS_SUBSCRIBE, events=want)))
@@ -5792,6 +5820,17 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
                 ws.close()
             except Exception:                          # noqa: BLE001
                 pass
+        lived = time.time() - opened_at
+        if lived >= _WS_GOOD_SESSION_SEC:
+            attempt = 0
+            continue
+        attempt += 1
+        pause = min(60.0, 2.0 ** attempt)
+        log.warning(f"Соединение прожило {lived:.1f}с — это обрыв, а не "
+                    f"работа; пауза {pause:.0f}с перед повтором")
+        if time.time() - started + pause >= seconds:
+            break
+        time.sleep(pause)
 
     log.info(f"Записано сделок: {saved} (повторов {dup}), по коллекциям: "
              f"{by_slug or '—'}")

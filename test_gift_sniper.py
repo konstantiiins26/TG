@@ -7647,6 +7647,93 @@ check("листинги в запись рынка не пишутся",
       "record_snapshot" not in _src90.split("def seetg_listing_from_frame")[1]
       .split("def record_sale")[0])
 
+# =============================================================================
+# [91] ГОРЯЧИЙ ПЕРЕЗВОН К ПОТОКУ И КВОТА НА ЛИСТИНГАХ
+# =============================================================================
+# Живой лог 23.10.2026: тридцать строк «Connection to remote host was lost»
+# за пять секунд. `attempt` обнулялся СРАЗУ после удачного `connect`, а
+# соединение рвалось тут же — выдержка не наступала никогда. Правила see.tg
+# запрещают нагрузку, и блокируется АККАУНТ целиком, так что это не
+# косметика.
+
+_src91 = open("gift_sniper.py", encoding="utf-8").read()
+check("удачным считается ПРОЖИВШЕЕ соединение, а не открывшееся",
+      "_WS_GOOD_SESSION_SEC" in _src91 and
+      "lived = time.time() - opened_at" in _src91)
+check("обнуления выдержки сразу после connect больше нет",
+      "attempt = 0\n        ticked" not in _src91)
+
+
+class _DeadWS91:
+    """Соединение, которое открывается и сразу рвётся."""
+    def __init__(self): self.closed = False
+    def send(self, *a, **k): pass
+    def settimeout(self, *a, **k): pass
+    def recv(self):
+        raise RuntimeError("Connection to remote host was lost.")
+    def close(self): self.closed = True
+
+
+_tries91 = []
+_o_conn91, _o_tok91 = gs._ws_connect, gs.SEETG_TOKEN
+_o_slugs91, _o_sleep91 = gs.known_seetg_slugs, time.sleep
+try:
+    gs.SEETG_TOKEN = "1:x"
+    gs.known_seetg_slugs = lambda: {"CandyCane"}
+    gs._ws_connect = lambda *a, **k: (
+        _tries91.append(time.time()), (_DeadWS91(), None))[1]
+    gs.seetg_watch_sales(3)
+finally:
+    gs._ws_connect, gs.SEETG_TOKEN = _o_conn91, _o_tok91
+    gs.known_seetg_slugs, time.sleep = _o_slugs91, _o_sleep91
+
+# Без выдержки этот цикл успел бы сотни подключений за три секунды.
+check("мгновенный обрыв уходит в выдержку, а не в горячий перезвон",
+      1 <= len(_tries91) <= 4, f"подключений: {len(_tries91)}")
+
+# --- КВОТА: при исчерпанном бюджете лестницу не спрашиваем ВООБЩЕ ---------
+# Иначе КАЖДЫЙ листинг печатает одно и то же предупреждение на полэкрана
+# (живой лог 23.10.2026) — повторяющаяся строка становится фоном.
+_o_left91, _o_said91 = gs.seetg_budget_left, gs._listing_quota_said
+_h91 = _Collect89()
+gs.log.addHandler(_h91)
+try:
+    gs.seetg_budget_left = lambda: 0
+    gs._listing_quota_said = False
+    _calls91 = []
+    _o_not91 = gs.notify_seetg_arb
+    gs.notify_seetg_arb = lambda *a, **k: _calls91.append(1) or False
+    try:
+        for _ in range(5):
+            gs.check_listing_candidate(dict(_l90))
+    finally:
+        gs.notify_seetg_arb = _o_not91
+finally:
+    gs.log.removeHandler(_h91)
+    gs.seetg_budget_left, gs._listing_quota_said = _o_left91, _o_said91
+_out91 = "\n".join(_h91.lines)
+check("при исчерпанной квоте лестница не запрашивается", not _calls91)
+check("причина названа ОДИН раз, а не на каждом листинге",
+      _out91.count("суточный бюджет see.tg исчерпан") == 1, _out91)
+# Поток квоты не тратит — сделки писать продолжаем, и это сказано вслух.
+check("сказано, что сделки писать продолжаем", "Сделки писать" in _out91)
+
+# --- НАСТРОЙКИ ВЛАДЕЛЬЦА ПЕРЕЖИВАЮТ `git pull` ---------------------------
+# 23.10.2026: `SEETG_DAILY_BUDGET=2600` был вписан в ОТСЛЕЖИВАЕМЫЙ
+# settings.bat, и pull вернул его к 95 — бот полсуток планировал ритм под
+# квоту, которой нет. Тот же класс, что ключи в start-windows.bat.
+_set91 = open("deploy/settings.bat", encoding="utf-8").read()
+check("my-secrets.bat вызывается ДВАЖДЫ — и второй раз в конце",
+      _set91.count('call "%~dp0my-secrets.bat"') == 2 and
+      _set91.rfind('call "%~dp0my-secrets.bat"')
+      > _set91.rfind("set SEETG_DAILY_BUDGET=95"))
+check("в файле названа причина, а не просто вызов",
+      "lovushka" in _set91 and "SEETG_DAILY_BUDGET=2600" in _set91)
+# Правила .bat из CLAUDE.md: только латиница и никаких «)» внутри echo.
+_new91 = _set91.split("VASHI ZNACHENIYA")[1]
+check("добавленный блок на латинице",
+      all(ord(c) < 128 for c in _new91))
+
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
     sys.exit(1)

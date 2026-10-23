@@ -117,6 +117,11 @@ echo === Sozdayu deploy\my-secrets.bat ===
 >> "%~dp0my-secrets.bat" echo REM   mini-app see.tg -^> Poleznoe -^> API -^> sozdat prilozhenie.
 >> "%~dp0my-secrets.bat" echo REM Vid tokena: id:secret. Bez nego rabotaet tolko TonAPI.
 >> "%~dp0my-secrets.bat" echo set SEETG_TOKEN=
+>> "%~dp0my-secrets.bat" echo REM.
+>> "%~dp0my-secrets.bat" echo REM SYUDA ZHE - lyubye VASHI nastroyki: etot fail
+>> "%~dp0my-secrets.bat" echo REM vyzyvaetsya POSLEDNIM, poetomu perebivaet settings.bat,
+>> "%~dp0my-secrets.bat" echo REM i git pull ego nikogda ne zatret. Naprimer:
+>> "%~dp0my-secrets.bat" echo REM   set SEETG_DAILY_BUDGET=2600
 echo Fail sozdan. Vpishite v nego klyuchi i zapustite etot bat zanovo.
 echo.
 
@@ -391,5 +396,25 @@ REM
 REM Bez etoy stroki beretsya znachenie po umolchaniyu 1.1 - bezopasnoe dlya
 REM Free, no vprityk. Raskommentiruyte nuzhnoe.
 REM set TONAPI_MIN_INTERVAL=2.0
+
+REM ================================================================
+REM  VASHI ZNACHENIYA PEREBIVAYUT VSE, CHTO VYSHE.
+REM
+REM  my-secrets.bat vyzyvaetsya VTOROY raz - imenno zdes, v konce.
+REM  Prichina izmerena 23.10.2026: vladelec vpisal SEETG_DAILY_BUDGET=2600
+REM  pryamo v etot fail, a ocherednoy git pull vernul ego k 95 - i bot
+REM  polsutok rabotal pod kvotu, kotoroy net. Tot zhe klass, chto klyuchi
+REM  v start-windows.bat: fail v repozitorii, kuda vy vpisyvaete svoe
+REM  znachenie, - eto ne konfiguraciya, a lovushka.
+REM
+REM  Lyubuyu nastroyku iz etogo faila mozhno pereopredelit v
+REM  deploy\my-secrets.bat - on v .gitignore, pull ego NE trogaet.
+REM  Naprimer, posle popolneniya balansa see.tg:
+REM     set SEETG_DAILY_BUDGET=2600
+REM  ili:
+REM     set MAX_NOTIFY_PRICE_TON=17
+REM     set TONAPI_MIN_INTERVAL=2.0
+REM ================================================================
+if exist "%~dp0my-secrets.bat" call "%~dp0my-secrets.bat"
 
 REM Konec nastroek. Zapusk - v run.bat ili start-windows.bat.
