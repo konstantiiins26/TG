@@ -4748,13 +4748,21 @@ def notify_seetg_arb(name: str, slug: str, pair: dict,
     global _seetg_arb_suppressed, _seetg_arb_unconfirmed
     global _seetg_ladder_cut, _seetg_arb_sent
     if SEETG_ARB_NOTIFY_MAX_PER_HOUR <= 0:
+        log.info(f"{_Color.GREY}      «{pair['model']}» НЕ отправлена: "
+                 f"уведомления о связках выключены "
+                 f"(SEETG_ARB_NOTIFY_MAX_PER_HOUR=0){_Color.RESET}")
         return False
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not _tg_ready(f"связка «{pair['model']}»"):
         return False
     now = time.time()
     _seetg_arb_sent_ts[:] = [t for t in _seetg_arb_sent_ts if now - t < 3600]
     if len(_seetg_arb_sent_ts) >= SEETG_ARB_NOTIFY_MAX_PER_HOUR:
+        # Часовой потолок. Счёт уходит в сводку, но сводка идёт ТУДА ЖЕ, в
+        # телефон, — значит в логе отказ обязан называть себя сам.
         _seetg_arb_suppressed += 1
+        log.info(f"{_Color.GREY}      «{pair['model']}» НЕ отправлена: уже "
+                 f"{SEETG_ARB_NOTIFY_MAX_PER_HOUR} связок за час "
+                 f"(SEETG_ARB_NOTIFY_MAX_PER_HOUR){_Color.RESET}")
         return False
     _seetg_arb_sent_ts.append(now)
 
@@ -5043,6 +5051,13 @@ def scan_seetg_arbitrage(snap: dict) -> int:
         if not _affordable(pair["buy_floor"], f"«{pair['model']}»"):
             continue
         if _seetg_arb_already_seen(slug, pair):
+            # Молчаливый `continue` в цепочке ворот неотличим от «пары не
+            # было»: владелец видит строку «предварительно …» и пустой
+            # телефон. Повтор глушим, но не молча.
+            log.info(f"{_Color.GREY}      «{pair['model']}» по этим ценам уже "
+                     f"показывали — выдержка повтора "
+                     f"{SEETG_ARB_SEEN_TTL_SEC // 3600}ч "
+                     f"(SEETG_ARB_SEEN_TTL_SEC){_Color.RESET}")
             continue
         if notify_seetg_arb(name or slug, slug, pair, collection):
             notified += 1
@@ -6866,7 +6881,7 @@ def notify_segment_bargain(b: dict) -> bool:
     global _segment_suppressed
     if SEGMENT_NOTIFY_MAX_PER_HOUR <= 0:
         return False
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not _tg_ready():
         return False
     now = time.time()
     _segment_sent_ts[:] = [t for t in _segment_sent_ts if now - t < 3600]
@@ -8004,6 +8019,51 @@ def check_risk_limits(buy_price: Decimal, roi_pct=None):
     return True, "лимиты в норме"
 
 
+_tg_unconfigured_said = False
+
+
+def _tg_ready(what: str = "") -> bool:
+    """
+    Настроен ли канал в Telegram. Говорит ПРИЧИНУ, а не возвращает False молча.
+
+    СЕМЬ мест в файле проверяли `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` и
+    при пустых значениях выходили БЕЗ ЕДИНОЙ СТРОКИ В ЛОГЕ. Бот с пустым
+    токеном писал ровно зелёный лог, находил связки и не отправлял ничего —
+    а владелец видел ту же картину, что при пустом рынке. Два состояния с
+    противоположными решениями под одним симптомом: в первом чинят настройку,
+    во втором ждут или меняют коллекции. Поймано живым прогоном 23.10.2026,
+    где пары с ROI 18.39%, 11.23% и 8.28% прошли ВСЕ ворота и исчезли.
+
+    Это тот же урок, что стоил суток 21.09.2026 (`notify()` не проверяла
+    ОТВЕТ Telegram), только для случая, когда запроса не было вовсе: тогда
+    молчал отказ сервера, теперь молчало отсутствие попытки. И то же правило
+    про несколько потребителей одного значения — проверка одна на всех.
+
+    Громкая строка идёт ОДИН раз за прогон: при двенадцати парах за цикл она
+    стала бы фоном, а фон перестают читать (довод `HEARTBEAT_MIN`). Зато
+    каждое потерянное сообщение называется отдельной серой строкой — иначе
+    непонятно, что именно не ушло.
+    """
+    global _tg_unconfigured_said
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        return True
+    if not _tg_unconfigured_said:
+        _tg_unconfigured_said = True
+        miss = " и ".join(n for n, v in (("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
+                                         ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID))
+                          if not v)
+        log.error(f"{_Color.RED}УВЕДОМЛЕНИЙ НЕ БУДЕТ: не задано {miss}. "
+                  f"Бот продолжит считать и писать в лог, но в телефон не "
+                  f"уйдёт НИЧЕГО — ни находки, ни связки, ни сводка. "
+                  f"Значения вписывают в deploy\\my-secrets.bat (этот файл "
+                  f"не отслеживается git, pull его не трогает), проверяют "
+                  f"командой: deploy\\run.bat --test-telegram{_Color.RESET}")
+    if what:
+        log.info(f"{_Color.GREY}      {what} — в телефон НЕ уйдёт: "
+                 f"Telegram не настроен{_Color.RESET}")
+    return False
+
+
 def _tg_call(method: str, payload: dict):
     """
     Один запрос к Telegram. Возвращает тело ответа (dict) либо None.
@@ -8013,7 +8073,7 @@ def _tg_call(method: str, payload: dict):
     неверный токен это обычный HTTP 401. В лог попадает ТОЛЬКО описание от
     Telegram: токен лежит прямо в URL, и адрес логировать нельзя.
     """
-    if not TELEGRAM_BOT_TOKEN:
+    if not _tg_ready():
         return None
     try:
         r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}",
@@ -8079,7 +8139,7 @@ def notify(text: str) -> bool:
     неизвестный chat_id — 400, и код без проверки статуса считал их успехом.
     Владелец видел ровный зелёный лог и пустой чат. Поймано 21.09.2026.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not _tg_ready():
         return False
     return _tg_call("sendMessage",
                     {"chat_id": TELEGRAM_CHAT_ID, "text": text}) is not None
@@ -8235,7 +8295,7 @@ def notify_heartbeat(snapshots: list, force: bool = False):
     от упавшего, а болтливый — от шума.
     """
     global _last_heartbeat
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not _tg_ready():
         return False
     now = time.time()
     if not force and (now - _last_heartbeat) < HEARTBEAT_MIN * 60:
@@ -8401,7 +8461,7 @@ def notify_find(item: dict, snap: dict, ev: dict) -> bool:
     global _finds_suppressed
     if FIND_NOTIFY_MAX_PER_HOUR <= 0:
         return False
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not _tg_ready():
         return False
 
     now = time.time()
@@ -8572,7 +8632,7 @@ def poll_telegram_callbacks() -> int:
     приходит с id того, кто нажал: всё, что не из `TELEGRAM_CHAT_ID`,
     отбрасывается. Иначе посторонний открывал бы позиции в чужом учёте.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not _tg_ready():
         return 0
 
     offset = meta_get("tg_offset")
@@ -8710,7 +8770,7 @@ def notify_startup(collections):
     перезапуске на Windows. Тихо стартовать с другими значениями, чем вы
     думаете, — самый дешёвый способ испортить запись рынка.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not _tg_ready():
         return False
     mode = "СИМУЛЯЦИЯ" if DRY_RUN else "ЖИВАЯ ТОРГОВЛЯ"
     lines = [

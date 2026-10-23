@@ -7312,6 +7312,126 @@ check("оба читателя зовут общий отбор, а не реж�
 check("в сводке ноль назван «все», а не числом",
       '"(все)" if SEETG_ARB_LOG_TOP <= 0' in _src83)
 
+# =============================================================================
+# [89] МОЛЧАЛИВЫЕ ВОРОТА TELEGRAM
+# =============================================================================
+# Живой прогон 23.10.2026: пары с ROI 18.39%, 11.23%, 8.28% прошли порог,
+# потолок цены и банк — и исчезли без единой строки в логе. Все семь мест,
+# проверявших токен и chat_id, возвращали False МОЛЧА, поэтому «не настроено»
+# выглядело в логе ровно как «рынок пуст». Решения у этих состояний
+# противоположные: в первом чинят настройку, во втором ждут.
+
+_src89 = open("gift_sniper.py", encoding="utf-8").read()
+
+
+class _Collect89(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+def _tg_ready_out(token, chat, what=""):
+    """Зовёт _tg_ready при заданной конфигурации и отдаёт (результат, лог)."""
+    o_t, o_c, o_s = (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+                     gs._tg_unconfigured_said)
+    h = _Collect89()
+    gs.log.addHandler(h)
+    try:
+        gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = token, chat
+        gs._tg_unconfigured_said = False
+        res = gs._tg_ready(what)
+        res2 = gs._tg_ready(what)          # второй вызов того же прогона
+    finally:
+        gs.log.removeHandler(h)
+        gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = o_t, o_c
+        gs._tg_unconfigured_said = o_s
+    return res, res2, "\n".join(h.lines)
+
+
+_ok89, _ok89b, _log89 = _tg_ready_out("123:SECRETTOKEN", "777")
+check("настроенный канал — True и ни строки в логе",
+      _ok89 is True and _ok89b is True and _log89 == "")
+
+_no89, _no89b, _logno89 = _tg_ready_out("", "777", "связка «Sticky Sweet»")
+check("пустой токен — False", _no89 is False and _no89b is False)
+check("громкая строка называет ИМЕННО пустую переменную",
+      "TELEGRAM_BOT_TOKEN" in _logno89 and "TELEGRAM_CHAT_ID" not in
+      _logno89.split("Значения вписывают")[0])
+check("названо лечение одной командой",
+      "--test-telegram" in _logno89 and "my-secrets.bat" in _logno89)
+# Без этой строки владелец читает пустой телефон как пустой рынок.
+check("сказано, что НЕ уйдёт ничего",
+      "НИЧЕГО" in _logno89 and "сводка" in _logno89)
+# Довод HEARTBEAT_MIN: строка, повторяющаяся на каждой паре, становится фоном.
+check("громкая строка — один раз за прогон",
+      _logno89.count("УВЕДОМЛЕНИЙ НЕ БУДЕТ") == 1)
+# А вот ПОТЕРЯННОЕ сообщение обязано называться каждое: иначе непонятно, что
+# именно не ушло.
+check("каждое потерянное сообщение названо",
+      _logno89.count("Sticky Sweet") == 2 and
+      "в телефон НЕ уйдёт" in _logno89)
+
+_nc89, _, _lognc89 = _tg_ready_out("123:SECRETTOKEN", "")
+check("пустой chat_id ловится тоже",
+      _nc89 is False and "TELEGRAM_CHAT_ID" in _lognc89.split("Значения")[0])
+
+# Токен лежит в URL; в лог он не попадает ни одним путём — правило 21.09.2026.
+check("токен в лог не утекает",
+      "SECRETTOKEN" not in _logno89 + _lognc89)
+
+# ОДНА проверка на всех потребителей. Их было семь, и «поправили одного из
+# семи» в этом проекте выживало тринадцать раз.
+check("старой молчаливой проверки в файле не осталось",
+      "if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:" not in _src89)
+check("все потребители зовут общую проверку",
+      _src89.count("if not _tg_ready(") >= 7)
+# _tg_call тоже: раньше он выходил по пустому токену молча.
+check("_tg_call больше не молчит на пустом токене",
+      "    if not TELEGRAM_BOT_TOKEN:\n        return None" not in _src89)
+# Исключение намеренное: у --test-telegram своя диагностика с подсказками,
+# где именно взять токен и id, и она должна остаться отдельной.
+check("диагностика --test-telegram сохранила свои сообщения",
+      "TELEGRAM_BOT_TOKEN не задан" in _src89 and
+      "TELEGRAM_CHAT_ID не задан" in _src89)
+
+# --- остальные молчаливые ворота на пути связки в телефон -----------------
+check("выдержка повтора называет себя",
+      "по этим ценам уже" in _src89 and "SEETG_ARB_SEEN_TTL_SEC)" in _src89)
+check("часовой потолок называет себя",
+      "SEETG_ARB_NOTIFY_MAX_PER_HOUR)" in _src89 and
+      "связок за час" in _src89)
+check("выключенные уведомления о связках названы",
+      "SEETG_ARB_NOTIFY_MAX_PER_HOUR=0" in _src89)
+
+# Живой случай целиком: пара прошла все ворота, Telegram не настроен.
+_pair89 = {"model": "Sticky Sweet", "buy_market": "mrkt",
+           "buy_floor": Decimal("3.88"), "buy_n": 42,
+           "sell_market": "portals", "sell_floor": Decimal("4.99"),
+           "sell_n": 47, "profit": Decimal("0.7135"), "roi": Decimal("18.39")}
+_o_t89, _o_c89, _o_s89 = (gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID,
+                          gs._tg_unconfigured_said)
+_h89 = _Collect89()
+gs.log.addHandler(_h89)
+try:
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = "", ""
+    gs._tg_unconfigured_said = False
+    _sent89 = gs.notify_seetg_arb("CandyCane", "CandyCane", _pair89)
+finally:
+    gs.log.removeHandler(_h89)
+    gs.TELEGRAM_BOT_TOKEN, gs.TELEGRAM_CHAT_ID = _o_t89, _o_c89
+    gs._tg_unconfigured_said = _o_s89
+_out89 = "\n".join(_h89.lines)
+check("связка без настроенного Telegram не отправляется", _sent89 is False)
+# ГЛАВНОЕ: она не исчезает молча — иначе лог снова читается как пустой рынок.
+check("и говорит об этом, назвав пару",
+      "Sticky Sweet" in _out89 and "УВЕДОМЛЕНИЙ НЕ БУДЕТ" in _out89)
+# И не тратит квоту see.tg на лестницу: отправлять всё равно некуда.
+check("лестница при ненастроенном Telegram не запрашивается",
+      "не подтверждена лестницей" not in _out89)
+
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
     sys.exit(1)
