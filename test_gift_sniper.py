@@ -7211,16 +7211,39 @@ try:
           any(f"За последние {int(gs.SALES_FRESH_HOURS)}ч:" in x
               for x in _l87b))
 
-    # (3) ОКНО ПУСТОЕ: это НЕ «сделок нет» — числа выше про всю запись.
+    # (3) ОКНО ПУСТОЕ, НО ЗАПИСЬ ЖИВАЯ: это РЫНОК молчит по модели.
+    # Свежая сделка по ДРУГОЙ модели доказывает, что слушатель работает.
+    with gs.db_connect() as _c87:
+        _c87.execute("UPDATE sales SET seen_ts = ? WHERE at_iso LIKE 'n%'",
+                     (time.time() - 10 * 24 * 3600,))
+    gs._sales_age_cache = (None, None)
+    gs.record_sale(_sale72("ViceCream", 999, "Other Model", "mrkt",
+                           "4.0", "4.0", "fresh1"))
+    gs._sales_age_cache = (None, None)
+    _l87c = gs.model_sales_lines("ViceCream", "Red Dragon",
+                                 Decimal("4.30"), _buy87)
+    check("при живой записи молчание модели названо рынком",
+          any("НЕ БЫЛО" in x and "рынок" in x for x in _l87c))
+    check("при живой записи про слушателя НЕ пишем",
+          not any("слушатель" in x for x in _l87c))
+
+    # (4) ВСЯ ЗАПИСЬ СТАРШЕ ОКНА — молчит НЕ рынок, а слушатель. Живой
+    # случай 23.10.2026: строка «за 48ч сделок не было» горела у ВСЕХ
+    # восемнадцати моделей сразу, потому что --seetg-watch не был запущен.
     with gs.db_connect() as _c87:
         _c87.execute("UPDATE sales SET seen_ts = ?",
                      (time.time() - 10 * 24 * 3600,))
-    _l87c = gs.model_sales_lines("ViceCream", "Red Dragon",
+    gs._sales_age_cache = (None, None)
+    _l87d = gs.model_sales_lines("ViceCream", "Red Dragon",
                                  Decimal("4.30"), _buy87)
-    check("пустое окно названо, а не смолчано",
-          any("НЕ БЫЛО" in x and "всю запись" in x for x in _l87c))
+    check("мёртвая запись названа поломкой наблюдения, а не рынком",
+          any("НЕ ПОПОЛНЯЕТСЯ" in x and "seetg-watch" in x for x in _l87d))
+    check("про «рынок мог уехать» при мёртвой записи не пишем",
+          not any("рынок с тех пор" in x for x in _l87d))
     check("при пустом окне блок сделок всё равно есть",
-          any("По сделкам этой модели" in x for x in _l87c))
+          any("По сделкам этой модели" in x for x in _l87d))
+    check("возраст записи измеряется по ВСЕЙ таблице",
+          gs.sales_record_age_hours() > 48)
 
     # (4) ПОВТОРЫ СВЁРНУТЫ И В СВЕЖЕМ ОКНЕ. Иначе артефакт portals (одна
     # цена у одного предмета сто раз) утащил бы свежую медиану в пол —

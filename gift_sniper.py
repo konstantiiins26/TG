@@ -5624,6 +5624,49 @@ def _sale_reps(rows) -> set:
     return reps
 
 
+_sales_age_cache: tuple = (None, None)
+
+
+def sales_record_age_hours():
+    """
+    Сколько часов прошло с САМОЙ СВЕЖЕЙ записанной сделки — по ВСЕЙ таблице,
+    а не по одной модели. None, если сделок нет вовсе.
+
+    ЗАЧЕМ ОТДЕЛЬНОЕ ЧИСЛО. Строка «за последние 48ч сделок по этой модели не
+    было» имеет ДВЕ причины с противоположными решениями, и первый же живой
+    прогон (23.10.2026) показал их неразличимость: она горела у ВСЕХ
+    восемнадцати моделей сразу.
+
+      - по модели сделок нет, а запись свежая -> это РЫНОК, делать нечего;
+      - запись не пополняется вовсе -> `--seetg-watch` НЕ ЗАПУЩЕН, и лечится
+        это одной командой.
+
+    Восемнадцать из восемнадцати — не рыночное событие: те же коллекции в
+    прогоне 09.10.2026 давали тысячи сделок за восемь часов. Один запрос к
+    локальной БД различает случаи, и квоты see.tg он не стоит.
+
+    Кеш привязан к ПУТИ базы, а не «да/нет»: тесты подменяют `DB_PATH`, и
+    флаг от прошлой базы ответил бы про чужие данные (тот же принцип, что у
+    `_schema_ready_for`).
+    """
+    global _sales_age_cache
+    path, cached = _sales_age_cache
+    if path == DB_PATH and cached is not None:
+        return cached
+    try:
+        with db_connect() as conn:
+            row = conn.execute("SELECT MAX(seen_ts) AS t FROM sales").fetchone()
+    except Exception as e:                                  # noqa: BLE001
+        log.debug(f"возраст записи сделок не прочитан: {e}")
+        return None
+    newest = row["t"] if row else None
+    if not newest:
+        return None
+    age = max(0.0, (time.time() - float(newest)) / 3600)
+    _sales_age_cache = (DB_PATH, age)
+    return age
+
+
 def model_sales_fact(slug: str, model: str) -> dict:
     """
     СКОЛЬКО РЕАЛЬНО ПЛАТИЛИ ЗА ЭТУ МОДЕЛЬ — из НАШЕЙ ЖЕ записи потока.
@@ -5747,9 +5790,23 @@ def model_sales_lines(slug: str, model: str, planned_sale: Decimal,
     # и здесь, поэтому свежее окно может только УБАВИТЬ уверенность.
     fh = int(SALES_FRESH_HOURS)
     if not fact.get("fresh_trades"):
-        lines.append(f"🕒 За последние {fh}ч сделок по этой модели НЕ БЫЛО — "
-                     f"числа выше про всю запись ({fact['trades']} шт), и "
-                     f"рынок с тех пор мог уехать")
+        # ДВЕ ПРИЧИНЫ С ПРОТИВОПОЛОЖНЫМИ РЕШЕНИЯМИ. Если вся таблица старше
+        # окна, молчит не рынок, а наш слушатель — и это чинится командой,
+        # а не ожиданием. Писать про «рынок уехал» в этом случае значит
+        # отправить владельца ждать там, где надо запускать.
+        age = sales_record_age_hours()
+        if age is None or age > float(SALES_FRESH_HOURS):
+            when = ("сделок в записи нет вовсе" if age is None
+                    else f"последняя записана {age / 24:.1f} сут назад")
+            lines.append(f"⛔ ЗАПИСЬ СДЕЛОК НЕ ПОПОЛНЯЕТСЯ ({when}) — это НЕ "
+                         f"рынок молчит, а слушатель потока не запущен: "
+                         f"`deploy\\run.bat --seetg-watch 180000`. Числа "
+                         f"выше про всю запись ({fact['trades']} шт)")
+        else:
+            lines.append(f"🕒 За последние {fh}ч сделок по этой модели НЕ "
+                         f"БЫЛО — числа выше про всю запись "
+                         f"({fact['trades']} шт), и рынок с тех пор мог "
+                         f"уехать")
     else:
         fresh_paid = [p for p in fact["fresh_prices"] if p >= be]
         few = ", мало" if fact["fresh_trades"] < MIN_BACKTEST_TRADES else ""
