@@ -4584,7 +4584,13 @@ def seetg_confirm_pair(slug: str, model: str, pair: dict):
     if floor > 0 and buy["price"] < floor:
         note += f"; лот дешевле борды ({buy['price']} против {floor})"
 
-    sell_floor = min(rival["price"], pair["sell_floor"])
+    # У листинга из потока борды НЕТ ВОВСЕ (`sell_floor = None`), и это не
+    # дыра, а честное «обещания не было»: сторону продажи целиком решает
+    # лестница. У связки борда есть, и тогда берётся МЕНЬШЕЕ — выше борды
+    # оценка не поднимается никогда.
+    board_sell = pair.get("sell_floor")
+    sell_floor = (min(rival["price"], board_sell) if board_sell
+                  else rival["price"])
     profit = compute_net_profit(sell_floor, pair["buy_floor"])
     out = {
         "buy": buy, "sell": rival, "note": note,
@@ -4697,9 +4703,10 @@ def _seetg_sales_lines(sales, skipped, planned_sale):
 
 def _seetg_arb_key(slug: str, pair: dict) -> str:
     """Ключ выдержки. Несёт ЦЕНЫ, поэтому подешевевшая пара — это новая пара."""
-    q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
+    q = lambda x: ("—" if x is None
+                   else Decimal(str(x)).quantize(Decimal("0.01")))
     return (f"{slug}|{pair['model']}|{pair['buy_market']}|{pair['sell_market']}"
-            f"|{q(pair['buy_floor'])}|{q(pair['sell_floor'])}")
+            f"|{q(pair['buy_floor'])}|{q(pair.get('sell_floor'))}")
 
 
 def _seetg_arb_already_seen(slug: str, pair: dict):
@@ -5295,6 +5302,165 @@ def seetg_sale_from_frame(obj: dict):
     }, ""
 
 
+# =============================================================================
+# КАНДИДАТ ИЗ ПОТОКА ЛИСТИНГОВ — «ошибка продавца» в момент её появления
+# =============================================================================
+# Это закрытие дыры, записанной в CLAUDE.md с 21.09.2026: «СКОРОСТИ НЕТ...
+# нужен другой источник событий — подписка на новые листинги, а не обход
+# страниц». Опрос REST по кругу даёт шаг в минуты, а ошибочный листинг живёт
+# секунды: 10.10.2026 лот «Herbarium» ушёл за полчаса между двумя прогонами,
+# 23.10.2026 за семь минут сменилась треть пар.
+#
+# ПОЧЕМУ ЭТО ВООБЩЕ ВОЗМОЖНО ПО КВОТЕ. Подписка суточного лимита НЕ ИМЕЕТ
+# (блокируется массовая ВЫГРУЗКА, а не поток), и слушаем мы в ТОМ ЖЕ
+# соединении, что и сделки — отдельного процесса и второго коннекта нет.
+# Значит сам поток бесплатен, а платит только ЛЕСТНИЦА, и она вызывается
+# лишь у лота, прошедшего бесплатные ворота.
+#
+# ПОРЯДОК ВОРОТ — ПО ЦЕНЕ, А НЕ ПО СТРОГОСТИ. Листингов по трём коллекциям
+# идут сотни в час (за 8 часов 09.10.2026 только сделок было 8701), и
+# спросить лестницу у каждого значит сжечь суточную квоту за несколько
+# минут. Поэтому сначала идут проверки, НЕ СТОЯЩИЕ НИ ОДНОГО ЗАПРОСА:
+# потолок цены и банк, потом сверка с НАШЕЙ ЖЕ записью сделок (локальная
+# таблица `sales`), и только потом один запрос лестницы.
+
+# Потолок запросов лестницы в час. Это не «лимит шума», а защита квоты:
+# 40 в час это 960 в сутки при балансе 2600, то есть остаётся место и на
+# `--seetg-arb`, и на ручные отчёты. Подавленное СЧИТАЕТСЯ и попадает в
+# сводку — молчание без причины неотличимо от пустого рынка.
+SEETG_LISTING_CHECKS_PER_HOUR = int(
+    os.getenv("SEETG_LISTING_CHECKS_PER_HOUR", "40"))
+# Слушать ли листинги вместе со сделками. Выключатель нужен на случай, если
+# поток листингов окажется тяжелее, чем измерено: сделки писать важнее.
+SEETG_WATCH_LISTINGS = os.getenv("SEETG_WATCH_LISTINGS", "1") != "0"
+
+_listing_check_ts: list = []
+
+
+def seetg_listing_from_frame(obj: dict):
+    """
+    Разбирает кадр потока в новый листинг. (запись | None, причина).
+
+    ФОРМА ЦЕНЫ У `listing` НЕ ИЗМЕРЕНА — у `sale` она снята по 116 живым
+    кадрам (`price.amount` + `price_ton`, оба в НАНОТОНАХ вопреки имени), а
+    по листингам кадров в руках не было. Поэтому здесь НЕ ДОГАДКА, а
+    ПРОВЕРКА: читаем те же поля, и если их нет или они расходятся — запись
+    ПРОПУСКАЕТСЯ с причиной, а вызывающий печатает сырой кадр.
+
+    Это ровно тот приём, которым опознали `saleInfo` (06.10.2026): разбор
+    отказал на всех 12 коллекциях, напечатал сырьё — и форма нашлась со
+    следующего прогона. Писать парсер к полю, которого не видел, в этом
+    проекте запрещено: имена уже угадывали один раз (ключи борды), и это
+    стоило вывода «у see.tg нет наших коллекций».
+    """
+    if not isinstance(obj, dict) or obj.get("type") != "event" \
+            or obj.get("event") != "listing":
+        return None, "не событие листинга"
+    price = obj.get("price")
+    if not isinstance(price, dict):
+        return None, "нет блока price (форма кадра listing не та, что у sale)"
+    cur = str(price.get("currency", "")).lower()
+    if cur not in ("gram", "ton"):
+        # Звёзды и USDT пропускаем: курса у нас нет, а выдумать его значит
+        # придумать цену. То же правило, что у `saleInfo` и у сделок.
+        return None, f"валюта {cur or '?'} — не TON"
+    amount, pton = price.get("amount"), obj.get("price_ton")
+    if pton is not None and str(amount) != str(pton):
+        return None, (f"price.amount {amount} != price_ton {pton} — "
+                      f"поля означают разное, пропускаю")
+    ton = _nano_to_ton(amount)
+    if ton is None or ton <= 0:
+        return None, f"цена не разобрана: {amount!r}"
+
+    gift = obj.get("gift") if isinstance(obj.get("gift"), dict) else {}
+    det = gift.get("details") if isinstance(gift.get("details"), dict) else {}
+    pick = lambda k: (det.get(k) or gift.get(k))
+    name = lambda v: (v.get("name") if isinstance(v, dict) else None)
+    slug = pick("slug")
+    model = name(pick("model"))
+    if not slug:
+        return None, "в кадре нет слага коллекции"
+    if not model:
+        # Без модели сравнивать не с чем: и лестница, и запись сделок
+        # спрашиваются ПО МОДЕЛИ. «Нет модели» и «модель дешёвая» — разные
+        # утверждения, и подставлять коллекцию вместо модели нельзя.
+        return None, "в кадре нет модели"
+    return {
+        "slug": str(slug), "num": pick("num"), "model": model,
+        "backdrop": name(pick("backdrop")), "pattern": name(pick("pattern")),
+        "market": obj.get("market"), "price_ton": ton,
+        "at_iso": obj.get("at"),
+        "address": gift.get("giftAddress") or det.get("giftAddress") or "",
+    }, ""
+
+
+def listing_screen(lst: dict):
+    """
+    БЕСПЛАТНЫЕ ВОРОТА перед запросом лестницы. (ok, причина отказа).
+
+    Ни одного запроса к see.tg: потолок цены и банк считаются на месте, а
+    «сколько за эту модель платили» лежит в локальной таблице `sales`.
+
+    ПОЧЕМУ СРАВНИВАЕМ С БЕЗУБЫТКОМ, А НЕ С ПРИДУМАННЫМ ПРОЦЕНТОМ СКИДКИ.
+    Порог вида «дешевле floor на 10%» был бы выдуманным критерием, а
+    `breakeven_sale_price()` — обратная к `compute_net_profit()`, то есть
+    то же самое число, которым принимается решение. Вопрос ставится точно:
+    «а по такой цене за эту модель вообще когда-нибудь платили?»
+
+    БЕРЁТСЯ МАКСИМУМ ЗАПИСИ, А НЕ МЕДИАНА, и это намеренно: ворота решают
+    НЕ судьбу сделки, а стоит ли тратить ОДИН запрос. Медиана отрезала бы
+    половину настоящих находок ещё до измерения, а всё, что сюда пройдёт,
+    дальше проверяется лестницей живых лотов и сверкой с деньгами —
+    и обе двигают число только ВНИЗ.
+
+    «Записи по модели нет» — это ОТДЕЛЬНЫЙ исход, а не отказ по существу:
+    он означает «мне нечем судить», лечится временем прослушивания потока,
+    и считается отдельной строкой в сводке.
+    """
+    price = lst["price_ton"]
+    if not _affordable(price, f"листинг «{lst['model']}»"):
+        return False, "не по карману или выше потолка цены"
+    fact = model_sales_fact(lst["slug"], lst["model"])
+    if not fact.get("trades"):
+        return False, "нет записи сделок по этой модели (нечем судить)"
+    need = breakeven_sale_price(price)
+    top = fact.get("fresh_max") or fact.get("max")
+    if top is None or need > top:
+        return False, (f"безубыток {need:.4f} выше максимума сделок "
+                       f"{top} — по такой цене за модель не платили")
+    return True, ""
+
+
+def check_listing_candidate(lst: dict) -> bool:
+    """
+    Один запрос лестницы и — если она подтверждает — уведомление.
+
+    Решение и сообщение идут ТЕМ ЖЕ путём, что у связок (`notify_seetg_arb`):
+    та же лестница, та же `compute_net_profit()`, та же сверка с деньгами,
+    те же пороги, та же выдержка повтора и тот же часовой потолок. Второй
+    путь в телефон означал бы второй набор ворот, а в этом проекте
+    «исправление в одной точке» не закрывало класс ошибки уже четырнадцать
+    раз.
+
+    `sell_floor = None` — честное «борды нет»: у листинга из потока нет
+    обещания борды вовсе, и сторону продажи целиком решает лестница.
+    """
+    now = time.time()
+    _listing_check_ts[:] = [t for t in _listing_check_ts if now - t < 3600]
+    if len(_listing_check_ts) >= SEETG_LISTING_CHECKS_PER_HOUR:
+        return False
+    _listing_check_ts.append(now)
+    pair = {
+        "model": lst["model"],
+        "buy_market": lst.get("market") or "", "buy_floor": lst["price_ton"],
+        "buy_n": 1,
+        "sell_market": "", "sell_floor": None, "sell_n": 0,
+        "profit": Decimal("0"), "roi": Decimal("0"),
+        "from_listing": True,
+    }
+    return bool(notify_seetg_arb(lst["slug"], lst["slug"], pair))
+
+
 def record_sale(sale: dict) -> bool:
     """Пишет сделку в БД. False — такая уже есть (повтор при переподключении)."""
     with db_connect() as conn:
@@ -5497,6 +5663,11 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
     started, saved, dup, foreign, skipped, lucky = time.time(), 0, 0, 0, 0, 0
     failed = 0
     reasons, by_slug = {}, {}
+    # Листинги считаются ОТДЕЛЬНО от сделок: это разные вопросы, и общий
+    # счётчик скрыл бы, какой из двух потоков молчит.
+    lst_seen = lst_screened = lst_checked = lst_raw_shown = 0
+    lst_why, lst_by_slug = {}, {}
+    want = ["sale", "listing"] if SEETG_WATCH_LISTINGS else ["sale"]
     attempt = 0
     while time.time() - started < seconds:
         ws, why = _ws_connect(SEETG_WS_URL,
@@ -5513,7 +5684,7 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
         attempt = 0
         ticked = 0.0
         try:
-            ws.send(json.dumps(dict(_WS_SUBSCRIBE, events=["sale"])))
+            ws.send(json.dumps(dict(_WS_SUBSCRIBE, events=want)))
             while time.time() - started < seconds:
                 try:
                     left = started + seconds - time.time()
@@ -5535,6 +5706,45 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
                 try:
                     obj = json.loads(frame)
                 except Exception:                      # noqa: BLE001
+                    continue
+                if SEETG_WATCH_LISTINGS and isinstance(obj, dict) \
+                        and obj.get("event") == "listing":
+                    lst, why3 = seetg_listing_from_frame(obj)
+                    if lst is None:
+                        lst_why[why3] = lst_why.get(why3, 0) + 1
+                        # СЫРОЙ КАДР ПЕЧАТАЕТСЯ, А НЕ ЗАМАЛЧИВАЕТСЯ: форма
+                        # кадра `listing` не измерена, и первый же прогон
+                        # обязан её показать — иначе «ноль кандидатов»
+                        # читается как пустой рынок. Тот же приём, что
+                        # опознал `saleInfo` 06.10.2026.
+                        if lst_raw_shown < 2 and "не TON" not in why3:
+                            lst_raw_shown += 1
+                            log.warning(f"{_Color.YELLOW}Кадр listing не "
+                                        f"разобран ({why3}). СЫРЬЁ:"
+                                        f"{_Color.RESET}\n{frame}")
+                        continue
+                    if lst["slug"] not in slugs:
+                        foreign += 1
+                        continue
+                    lst_seen += 1
+                    lst_by_slug[lst["slug"]] = lst_by_slug.get(lst["slug"], 0) + 1
+                    ok, why4 = listing_screen(lst)
+                    if not ok:
+                        lst_why[why4] = lst_why.get(why4, 0) + 1
+                        continue
+                    lst_screened += 1
+                    log.info(f"{_Color.GREEN}ЛИСТИНГ{_Color.RESET} "
+                             f"{lst['slug']}-{lst['num']} «{lst['model']}» "
+                             f"{lst['price_ton']} TON на {lst['market']} — "
+                             f"прошёл бесплатные ворота, спрашиваю лестницу")
+                    try:
+                        if check_listing_candidate(lst):
+                            lst_checked += 1
+                    except RateLimited as e:
+                        log.warning(f"see.tg: {e}")
+                    except Exception as e:             # noqa: BLE001
+                        log.warning(f"Листинг не проверен: "
+                                    f"{type(e).__name__}: {e}")
                     continue
                 sale, why2 = seetg_sale_from_frame(obj)
                 if sale is None:
@@ -5587,6 +5797,21 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
              f"{by_slug or '—'}")
     log.info(f"Чужих коллекций в потоке: {foreign} — это весь рынок, мы "
              f"пишем только свои")
+    if SEETG_WATCH_LISTINGS:
+        # ВОРОНКА, А НЕ ОДНО ЧИСЛО. «Ноль уведомлений» бывает у трёх разных
+        # состояний — листингов не было, они не прошли бесплатные ворота,
+        # их срезала лестница, — и решения у них разные. Это тот же урок,
+        # что у воронки связок 10.10.2026.
+        log.info(f"Листингов по нашим коллекциям: {lst_seen} "
+                 f"({lst_by_slug or '—'}) → бесплатные ворота прошли "
+                 f"{lst_screened} → в телефон ушло {lst_checked}")
+        for r, n in sorted(lst_why.items(), key=lambda x: -x[1])[:6]:
+            log.info(f"{_Color.GREY}  отсев листингов ({n}): {r}{_Color.RESET}")
+        if lst_screened >= SEETG_LISTING_CHECKS_PER_HOUR:
+            log.warning(f"{_Color.YELLOW}Потолок проверок лестницей "
+                        f"({SEETG_LISTING_CHECKS_PER_HOUR}/час) достигнут — "
+                        f"часть листингов не проверена вовсе "
+                        f"(SEETG_LISTING_CHECKS_PER_HOUR){_Color.RESET}")
     if lucky:
         log.info(f"Сделок вида не «purchase/sale»: {lucky} — в среднюю не "
                  f"идут, потому что что они означают, не измерено")

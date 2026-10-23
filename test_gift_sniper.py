@@ -21,6 +21,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -79,6 +80,8 @@ _PINNED = {
     "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "", "HEARTBEAT_MIN": 60,
     "MIN_MARKET_SAMPLE": 5, "NEAR_MISS_TOP": 3,
     "SALES_FRESH_HOURS": Decimal("48"),
+    "SEETG_LISTING_CHECKS_PER_HOUR": 40,
+    "SEETG_WATCH_LISTINGS": True,
     "SEGMENT_NOTIFY_MAX_PER_HOUR": 12,
     "SEGMENT_MAX_PER_COLLECTION": 1, "SEGMENT_SEEN_TTL_SEC": 21600,
     "SEGMENT_MIN_ROI_PCT": Decimal("10"), "SEGMENT_MAX_ROI_PCT": Decimal("100"),
@@ -7461,6 +7464,188 @@ check("и говорит об этом, назвав пару",
 # И не тратит квоту see.tg на лестницу: отправлять всё равно некуда.
 check("лестница при ненастроенном Telegram не запрашивается",
       "не подтверждена лестницей" not in _out89)
+
+# =============================================================================
+# [90] КАНДИДАТ ИЗ ПОТОКА ЛИСТИНГОВ
+# =============================================================================
+# Закрытие дыры «СКОРОСТИ НЕТ» (CLAUDE.md, 21.09.2026): опрос REST по кругу
+# даёт шаг в минуты, а ошибочный листинг живёт секунды. Поток — подписка,
+# суточной квоты у неё нет; платит только лестница, и только у лота,
+# прошедшего БЕСПЛАТНЫЕ ворота.
+
+_src90 = open("gift_sniper.py", encoding="utf-8").read()
+
+# Кадр построен по ИЗМЕРЕННОЙ форме `sale` (116 живых кадров 09.10.2026):
+# цена лежит РЯДОМ с `gift`, а `price_ton` вопреки имени в НАНОТОНАХ.
+def _frame90(**over):
+    f = {"type": "event", "event": "listing",
+         "at": "2026-10-23T12:00:00+00:00", "market": "mrkt",
+         "price": {"amount": 3500000000, "currency": "gram"},
+         "price_ton": 3500000000,
+         "gift": {"giftAddress": "EQAbc", "details": {
+             "slug": "CandyCane", "num": 1234,
+             "model": {"name": "Tropico"},
+             "backdrop": {"name": "Onyx Black"},
+             "pattern": {"name": "Scarab"}}}}
+    f.update(over)
+    return f
+
+_l90, _w90 = gs.seetg_listing_from_frame(_frame90())
+check("листинг разобран по форме кадра sale",
+      _l90 is not None and _l90["slug"] == "CandyCane"
+      and _l90["model"] == "Tropico", _w90)
+# Нанотоны вопреки имени поля: 3500000000 это 3.5 TON, а не 3.5 миллиарда.
+check("price_ton делится на 1e9, как у сделок",
+      _l90 and _l90["price_ton"] == Decimal("3.5"))
+check("адрес предмета сохранён — без него нечем отметить покупку",
+      _l90 and _l90["address"] == "EQAbc")
+
+# Форма кадра listing НЕ ИЗМЕРЕНА, поэтому разбор обязан ОТКАЗАТЬ и назвать
+# причину, а не придумать цену. Тот же приём опознал `saleInfo` 06.10.2026.
+_n90, _nw90 = gs.seetg_listing_from_frame(
+    {"type": "event", "event": "listing", "gift": {}})
+check("нет блока price — отказ, а не догадка",
+      _n90 is None and "price" in _nw90)
+_x90, _xw90 = gs.seetg_listing_from_frame(_frame90(price_ton=999))
+check("price.amount != price_ton — поля означают разное, пропуск",
+      _x90 is None and "означают разное" in _xw90)
+_s90, _sw90 = gs.seetg_listing_from_frame(
+    _frame90(price={"amount": 10000, "currency": "stars"}))
+check("звёзды пропускаются: курса у нас нет",
+      _s90 is None and "не TON" in _sw90)
+# Без модели сравнивать не с чем: и лестница, и запись сделок идут ПО МОДЕЛИ.
+_m90 = _frame90()
+_m90["gift"]["details"]["model"] = None
+_nm90, _nmw90 = gs.seetg_listing_from_frame(_m90)
+check("без модели — отказ, а не подстановка коллекции",
+      _nm90 is None and "модел" in _nmw90)
+check("сделка не разбирается как листинг и наоборот",
+      gs.seetg_listing_from_frame(_frame90(event="sale"))[0] is None
+      and gs.seetg_sale_from_frame(_frame90())[0] is None)
+
+# --- БЕСПЛАТНЫЕ ВОРОТА: ни одного запроса к see.tg -----------------------
+_db90 = tempfile.mkdtemp()
+_odb90, gs.DB_PATH = gs.DB_PATH, os.path.join(_db90, "s.db")
+gs._schema_ready = None
+_obank90, _ores90 = gs.BANKROLL_TON, gs.RESERVE_TON
+_ocap90 = gs.MAX_NOTIFY_PRICE_TON
+try:
+    gs.BANKROLL_TON, gs.RESERVE_TON = Decimal("50"), Decimal("1")
+    gs.MAX_NOTIFY_PRICE_TON = Decimal("10")
+    _lot90 = dict(_l90)
+
+    # «Записи по модели нет» — это НЕ отказ по существу, а «нечем судить»:
+    # лечится временем прослушивания потока, и названо отдельной строкой.
+    _ok90, _why90 = gs.listing_screen(_lot90)
+    check("без записи сделок — отказ со словами «нечем судить»",
+          _ok90 is False and "нечем судить" in _why90)
+
+    # Записываем сделки по модели ВЫШЕ безубытка: ворота обязаны пропустить.
+    for i, pr in enumerate(("4.80", "5.10", "4.95")):
+        gs.record_sale({"slug": "CandyCane", "num": 900 + i,
+                        "model": "Tropico", "backdrop": "Onyx Black",
+                        "pattern": None, "market": "mrkt", "price_ton": pr,
+                        "sale_kind": "purchase", "estimate_ton": None,
+                        "at_iso": f"2026-10-23T1{i}:00:00+00:00",
+                        "owner_name": None, "gift_id": None})
+    _ok90b, _why90b = gs.listing_screen(_lot90)
+    check("листинг ниже безубытка по записи — ворота пропускают",
+          _ok90b is True, _why90b)
+
+    # Порог — не придуманный процент, а breakeven_sale_price(): обратная к
+    # compute_net_profit(). Лот за 5.0 требует продажи дороже максимума 5.10.
+    _hi90 = dict(_lot90, price_ton=Decimal("5.0"))
+    _ok90c, _why90c = gs.listing_screen(_hi90)
+    check("безубыток выше максимума сделок — отказ с числом",
+          _ok90c is False and "безубыток" in _why90c,
+          f"{_why90c} | безубыток {gs.breakeven_sale_price(Decimal('5.0'))}")
+
+    # Потолок цены и банк стоят ПЕРВЫМИ — они бесплатны и отсеивают больше
+    # всего. 12 TON выше потолка показа 10.
+    _ok90d, _why90d = gs.listing_screen(dict(_lot90, price_ton=Decimal("12")))
+    check("выше потолка цены — отсев до любых запросов", _ok90d is False)
+finally:
+    gs.BANKROLL_TON, gs.RESERVE_TON = _obank90, _ores90
+    gs.MAX_NOTIFY_PRICE_TON = _ocap90
+    gs.DB_PATH, gs._schema_ready = _odb90, None
+    shutil.rmtree(_db90, ignore_errors=True)
+
+# --- СТОРОНА ПРОДАЖИ: борды нет, решает лестница -------------------------
+# У листинга из потока обещания борды НЕТ ВОВСЕ. Это честное «нет», а не
+# дыра: прибыль считает та же compute_net_profit() по живому конкуренту.
+_ladder90 = [{"price": Decimal("3.50"), "market": "mrkt", "num": 1, "link": "",
+              "address": "EQAbc"},
+             {"price": Decimal("4.60"), "market": "portals", "num": 2,
+              "link": "", "address": "EQB"}]
+_old90 = gs.seetg_model_ladder
+try:
+    gs.seetg_model_ladder = lambda slug, model: list(_ladder90)
+    _pair90 = {"model": "Tropico", "buy_market": "mrkt",
+               "buy_floor": Decimal("3.50"), "sell_market": "",
+               "sell_floor": None}
+    _conf90, _cw90 = gs.seetg_confirm_pair("CandyCane", "Tropico", _pair90)
+    check("без борды сторону продажи задаёт конкурент из лестницы",
+          _conf90 is not None and _conf90["sell_floor"] == Decimal("4.60"),
+          _cw90)
+    # Второй формулы прибыли в проекте нет — сверяем до нанотона.
+    check("прибыль считает та же compute_net_profit()",
+          _conf90 and _conf90["profit"] == gs.compute_net_profit(
+              Decimal("4.60"), Decimal("3.50")))
+    # А когда борда ЕСТЬ, берётся МЕНЬШЕЕ: выше борды оценка не растёт.
+    _conf90b, _ = gs.seetg_confirm_pair(
+        "CandyCane", "Tropico", dict(_pair90, sell_floor=Decimal("4.00")))
+    check("с бордой берётся меньшее из двух",
+          _conf90b and _conf90b["sell_floor"] == Decimal("4.00"))
+    # Лот уже ушёл: поток сказал 3.50, а лестница показывает 4.60 первым.
+    _gone90, _gw90 = gs.seetg_confirm_pair(
+        "CandyCane", "Tropico", dict(_pair90, buy_floor=Decimal("2.00")))
+    check("ушедший лот отсекается: купить по названной цене нечего",
+          _gone90 is None and "купить нечего" in _gw90)
+finally:
+    gs.seetg_model_ladder = _old90
+
+# Ключ выдержки обязан терпеть отсутствие борды, а не падать на Decimal(None).
+check("ключ выдержки собирается и без борды",
+      "CandyCane|Tropico|mrkt||3.50|—" ==
+      gs._seetg_arb_key("CandyCane", {"model": "Tropico", "buy_market": "mrkt",
+                                      "sell_market": "",
+                                      "buy_floor": Decimal("3.5"),
+                                      "sell_floor": None}))
+
+# --- КВОТА: лестница спрашивается не чаще потолка -------------------------
+_calls90 = []
+_on90, _ot90 = gs.notify_seetg_arb, list(gs._listing_check_ts)
+try:
+    gs.notify_seetg_arb = lambda *a, **k: _calls90.append(1) or False
+    gs._listing_check_ts[:] = []
+    for _ in range(gs.SEETG_LISTING_CHECKS_PER_HOUR + 5):
+        gs.check_listing_candidate(dict(_l90))
+    check("потолок проверок лестницей соблюдён",
+          len(_calls90) == gs.SEETG_LISTING_CHECKS_PER_HOUR)
+finally:
+    gs.notify_seetg_arb = _on90
+    gs._listing_check_ts[:] = _ot90
+
+# --- УСТРОЙСТВО: один поток, один путь в телефон --------------------------
+# Отдельный коннект стоил бы второго соединения, а отдельный путь в телефон —
+# второго набора ворот: в этом проекте «поправили одного из нескольких
+# потребителей» выживало четырнадцать раз.
+check("листинги слушаются в ТОМ ЖЕ соединении, что и сделки",
+      'want = ["sale", "listing"] if SEETG_WATCH_LISTINGS' in _src90
+      and "dict(_WS_SUBSCRIBE, events=want)" in _src90)
+check("уведомление идёт общим путём, своего нет",
+      "notify_seetg_arb(lst[\"slug\"], lst[\"slug\"], pair)" in _src90)
+# Сырой кадр при неразобранном листинге — это и есть измерение формы.
+check("неразобранный кадр печатается сырьём, а не замалчивается",
+      "Кадр listing не " in _src90 and "lst_raw_shown" in _src90)
+# Воронка: «ноль» бывает у трёх разных состояний с разными решениями.
+check("в сводке воронка листингов, а не одно число",
+      "бесплатные ворота прошли" in _src90 and "в телефон ушло" in _src90)
+# Запись рынка остаётся на TonAPI: массовый обход see.tg запрещён их
+# правилами, и блокируется АККАУНТ целиком.
+check("листинги в запись рынка не пишутся",
+      "record_snapshot" not in _src90.split("def seetg_listing_from_frame")[1]
+      .split("def record_sale")[0])
 
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

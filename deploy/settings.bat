@@ -356,6 +356,18 @@ REM ROI 3 procenta = 0.11 TON chistymi, i odin konkurent ryadom s'edaet
 REM ih celikom. Nizhe 2 stavit bessmyslenno.
 set SEETG_ARB_MIN_ROI_PCT=5
 
+REM --- KANDIDAT IZ POTOKA LISTINGOV ---------------------------------
+REM Potok (wss) sutochnoy kvoty NE imeet: eto podpiska, a ne vygruzka.
+REM --seetg-watch slushaet sdelki I listingi v ODNOM soedinenii.
+REM Platit tolko lestnica - i tolko u lota, proshedshego besplatnye
+REM vorota (potolok ceny, bank, nasha zhe zapis sdelok).
+REM 40 proverok v chas = 960 v sutki pri balanse 2600: ostaetsya mesto
+REM i na --seetg-arb, i na ruchnye otchety.
+set SEETG_LISTING_CHECKS_PER_HOUR=40
+REM Vyklyuchatel na sluchay, esli potok listingov okazhetsya tyazhelee
+REM izmerennogo: sdelki pisat vazhnee.
+REM set SEETG_WATCH_LISTINGS=0
+
 REM --- Pauza mezhdu zaprosami k TonAPI ---
 REM Tarify Ton Console (snyato so skrinshota 23.09.2026, REST API):
 REM   Free  $0     1 RPS   <- tekushchiy
