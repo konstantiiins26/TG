@@ -5034,20 +5034,45 @@ try:
 finally:
     gs.seetg_get = _oget64b
 
-# --- ВЫДЕРЖКА ПОВТОРА: СВОЙ ЖУРНАЛ, И ЦЕНА В КЛЮЧЕ ------------------------
+# --- ВЫДЕРЖКА ПОВТОРА: ДВА ЖУРНАЛА, И ЦЕНА В КЛЮЧЕ ------------------------
+# Журнал помнит ВЕРДИКТ, а не вопрос. Прежде ключ писался на входе, и пара,
+# срезанная лестницей, замолкала на шесть часов наравне с отправленной —
+# хотя лестница отвечает про живые лоты, а они живут минутами.
 gs._seetg_arb_seen.clear()
-check("пара видна впервые", gs._seetg_arb_already_seen("S", _pair64) is False)
+gs._seetg_arb_cut.clear()
+check("пара видна впервые", gs._seetg_arb_already_seen("S", _pair64) is None)
+check("сам по себе вопрос пару не глушит",
+      gs._seetg_arb_already_seen("S", _pair64) is None)
+gs._seetg_arb_seen[gs._seetg_arb_key("S", _pair64)] = time.time()
 check("та же пара повторно не шлётся",
-      gs._seetg_arb_already_seen("S", _pair64) is True)
+      "уже отправляли" in (gs._seetg_arb_already_seen("S", _pair64) or ""))
 check("подешевевшая пара — новость, а не повтор",
       gs._seetg_arb_already_seen("S", dict(_pair64, buy_floor=Decimal("7.0")))
-      is False)
+      is None)
+# Срез лестницы глушит НЕНАДОЛГО и называет срок: конкурент мог уйти.
+gs._seetg_arb_seen.clear()
+gs._seetg_arb_cut[gs._seetg_arb_key("S", _pair64)] = time.time()
+_cut64 = gs._seetg_arb_already_seen("S", _pair64) or ""
+check("срез лестницы глушит отдельно и называет срок",
+      "лестница уже срезала" in _cut64 and "пересверим" in _cut64)
+check("срок пересверки КОРОЧЕ выдержки отправленной пары",
+      gs.SEETG_ARB_CUT_TTL_SEC < gs.SEETG_ARB_SEEN_TTL_SEC)
+gs._seetg_arb_cut[gs._seetg_arb_key("S", _pair64)] = (
+    time.time() - gs.SEETG_ARB_CUT_TTL_SEC - 1)
+check("после срока пару сверяют заново",
+      gs._seetg_arb_already_seen("S", _pair64) is None)
+gs._seetg_arb_cut.clear()
+# Ключ пишется ТАМ, ГДЕ ПОЛУЧЕН ВЕРДИКТ, а не на входе в цепочку ворот.
+check("отправленное помечается после ухода сообщения",
+      "_seetg_arb_seen[_seetg_arb_key(slug, pair)] = time.time()" in _src64 and
+      _src64.count("_seetg_arb_cut[_seetg_arb_key(slug, pair)]") == 2)
 # Журнал СВОЙ: общий с сегментным наблюдением означал бы, что одно тихо
 # помечает лот виденным для другого.
 check("журнал арбитража отдельный от сегментного",
       "_seetg_arb_seen" in _src64 and "_segment_seen" in _src64
       and "_seetg_arb_seen = _segment_seen" not in _src64)
 gs._seetg_arb_seen.clear()
+gs._seetg_arb_cut.clear()
 
 # --- БЕЗ ТОКЕНА НЕ ПОДМЕНЯЕМ ИСТОЧНИК МОЛЧА -------------------------------
 # Тихий откат на путь по TonAPI — это и есть «горит зелёным, пока ошибка
@@ -7399,7 +7424,12 @@ check("диагностика --test-telegram сохранила свои соо
 
 # --- остальные молчаливые ворота на пути связки в телефон -----------------
 check("выдержка повтора называет себя",
-      "по этим ценам уже" in _src89 and "SEETG_ARB_SEEN_TTL_SEC)" in _src89)
+      "»: {hush}" in _src89 and "hush = _seetg_arb_already_seen" in _src89 and
+      "SEETG_ARB_SEEN_TTL_SEC)" in _src89 and
+      "SEETG_ARB_CUT_TTL_SEC)" in _src89)
+# Отказ Telegram при живом токене тоже не должен быть молчаливым возвратом.
+check("несостоявшаяся отправка названа",
+      "НЕ ушла в Telegram" in _src89)
 check("часовой потолок называет себя",
       "SEETG_ARB_NOTIFY_MAX_PER_HOUR)" in _src89 and
       "связок за час" in _src89)

@@ -3962,6 +3962,18 @@ SEETG_ONLY = os.getenv("SEETG_ONLY", "1") == "1"
 SEETG_ARB_MAX_PER_COLLECTION = int(os.getenv("SEETG_ARB_MAX_PER_COLLECTION", "1"))
 SEETG_ARB_NOTIFY_MAX_PER_HOUR = int(os.getenv("SEETG_ARB_NOTIFY_MAX_PER_HOUR", "12"))
 SEETG_ARB_SEEN_TTL_SEC = int(os.getenv("SEETG_ARB_SEEN_TTL_SEC", "21600"))
+# Выдержка для пары, которую СРЕЗАЛА ЛЕСТНИЦА. Это другой вопрос, чем
+# «не слать то же дважды», поэтому и срок другой, и журнал отдельный.
+#
+# Лестница отвечает про ЖИВЫЕ лоты, а они живут минутами: 10.10.2026 лот
+# «Herbarium» ушёл за те полчаса, что прошли между двумя прогонами. Значит
+# отказ лестницы устаревает за десятки минут, а не за шесть часов.
+#
+# 1800с — не круглое число с потолка, а бюджет: при трёх коллекциях выше
+# порога держится 5-6 пар, то есть повторная сверка стоит ~12 запросов в час
+# (290 в сутки) при квоте 2600. Сверять каждый цикл (раз в 3 мин) стоило бы
+# 2600 в сутки на одни лестницы — вся квота.
+SEETG_ARB_CUT_TTL_SEC = int(os.getenv("SEETG_ARB_CUT_TTL_SEC", "1800"))
 # ПОРОГ ПОКАЗА СВЯЗКИ. Ниже сегментного (10%) намеренно, по прямой просьбе
 # владельца: «можешь давать связки хоть и на мало процентов». Это уже не
 # то же утверждение, что было у сегментного наблюдения: там прибыль
@@ -4037,7 +4049,8 @@ def _arb_examine(pairs: list, floor_n: int = 0) -> list:
         return pairs
     return pairs[:max(SEETG_ARB_LOG_TOP, floor_n)]
 
-_seetg_arb_seen: dict = {}
+_seetg_arb_seen: dict = {}        # ОТПРАВЛЕННЫЕ пары — не слать дважды
+_seetg_arb_cut: dict = {}         # срезанные лестницей — пересверить позже
 _seetg_arb_sent_ts: list = []
 _seetg_arb_suppressed = 0
 _seetg_arb_implausible = 0
@@ -4682,24 +4695,44 @@ def _seetg_sales_lines(sales, skipped, planned_sale):
     return lines
 
 
-def _seetg_arb_already_seen(slug: str, pair: dict) -> bool:
-    """
-    Выдержка повтора. Ключ несёт ЦЕНЫ, поэтому подешевевшая пара приходит
-    сразу: выдержка глушит повтор, а не новость. Журнал СВОЙ, не общий с
-    сегментным наблюдением — два разных вопроса, два журнала, иначе одно
-    тихо помечало бы лот виденным для другого.
-    """
+def _seetg_arb_key(slug: str, pair: dict) -> str:
+    """Ключ выдержки. Несёт ЦЕНЫ, поэтому подешевевшая пара — это новая пара."""
     q = lambda x: Decimal(str(x)).quantize(Decimal("0.01"))
-    key = (f"{slug}|{pair['model']}|{pair['buy_market']}|{pair['sell_market']}"
-           f"|{q(pair['buy_floor'])}|{q(pair['sell_floor'])}")
+    return (f"{slug}|{pair['model']}|{pair['buy_market']}|{pair['sell_market']}"
+            f"|{q(pair['buy_floor'])}|{q(pair['sell_floor'])}")
+
+
+def _seetg_arb_already_seen(slug: str, pair: dict):
+    """
+    Глушить ли пару. Возвращает причину (строку) либо None.
+
+    ДВА ЖУРНАЛА, ПОТОМУ ЧТО ДВА РАЗНЫХ ВОПРОСА. Прежде был один, и ключ в
+    него писался ДО вердикта лестницы — то есть журнал помнил, что пару
+    СПРОСИЛИ, а не что её ОТПРАВИЛИ. Последствие измерено на логе владельца
+    23.10.2026: из 533 рассмотренных пар 108 не дошли до лестницы вовсе,
+    потому что те же цены уже спрашивали в прошлом цикле. Срезанная пара
+    замолкала на ШЕСТЬ ЧАСОВ, хотя лестница отвечает про живые лоты, и
+    конкурент, из-за которого она срезана, мог уйти через пять минут.
+
+    Это тот же класс, что молчаливые ворота Telegram: запись «виделись»
+    выглядела одинаково для отправленной находки и для отказа, а решения у
+    них противоположные.
+
+    Журнал СВОЙ, не общий с сегментным наблюдением, — по той же причине.
+    """
+    key = _seetg_arb_key(slug, pair)
     now = time.time()
-    for k in [k for k, ts in _seetg_arb_seen.items()
-              if now - ts > SEETG_ARB_SEEN_TTL_SEC]:
-        _seetg_arb_seen.pop(k, None)
+    for store, ttl in ((_seetg_arb_seen, SEETG_ARB_SEEN_TTL_SEC),
+                       (_seetg_arb_cut, SEETG_ARB_CUT_TTL_SEC)):
+        for k in [k for k, ts in store.items() if now - ts > ttl]:
+            store.pop(k, None)
     if now - _seetg_arb_seen.get(key, -1e9) < SEETG_ARB_SEEN_TTL_SEC:
-        return True
-    _seetg_arb_seen[key] = now
-    return False
+        return (f"уже отправляли по этим ценам, выдержка "
+                f"{SEETG_ARB_SEEN_TTL_SEC // 3600}ч (SEETG_ARB_SEEN_TTL_SEC)")
+    if now - _seetg_arb_cut.get(key, -1e9) < SEETG_ARB_CUT_TTL_SEC:
+        return (f"лестница уже срезала её по этим ценам, пересверим через "
+                f"{SEETG_ARB_CUT_TTL_SEC // 60} мин (SEETG_ARB_CUT_TTL_SEC)")
+    return None
 
 
 def _seetg_markets_line(markets) -> str:
@@ -4780,6 +4813,7 @@ def notify_seetg_arb(name: str, slug: str, pair: dict,
                  f"лестницей: {why}{_Color.RESET}")
         _seetg_arb_sent_ts.pop()
         _seetg_arb_unconfirmed += 1
+        _seetg_arb_cut[_seetg_arb_key(slug, pair)] = time.time()
         return False
 
     buy, sell = conf["buy"], conf["sell"]
@@ -4794,6 +4828,7 @@ def notify_seetg_arb(name: str, slug: str, pair: dict,
                  f"{_Color.RESET}")
         _seetg_arb_sent_ts.pop()
         _seetg_ladder_cut += 1
+        _seetg_arb_cut[_seetg_arb_key(slug, pair)] = time.time()
         note_seetg_near(pair["model"], name, buy, sell, profit, roi)
         return False
     if SEGMENT_MAX_ROI_PCT > 0 and roi > SEGMENT_MAX_ROI_PCT:
@@ -4923,6 +4958,14 @@ def notify_seetg_arb(name: str, slug: str, pair: dict,
             tg_action_update(action_id, message_id=int(mid))
     if body:
         _seetg_arb_sent += 1
+        # Ключ пишется ЗДЕСЬ, а не на входе: журнал обязан помнить, что пару
+        # ОТПРАВИЛИ, а не что её спросили.
+        _seetg_arb_seen[_seetg_arb_key(slug, pair)] = time.time()
+    else:
+        # Не ушло (Telegram отказал — причину напечатал `_tg_call`). Молча
+        # вернуть False значит снова оставить пару без следа в логе.
+        log.warning(f"Связка «{pair['model']}» НЕ ушла в Telegram — "
+                    f"причина строкой выше")
     return bool(body)
 
 
@@ -5050,14 +5093,13 @@ def scan_seetg_arbitrage(snap: dict) -> int:
             continue
         if not _affordable(pair["buy_floor"], f"«{pair['model']}»"):
             continue
-        if _seetg_arb_already_seen(slug, pair):
+        hush = _seetg_arb_already_seen(slug, pair)
+        if hush:
             # Молчаливый `continue` в цепочке ворот неотличим от «пары не
             # было»: владелец видит строку «предварительно …» и пустой
             # телефон. Повтор глушим, но не молча.
-            log.info(f"{_Color.GREY}      «{pair['model']}» по этим ценам уже "
-                     f"показывали — выдержка повтора "
-                     f"{SEETG_ARB_SEEN_TTL_SEC // 3600}ч "
-                     f"(SEETG_ARB_SEEN_TTL_SEC){_Color.RESET}")
+            log.info(f"{_Color.GREY}      «{pair['model']}»: {hush}"
+                     f"{_Color.RESET}")
             continue
         if notify_seetg_arb(name or slug, slug, pair, collection):
             notified += 1
