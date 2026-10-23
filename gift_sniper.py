@@ -3988,7 +3988,54 @@ def note_seetg_near(model, coll, buy, sell, profit, roi):
                         "profit": profit, "roi": roi})
     _seetg_near.sort(key=lambda x: x["roi"], reverse=True)
     del _seetg_near[SEETG_NEAR_TOP:]
-SEETG_ARB_LOG_TOP = int(os.getenv("SEETG_ARB_LOG_TOP", "5"))
+# СКОЛЬКО ПАР КОЛЛЕКЦИИ ДОВОДИТЬ ДО ЛЕСТНИЦЫ. 0 = ВСЕ, и это теперь
+# значение по умолчанию.
+#
+# ПОЧЕМУ ПЯТЬ БЫЛО НЕ ПРОСТО МАЛО, А ВРЕДНО (23.10.2026, измерено по двум
+# прогонам владельца). Пары сортируются по ROI БОРДЫ и берутся первые N.
+# Но борда — то самое число, которое мы сами печатаем со словом
+# «ПРЕДВАРИТЕЛЬНО», и его ошибка не случайна:
+#
+#     связь «обещание борды» -> «размер обвала после лестницы»: r = +0.884
+#     выжили ровно две пары из десяти, и у них ДВЕ САМЫЕ НИЗКИЕ борды
+#     (2.57 и 1.44 при обвалах у лидеров 21.3, 19.6, 16.7 пунктов)
+#
+# Механизм понятен: большой разрыв floor'ов ДВУХ МАРКЕТОВ означает, что
+# между ними стоит пачка лотов дешёвого маркета, — а лестница их видит и
+# обнуляет связку. Маленький разрыв означает, что между floor'ами никого
+# нет, и лестница число не трогает.
+#
+# То есть сортировка по борде ставила в начало очереди кандидатов, ОТОБРАННЫХ
+# ПО ПРИЗНАКУ ЛОЖНОСТИ, а выжившие оказывались в хвосте и отрезались
+# потолком. У CandyCane 07.10.2026 положительных пар было около пятидесяти —
+# значит смотрели 5 из 50, и не случайных, а худших.
+#
+# ПОЧЕМУ НЕ ПЕРЕВЕРНУТЬ СОРТИРОВКУ: десять наблюдений, и 10.10.2026 такая же
+# красивая группировка уже оказалась не находкой. Инвертировать — значит
+# подогнать правило под одну выборку. Поэтому борда просто перестаёт решать,
+# ЧТО измерять: смотрим всех, а ранжирует результат лестница.
+#
+# ЦЕНА: около 50 пар на коллекцию, то есть ~150 запросов на прогон при трёх
+# коллекциях. На бесплатной квоте (95) это меньше прогона в сутки — там надо
+# ставить `SEETG_ARB_LOG_TOP=5` обратно; на пополненном балансе (2600) это
+# 17 прогонов в сутки. Ритм бот считает сам.
+SEETG_ARB_LOG_TOP = int(os.getenv("SEETG_ARB_LOG_TOP", "0"))
+
+
+def _arb_examine(pairs: list, floor_n: int = 0) -> list:
+    """
+    Какие пары доводить до лестницы. ОДНА точка на обоих читателей —
+    уведомления и `--seetg-arb`: у значения два потребителя, и поправить
+    одного из двух в этом проекте выживало тринадцать раз.
+
+    `floor_n` — нижняя граница для пути уведомлений: сколько бы ни стоял
+    потолок, меньше `SEETG_ARB_MAX_PER_COLLECTION` смотреть бессмысленно.
+    Ноль в потолке значит «все», и через `max()` это выражать НЕЛЬЗЯ:
+    `max(0, 1)` дало бы ОДНУ пару вместо всех — обратное задуманному.
+    """
+    if SEETG_ARB_LOG_TOP <= 0:
+        return pairs
+    return pairs[:max(SEETG_ARB_LOG_TOP, floor_n)]
 
 _seetg_arb_seen: dict = {}
 _seetg_arb_sent_ts: list = []
@@ -4958,7 +5005,7 @@ def scan_seetg_arbitrage(snap: dict) -> int:
              f"арбитражем {len(pairs)}{_Color.RESET}")
     global _seetg_arb_implausible
     notified = 0
-    for pair in pairs[:max(SEETG_ARB_LOG_TOP, SEETG_ARB_MAX_PER_COLLECTION)]:
+    for pair in _arb_examine(pairs, SEETG_ARB_MAX_PER_COLLECTION):
         _seetg_pairs_looked += 1
         top = (f" | потолок: {pair['top_market']} {pair['top_floor']} "
                f"-> {pair['top_profit']:+.4f}" if pair.get("top_market") else "")
@@ -6676,7 +6723,7 @@ def seetg_arb_report(limit_collections: int = 0):
         if not pairs:
             log.info("  положительных пар маркетов нет")
             continue
-        for pair in pairs[:SEETG_ARB_LOG_TOP]:
+        for pair in _arb_examine(pairs):
             total += 1
             # ПО БОРДЕ — ПРЕДВАРИТЕЛЬНО, И ЭТО НАЗВАНО. Борда даёт floor
             # КАЖДОГО маркета, но не говорит, сколько лотов стоит МЕЖДУ
@@ -8197,8 +8244,9 @@ def notify_heartbeat(snapshots: list, force: bool = False):
         else:
             lines.append(f"🔻 Связки за час: прогонов {_seetg_rounds}, пар по "
                          f"борде {_seetg_pairs_total}, из них смотрели "
-                         f"{_seetg_pairs_looked} (по "
-                         f"{SEETG_ARB_LOG_TOP} лучшим на коллекцию)")
+                         f"{_seetg_pairs_looked} "
+                         + ("(все)" if SEETG_ARB_LOG_TOP <= 0 else
+                            f"(по {SEETG_ARB_LOG_TOP} лучшим на коллекцию)"))
             lines.append(f"   порог {SEETG_ARB_MIN_ROI_PCT}% прошли "
                          f"{_seetg_above_thr} → лестница срезала "
                          f"{_seetg_ladder_cut} → в телефон {_seetg_arb_sent}")
