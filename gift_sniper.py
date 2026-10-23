@@ -5685,7 +5685,7 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
     lst_seen = lst_screened = lst_checked = lst_raw_shown = 0
     lst_why, lst_by_slug = {}, {}
     want = ["sale", "listing"] if SEETG_WATCH_LISTINGS else ["sale"]
-    attempt = 0
+    attempt, short_said = 0, False
     while time.time() - started < seconds:
         ws, why = _ws_connect(SEETG_WS_URL,
                               [f"Authorization: Bearer {SEETG_TOKEN}"],
@@ -5711,6 +5711,9 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
         # не открывшееся вовсе.
         opened_at = time.time()
         ticked = 0.0
+        # Кадры ЭТОГО соединения. Нужны не для статистики: по ним
+        # различаются два разных обрыва (см. ниже, у расчёта выдержки).
+        got, last_service = 0, None
         try:
             ws.send(json.dumps(dict(_WS_SUBSCRIBE, events=want)))
             while time.time() - started < seconds:
@@ -5731,10 +5734,24 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
                         log.info(f"  …слушаю {now - started:.0f}с из "
                                  f"{seconds}, записано {saved}")
                     continue
+                got += 1
                 try:
                     obj = json.loads(frame)
                 except Exception:                      # noqa: BLE001
                     continue
+                # СЛУЖЕБНЫЕ КАДРЫ БОЛЬШЕ НЕ ПРОПАДАЮТ МОЛЧА. Сервер
+                # объясняет отказ кадром `type=error` («unknown message
+                # type» измерено 07.10.2026), а наблюдение до 23.10.2026
+                # брало только `sale` и `listing` — то есть причина обрыва
+                # приходила и терялась. Это тот же случай, что с ценой
+                # сделки: её «не было видно» ровно потому, что проба
+                # печатала одни ключи `gift`. ИНСТРУМЕНТ ИЗМЕРЕНИЯ САМ
+                # РЕШАЕТ, ЧТО Я УВИЖУ.
+                if isinstance(obj, dict) and not obj.get("event"):
+                    last_service = frame[:400]
+                    if obj.get("type") == "error":
+                        log.warning(f"{_Color.YELLOW}Поток see.tg ответил "
+                                    f"отказом:{_Color.RESET} {frame[:400]}")
                 if SEETG_WATCH_LISTINGS and isinstance(obj, dict) \
                         and obj.get("event") == "listing":
                     lst, why3 = seetg_listing_from_frame(obj)
@@ -5826,8 +5843,29 @@ def seetg_watch_sales(seconds: int = 0) -> bool:
             continue
         attempt += 1
         pause = min(60.0, 2.0 ** attempt)
-        log.warning(f"Соединение прожило {lived:.1f}с — это обрыв, а не "
-                    f"работа; пауза {pause:.0f}с перед повтором")
+        log.warning(f"Соединение прожило {lived:.1f}с, принято кадров {got} "
+                    f"— это обрыв, а не работа; пауза {pause:.0f}с перед "
+                    f"повтором")
+        if last_service:
+            log.warning(f"  последний служебный кадр: {last_service}")
+        # ДВА РАЗНЫХ ОБРЫВА ПОД ОДНИМ ИСКЛЮЧЕНИЕМ.
+        # `WebSocketConnectionClosedException` означает ровно «сокет
+        # закрыли», без кода и причины, а состояний за ним два, и лечатся
+        # они по-разному:
+        #   кадров 0   — отключили ДО приветствия `hello`, то есть отказ на
+        #                уровне соединения (второе окно бота с тем же
+        #                токеном, лимит подключений, блокировка). Подписка
+        #                тут ни при чём;
+        #   кадры были — токен приняли, рвётся уже после подписки.
+        # Сказать это обязан бот: «0.2с» выглядит одинаково в обоих случаях.
+        if got == 0 and not short_said:
+            short_said = True
+            log.warning(f"{_Color.YELLOW}Кадров не пришло ни одного — сервер "
+                        f"закрыл соединение ДО приветствия. Это отказ на "
+                        f"уровне соединения, а не подписки. Проверьте, что "
+                        f"не запущено второе окно бота с тем же токеном, и "
+                        f"прогоните «--seetg-stream 60»: он подписку не шлёт "
+                        f"и печатает сырые кадры{_Color.RESET}")
         if time.time() - started + pause >= seconds:
             break
         time.sleep(pause)

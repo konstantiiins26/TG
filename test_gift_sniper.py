@@ -7691,6 +7691,57 @@ finally:
 check("мгновенный обрыв уходит в выдержку, а не в горячий перезвон",
       1 <= len(_tries91) <= 4, f"подключений: {len(_tries91)}")
 
+# --- ПОЧЕМУ ИМЕННО РАЗОРВАЛОСЬ: кадров 0 против «кадры были» ---------------
+# `WebSocketConnectionClosedException` причины не несёт, а состояний за ней
+# два: отказ ДО приветствия (соединение) и обрыв ПОСЛЕ подписки. Лечатся
+# по-разному, выглядят одинаково — значит различить обязан бот.
+
+
+class _TalkWS91(_DeadWS91):
+    """Соединение, которое успевает сказать, почему закрывается."""
+    def __init__(self):
+        super().__init__()
+        self.sent = 0
+
+    def recv(self):
+        self.sent += 1
+        if self.sent == 1:
+            return '{"type":"error","code":"too_many","message":"rate"}'
+        raise RuntimeError("Connection to remote host was lost.")
+
+
+def _watch_log91(factory, secs=3):
+    h = _Collect89()
+    gs.log.addHandler(h)
+    o_c, o_t, o_s, o_sl = (gs._ws_connect, gs.SEETG_TOKEN,
+                           gs.known_seetg_slugs, time.sleep)
+    try:
+        gs.SEETG_TOKEN = "1:x"
+        gs.known_seetg_slugs = lambda: {"CandyCane"}
+        gs._ws_connect = lambda *a, **k: (factory(), None)
+        gs.seetg_watch_sales(secs)
+    finally:
+        gs._ws_connect, gs.SEETG_TOKEN = o_c, o_t
+        gs.known_seetg_slugs, time.sleep = o_s, o_sl
+        gs.log.removeHandler(h)
+    return "\n".join(h.lines)
+
+
+_out91 = _watch_log91(_DeadWS91)
+check("при нулевом числе кадров названа причина — отказ ДО приветствия",
+      "Кадров не пришло ни одного" in _out91 and "подписки" in _out91)
+check("совет при этом даётся ОДИН раз, а не на каждом обрыве",
+      _out91.count("Кадров не пришло ни одного") == 1)
+check("число принятых кадров названо в строке обрыва",
+      "принято кадров 0" in _out91)
+
+_out91b = _watch_log91(_TalkWS91)
+check("кадр type=error печатается ДОСЛОВНО, а не выбрасывается",
+      '"code":"too_many"' in _out91b and "отказом" in _out91b)
+check("при пришедших кадрах совет про соединение не печатается",
+      "Кадров не пришло ни одного" not in _out91b,
+      "токен приняли — дело не в соединении")
+
 # --- КВОТА: при исчерпанном бюджете лестницу не спрашиваем ВООБЩЕ ---------
 # Иначе КАЖДЫЙ листинг печатает одно и то же предупреждение на полэкрана
 # (живой лог 23.10.2026) — повторяющаяся строка становится фоном.
