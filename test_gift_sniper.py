@@ -78,6 +78,7 @@ _PINNED = {
     "DRY_RUN": True, "CONFIRM_LIVE_TRADING": "", "COLLECTION_WHITELIST": [],
     "TELEGRAM_BOT_TOKEN": "", "TELEGRAM_CHAT_ID": "", "HEARTBEAT_MIN": 60,
     "MIN_MARKET_SAMPLE": 5, "NEAR_MISS_TOP": 3,
+    "SALES_FRESH_HOURS": Decimal("48"),
     "SEGMENT_NOTIFY_MAX_PER_HOUR": 12,
     "SEGMENT_MAX_PER_COLLECTION": 1, "SEGMENT_SEEN_TTL_SEC": 21600,
     "SEGMENT_MIN_ROI_PCT": Decimal("10"), "SEGMENT_MAX_ROI_PCT": Decimal("100"),
@@ -7151,6 +7152,99 @@ check("по коллекции идёт один запрос, без курсо
 
 # =============================================================================
 print("\n" + "=" * 60)
+# =====================================================================
+# [87] МЕДИАНА СДЕЛОК БЕЗ ОКНА ВРЕМЕНИ — «КУСОК ВРЕМЕНИ, ВЫДАННЫЙ ЗА ЦЕЛОЕ»
+#
+# Живой случай 23.10.2026, ViceCream «Red Dragon»: лестница дала ROI −8.19%
+# (второй лот вплотную, 4.233 против 4.2432), а сверка с деньгами — «выше
+# безубытка 4.47 ушло 16 из 24, медиана 4.54». Два числа читаются
+# противоположно, и решает их РАЗНИЦА ВО ВРЕМЕНИ: запись копится с
+# 09.10.2026, а лестница отвечает про сейчас.
+#
+# `model_sales_fact()` окна не имела вовсе — тот же класс, что уже ловили
+# 18.10.2026 в `--rank` и бэктесте, только у третьего потребителя.
+print("\n[87] Сверка с деньгами: свежее окно против всей записи")
+
+_osales87, _osch87 = gs.DB_PATH, gs._schema_ready_for
+try:
+    gs.DB_PATH = os.path.join(_tmpdir, "sales87.db")
+    gs._schema_ready_for = None
+    # Форма из прогона: дешёвые свежие сделки и дорогие старые.
+    for _i, (_p, _at) in enumerate([("4.60", "o1"), ("4.70", "o2"),
+                                    ("4.80", "o3"), ("4.90", "o4"),
+                                    ("3.90", "n1"), ("4.00", "n2")]):
+        gs.record_sale(_sale72("ViceCream", 900 + _i, "Red Dragon",
+                               "mrkt", _p, "4.5", _at))
+    _buy87, _be87 = Decimal("4.233"), gs.breakeven_sale_price(Decimal("4.233"))
+
+    # (1) ВСЁ СВЕЖЕЕ: окно повторяет всю запись, строки «не было» нет.
+    _f87 = gs.model_sales_fact("ViceCream", "Red Dragon")
+    check("свежее окно видит все записанные сделки",
+          _f87["fresh_trades"] == _f87["trades"] == 6)
+    _l87 = gs.model_sales_lines("ViceCream", "Red Dragon",
+                                Decimal("4.30"), _buy87)
+    check("при свежих сделках нет строки «сделок НЕ БЫЛО»",
+          not any("НЕ БЫЛО" in x for x in _l87))
+
+    # (2) СТАРЫЕ СДЕЛКИ ВЫПАДАЮТ ИЗ ОКНА, и медиана падает — это и есть
+    # случай владельца: по всей записи дорого, а сейчас дёшево.
+    with gs.db_connect() as _c87:
+        _c87.execute("UPDATE sales SET seen_ts = ? WHERE at_iso LIKE 'o%'",
+                     (time.time() - 10 * 24 * 3600,))
+    _f87b = gs.model_sales_fact("ViceCream", "Red Dragon")
+    check("старые сделки в свежее окно не попадают",
+          _f87b["trades"] == 6 and _f87b["fresh_trades"] == 2)
+    check("свежая медиана ниже общей",
+          _f87b["fresh_median"] < _f87b["median"])
+    _l87b = gs.model_sales_lines("ViceCream", "Red Dragon",
+                                 Decimal("4.30"), _buy87)
+    check("падение медианы названо вслух",
+          any("Свежая медиана НИЖЕ" in x for x in _l87b))
+    # Счёт выше безубытка в свежем окне — НОЛЬ, хотя по всей записи есть.
+    # Число НЕ зашито: тесты пиннят ROYALTY_PCT = 0.05 (намеренно не
+    # дефолт), поэтому безубыток тут другой, чем в живом прогоне.
+    check("по всей записи выше безубытка кто-то есть",
+          len([x for x in _f87b["prices"] if x >= _be87]) > 0)
+    check("в свежем окне выше безубытка ни одной",
+          len([x for x in _f87b["fresh_prices"] if x >= _be87]) == 0)
+    check("свежий счёт напечатан отдельной строкой",
+          any(f"За последние {int(gs.SALES_FRESH_HOURS)}ч:" in x
+              for x in _l87b))
+
+    # (3) ОКНО ПУСТОЕ: это НЕ «сделок нет» — числа выше про всю запись.
+    with gs.db_connect() as _c87:
+        _c87.execute("UPDATE sales SET seen_ts = ?",
+                     (time.time() - 10 * 24 * 3600,))
+    _l87c = gs.model_sales_lines("ViceCream", "Red Dragon",
+                                 Decimal("4.30"), _buy87)
+    check("пустое окно названо, а не смолчано",
+          any("НЕ БЫЛО" in x and "всю запись" in x for x in _l87c))
+    check("при пустом окне блок сделок всё равно есть",
+          any("По сделкам этой модели" in x for x in _l87c))
+
+    # (4) ПОВТОРЫ СВЁРНУТЫ И В СВЕЖЕМ ОКНЕ. Иначе артефакт portals (одна
+    # цена у одного предмета сто раз) утащил бы свежую медиану в пол —
+    # ровно то, от чего заводилась `_sale_reps()`.
+    gs.DB_PATH = os.path.join(_tmpdir, "sales87b.db")
+    gs._schema_ready_for = None
+    for _k, _at in enumerate(["r1", "r2", "r3"]):
+        gs.record_sale(_sale72("CandyCane", 777, "Polka Pop", "portals",
+                               "0.5", "3.3", _at))
+    gs.record_sale(_sale72("CandyCane", 778, "Polka Pop", "portals",
+                           "3.8", "3.3", "r4"))
+    _f87d = gs.model_sales_fact("CandyCane", "Polka Pop")
+    check("повторы свёрнуты и в общем счёте, и в свежем",
+          _f87d["trades"] == 2 and _f87d["fresh_trades"] == 2)
+finally:
+    gs.DB_PATH, gs._schema_ready_for = _osales87, _osch87
+
+# ОКНО — НАСТРОЙКА, А НЕ ЧИСЛО В КОДЕ: если поток станет реже, 48 часов
+# перестанут набирать выборку, и чинить это строкой в settings.bat лучше,
+# чем правкой исходника.
+check("окно свежести читается из окружения",
+      "SALES_FRESH_HOURS" in _src83 and
+      'os.getenv("SALES_FRESH_HOURS"' in _src83)
+
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")
     sys.exit(1)

@@ -5103,6 +5103,20 @@ _WS_SUBSCRIBE = {"type": "subscribe", "events": ["sale"]}
 # идёт, но СЧИТАЕТСЯ отдельно: выбросить молча значило бы потерять факт.
 _SALE_KINDS_REAL = ("purchase", "sale")
 
+# ОКНО СВЕЖЕСТИ ДЛЯ СВЕРКИ С ДЕНЬГАМИ. Запись сделок копится с 09.10.2026 и
+# не обнуляется, поэтому медиана «по всей записи» отвечает за две недели
+# сразу, а решение о покупке принимается про СЕЙЧАС. Это тот же класс
+# ошибки, что уже ловили 18.10.2026 в `--rank` и бэктесте («кусок ВРЕМЕНИ,
+# выданный за целое»), только у `model_sales_fact()` окна не было вовсе.
+#
+# 48 часов, а не 24: при измеренной частоте у отдельной модели набирается
+# единицы сделок в сутки, и суточное окно чаще показывало бы «свежих нет»,
+# чем что-то решало. Порог «мало» НЕ новый — тот же `MIN_BACKTEST_TRADES`.
+#
+# Берётся `seen_ts` (когда ЗАПИСАЛИ МЫ), а не `at` из события: это наше
+# число, всегда численное, и оно честно описывает окно НАШЕГО наблюдения.
+SALES_FRESH_HOURS = Decimal(os.getenv("SALES_FRESH_HOURS", "48"))
+
 
 def seetg_sale_from_frame(obj: dict):
     """
@@ -5599,10 +5613,19 @@ def model_sales_fact(slug: str, model: str) -> dict:
     for r in rows:
         if r["id"] in reps:
             markets[r["market"] or "—"] = markets.get(r["market"] or "—", 0) + 1
+    # СВЕЖЕЕ ОКНО. Медиана по всей записи отвечает за две недели сразу, а
+    # покупают сейчас: floor за это время двигается, и старое число может
+    # обещать деньги, которых на витрине уже нет.
+    edge = time.time() - float(SALES_FRESH_HOURS) * 3600
+    fresh = [Decimal(r["price_ton"]) for r in rows
+             if r["id"] in reps and (r["seen_ts"] or 0) >= edge]
     return {
         "trades": len(prices), "rows": len(rows),
         "median": _median(prices), "min": min(prices), "max": max(prices),
         "prices": prices, "markets": markets,
+        "fresh_trades": len(fresh), "fresh_prices": fresh,
+        "fresh_median": _median(fresh) if fresh else None,
+        "fresh_max": max(fresh) if fresh else None,
     }
 
 
@@ -5669,6 +5692,27 @@ def model_sales_lines(slug: str, model: str, planned_sale: Decimal,
     else:
         lines.append(f"⛔ Безубыток {q(be)}: выше него не ушла НИ ОДНА из "
                      f"{fact['trades']}")
+
+    # СВЕЖЕЕ ОКНО ОТДЕЛЬНОЙ СТРОКОЙ. Числа выше посчитаны по ВСЕЙ записи, а
+    # она копится неделями: медиана оттуда может быть ценой рынка, которого
+    # уже нет. Решение принимается по МЕНЬШЕЙ из двух оценок — правило
+    # «изменения, увеличивающие расчётную прибыль, требуют данных» действует
+    # и здесь, поэтому свежее окно может только УБАВИТЬ уверенность.
+    fh = int(SALES_FRESH_HOURS)
+    if not fact.get("fresh_trades"):
+        lines.append(f"🕒 За последние {fh}ч сделок по этой модели НЕ БЫЛО — "
+                     f"числа выше про всю запись ({fact['trades']} шт), и "
+                     f"рынок с тех пор мог уехать")
+    else:
+        fresh_paid = [p for p in fact["fresh_prices"] if p >= be]
+        few = ", мало" if fact["fresh_trades"] < MIN_BACKTEST_TRADES else ""
+        lines.append(f"🕒 За последние {fh}ч: {fact['fresh_trades']} шт, "
+                     f"медиана {q(fact['fresh_median'])}, выше безубытка "
+                     f"{q(be)} ушло {len(fresh_paid)}{few}")
+        if fact["fresh_median"] < fact["median"]:
+            lines.append(f"📉 Свежая медиана НИЖЕ общей ({q(fact['median'])}) "
+                         f"— по всей записи оценка завышена, решайте по "
+                         f"свежей")
     return lines
 
 
