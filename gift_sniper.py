@@ -4103,6 +4103,28 @@ def _seetg_cost_per_collection() -> int:
     return max(_SEETG_COST_GUESS, _seetg_cost_seen)
 
 
+def _seetg_note_cost(spent_before: int) -> None:
+    """
+    Запомнить расход прогона по коллекции — ЦЕЛИКОМ, а не одну борду.
+
+    ПОЧЕМУ ЭТО ОТДЕЛЬНАЯ ФУНКЦИЯ И ПОЧЕМУ ЕЁ ЗОВУТ НЕСКОЛЬКО РАЗ. Замер
+    стоял в `finally` вокруг ОДНОГО запроса борды, а лестница
+    (`seetg_confirm_pair`) и история предмета (`seetg_gift_sales`) уходят
+    ПОСЛЕ него, в цикле по парам. То есть ритм планировался по трети
+    настоящей цены прогона — ровно то, от чего предостерегает докстрока
+    `_seetg_cost_per_collection()`: «занижённая оценка расхода сожжёт квоту
+    к обеду».
+
+    Промахнулся замер не всегда одинаково: пока кандидатов отбирала борда
+    (`SEETG_ARB_LOG_TOP = 5`), лестниц было единицы. После снятия потолка
+    23.10.2026 живой прогон дал 64 лестницы против ~30 борд за четыре часа,
+    то есть настоящий расход втрое выше измеренного — и бесплатная квота
+    (95) кончалась за один вечер, а остаток суток бот молчал.
+    """
+    global _seetg_cost_seen
+    _seetg_cost_seen = max(_seetg_cost_seen, seetg_budget_load() - spent_before)
+
+
 def seetg_scan_gap_sec(collections: int = 0) -> float:
     """
     Сколько секунд между прогонами, чтобы суточной квоты see.tg хватило ДО
@@ -5049,11 +5071,12 @@ def scan_seetg_arbitrage(snap: dict) -> int:
         return 0
     finally:
         # Расход ИЗМЕРЯЕТСЯ, а не предполагается: по нему считается ритм.
-        _seetg_cost_seen = max(_seetg_cost_seen,
-                               seetg_budget_load() - spent_before)
+        # Здесь — цена борды; лестницы — ниже, по концу прогона.
+        _seetg_note_cost(spent_before)
 
     _seetg_pairs_total += len(pairs)
     if not pairs:
+        _seetg_note_cost(spent_before)
         log.info(f"{_Color.GREY}see.tg «{slug}»: положительных пар маркетов "
                  f"нет — ни одна модель не даёт прибыли после комиссии и "
                  f"газа{_Color.RESET}")
@@ -5110,6 +5133,8 @@ def scan_seetg_arbitrage(snap: dict) -> int:
             continue
         if notify_seetg_arb(name or slug, slug, pair, collection):
             notified += 1
+    # ЗАМЕР ПОСЛЕ ЦИКЛА — он и есть настоящая цена прогона по коллекции.
+    _seetg_note_cost(spent_before)
     return len(pairs)
 
 

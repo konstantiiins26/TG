@@ -93,7 +93,7 @@ _PINNED = {
     "SEETG_MIN_INTERVAL": Decimal("1.2"),
     "SEETG_ARB_MAX_PER_COLLECTION": 1,
     "SEETG_ARB_NOTIFY_MAX_PER_HOUR": 12,
-    "SEETG_ARB_SEEN_TTL_SEC": 21600, "SEETG_ARB_LOG_TOP": 5,
+    "SEETG_ARB_SEEN_TTL_SEC": 21600, "SEETG_ARB_LOG_TOP": 0,
     "MAX_NOTIFY_PRICE_TON": Decimal("10"),
 }
 for _name, _value in _PINNED.items():
@@ -7784,6 +7784,65 @@ check("в файле названа причина, а не просто выз�
 _new91 = _set91.split("VASHI ZNACHENIYA")[1]
 check("добавленный блок на латинице",
       all(ord(c) < 128 for c in _new91))
+
+# =============================================================================
+# [92] РИТМ СЧИТАЛСЯ ПО ТРЕТИ ЦЕНЫ ПРОГОНА
+# =============================================================================
+# Замер расхода стоял в `finally` вокруг ОДНОГО запроса борды, а лестница и
+# история предмета уходят ПОСЛЕ него, в цикле по парам. Пока кандидатов
+# отбирала борда (потолок 5), лестниц было единицы и промах не замечался;
+# после снятия потолка живой прогон дал 64 лестницы против ~30 борд за
+# четыре часа — то есть ритм планировался по трети настоящей цены, и
+# бесплатная квота кончалась за вечер.
+
+_src92 = open("gift_sniper.py", encoding="utf-8").read()
+_scan92 = _src92.split("def scan_seetg_arbitrage")[1].split("\ndef ")[0]
+check("расход прогона запоминается одной функцией",
+      "def _seetg_note_cost(" in _src92)
+check("замер стоит и ПОСЛЕ цикла по парам, а не только вокруг борды",
+      _scan92.count("_seetg_note_cost(spent_before)") >= 2)
+
+_spend92 = [0]
+_o92 = (gs.seetg_budget_load, gs.seetg_slug_for, gs.seetg_cross_market,
+        gs.notify_seetg_arb, gs._affordable, gs.SEETG_TOKEN,
+        gs._seetg_cost_seen)
+try:
+    gs.SEETG_TOKEN = "1:x"
+    gs.seetg_budget_load = lambda: _spend92[0]
+    gs.seetg_slug_for = lambda *a, **k: ("CandyCane", "")
+
+    def _cross92(slug):
+        _spend92[0] += 2                       # борда коллекции
+        return [{"model": "M", "buy_market": "mrkt",
+                 "buy_floor": Decimal("4"), "buy_n": 10,
+                 "sell_market": "portals", "sell_floor": Decimal("6"),
+                 "sell_n": 10, "profit": Decimal("1.5"), "roi": 37.0,
+                 "markets": {}}]
+
+    def _notify92(*a, **k):
+        _spend92[0] += 3                       # лестница + история предмета
+        return True
+
+    gs.seetg_cross_market = _cross92
+    gs.notify_seetg_arb = _notify92
+    gs._affordable = lambda *a, **k: True
+    gs._seetg_cost_seen = 0
+    gs._seetg_scan_at.clear()
+    gs._seetg_arb_seen.clear()
+    gs._seetg_arb_cut.clear()
+    gs.scan_seetg_arbitrage({"collection": "0:" + "bb" * 32, "on_sale": []})
+    _cost92 = gs._seetg_cost_per_collection()
+finally:
+    (gs.seetg_budget_load, gs.seetg_slug_for, gs.seetg_cross_market,
+     gs.notify_seetg_arb, gs._affordable, gs.SEETG_TOKEN,
+     gs._seetg_cost_seen) = _o92
+    gs._seetg_scan_at.clear()
+    gs._seetg_arb_seen.clear()
+
+# Со старым замером тут было бы 2 (одна борда), и ритм планировался бы по
+# нему: 95 запросов квоты «хватило бы» вдвое дольше, чем на самом деле.
+check("в расход прогона входит и лестница, а не только борда",
+      _cost92 == 5, f"посчитано {_cost92}, а потрачено 2 + 3")
 
 if _failures:
     print(f"ПРОВАЛЕНО: {len(_failures)} проверок -> {_failures}")

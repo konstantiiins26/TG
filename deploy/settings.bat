@@ -330,9 +330,14 @@ set SEETG_DAILY_BUDGET=95
 REM POSLE POPOLNENIYA BALANSA ETO CHISLO NADO PODNYAT RUKAMI. 402 ot nih
 REM propadet sam, a nash schetchik ostanetsya na 95 - to est bot budet
 REM tormozit sebya pri zhivom balanse, i popolnenie nichego ne izmenit.
-REM Arifmetika dlya 3 kollekciy: 3 zaprosa na kollekciyu = 9 na progon.
-REM   progon raz v 10 min -> 144 progona -> 1300 zaprosov -> 0.065 TON/sutki
-REM   progon raz v  5 min -> 288 progonov -> 2600 zaprosov -> 0.13 TON/sutki
+REM Arifmetika dlya 3 kollekciy. S 23.10.2026 potolok kandidatov snyat
+REM ^(SEETG_ARB_LOG_TOP=0^), poetomu progon stoit ne 3 zaprosa na kollekciyu,
+REM a bordu PLYUS lestnicu u kazhdoy pary, proshedshey porog i bank.
+REM Zhivoy progon 23.10: ~30 bord i 64 lestnicy za 4 chasa, to est raskhod
+REM VTROE vyshe starogo chisla. Bot teper izmeryaet ego celikom sam
+REM ^(_seetg_note_cost^) i rastyagivaet ritm, no byudzheta nado bolshe:
+REM   progon raz v 10 min -> 144 progona -> ~1300 zaprosov -> 0.065 TON/sutki
+REM   progon raz v  5 min -> 288 progonov -> ~2600 zaprosov -> 0.13 TON/sutki
 REM Chashche 2-3 min smysla net: nizhniy predel derzhit cikl zapisi TonAPI.
 REM Ubrat REM s nuzhnoy stroki i postavit na stroku "set ...=95" vyshe.
 REM set SEETG_DAILY_BUDGET=1300
